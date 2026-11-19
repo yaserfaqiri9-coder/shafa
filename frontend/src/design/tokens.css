@@ -1,0 +1,134 @@
+/*
+ * Design tokens read from the XRay template's computed styles at 1600x900.
+ * The template is left-to-right; this system mirrors it, so its "left" is our inline start.
+ */
+:root {
+  --xr-primary: #089bab;
+  --xr-primary-end: #0db5c8;
+  --xr-primary-light: #ceebee;
+  --xr-orange: #ffb177;
+  --xr-orange-light: #fae9dd;
+  --xr-red: #e64141;
+  --xr-red-light: #fcecec;
+  --xr-cyan: #00d0ff;
+  --xr-cyan-light: #e5faff;
+  --xr-green: #31c02c;
+  --xr-green-light: #e5fae5;
+  --xr-yellow: #fbc647;
+  --xr-page-bg: #eff7f8;
+  --xr-surface: #ffffff;
+  --xr-text: #3f414d;
+  /* Secondary text must still be readable by older staff: 4.6 to 1 on white. */
+  --xr-text-muted: #6b7278;
+  --xr-text-table: #000000;
+  --xr-border: #eeeeee;
+  --xr-border-table: #dee2e6;
+  --xr-track: #eef1f7;
+
+  --xr-gradient-primary: linear-gradient(to right, #089bab 0%, #0db5c8 100%);
+  /* The template's gradient runs from the sidebar across the page; mirrored here so the sidebar keeps its darker end. */
+  --xr-gradient-shell: linear-gradient(to left, #089bab 0%, #0db5c8 100%);
+  --xr-gradient-green: linear-gradient(to right, #31c02c 0%, #57de53 100%);
+  --xr-gradient-red: linear-gradient(to right, #d84a45 0%, #f26361 100%);
+  --xr-gradient-orange: linear-gradient(to right, #fc9e5b 0%, #ffb67e 100%);
+  --xr-gradient-cyan: linear-gradient(to right, #02d1ff 0%, #61e2fc 100%);
+  --xr-gradient-grey: linear-gradient(to right, #787d76 0%, #ababab 100%);
+  --xr-gradient-light: linear-gradient(to right, #e9eef4 0%, #eef5fd 100%);
+  --xr-gradient-dark: linear-gradient(to right, #374949 0%, #455d5d 100%);
+
+  /* Fields as measured on the template's form-layout and form-validation pages. */
+  --xr-field-bg: #ffffff;
+  --xr-field-border: #d7dbda;
+  --xr-field-focus: #089bab;
+  --xr-field-placeholder: rgba(33, 37, 41, 0.75);
+  --xr-field-disabled: #e9ecef;
+  --xr-field-invalid: #dc3545;
+
+  /* List rows stay calm: a dark name, soft secondary text, and tinted statuses instead of solid ones. */
+  --xr-text-soft: #667079;
+  --xr-row-hover: #f6fbfc;
+  --xr-tone-primary-bg: #e3f4f6;
+  --xr-tone-primary-text: #066f7b;
+  --xr-tone-orange-bg: #fdf0e5;
+  --xr-tone-orange-text: #99500f;
+  --xr-tone-red-bg: #fcecec;
+  --xr-tone-red-text: #b5322e;
+  --xr-tone-cyan-bg: #e3f7fc;
+  --xr-tone-cyan-text: #0a6c82;
+  --xr-tone-green-bg: #e6f6ea;
+  --xr-tone-green-text: #1c7a32;
+  --xr-row-border: #eef0f4;
+  --xr-row-link: #089eaf;
+  --xr-status-primary: #089eaf;
+  --xr-status-orange: #fca262;
+  --xr-status-red: #dd4e4a;
+  --xr-status-cyan: #12d4fe;
+  --xr-status-green: #27b345;
+
+  --xr-chart-teal: #089bab;
+  --xr-chart-orange: #fc9e5b;
+  --xr-chart-sky: #5ec6d4;
+  --xr-chart-grid: #e0e0e0;
+  --xr-chart-band: #f3f3f3;
+  --xr-chart-axis: #373d3f;
+
+  --xr-sidebar-width: 260px;
+  --xr-sidebar-mini: 80px;
+  --xr-sidebar-child: #777d74;
+  --xr-header-height: 60px;
+  /* The floating header's gap from the top edge, and where a sticky bar inside a page must stop to stay clear of it. */
+  --xr-header-top: 10px;
+  --xr-main-pad-top: calc(var(--xr-header-top) + var(--xr-header-height) + 16px);
+  /* Side margin of the page body and floating header: wider on big screens so tables do not stretch edge to edge. */
+  --xr-page-gutter: clamp(22px, 4.5vw, 96px);
+  /* How far below the window's top edge a sticky bar stops, and the same place as a `top` value: the browser measures `top` from inside the page's padding. */
+  --xr-sticky-clear: calc(var(--xr-header-height) + 8px);
+  --xr-sticky-top: calc(var(--xr-sticky-clear) - var(--xr-main-pad-top));
+  /* Work screens are dense: less air between cards means less scrolling for the same content. */
+  --xr-gap-x: 20px;
+  --xr-gap-y: 20px;
+  --xr-gap: var(--xr-gap-y) var(--xr-gap-x);
+  --xr-radius-card: 18px;
+  --xr-radius-tile: 16px;
+  --xr-radius-link: 15px;
+  --xr-radius-control: 10px;
+  --xr-radius-button: 6px;
+  --xr-shadow-card: 0 4px 5px 1px rgba(175, 175, 175, 0.1);
+  --xr-shadow-bar: 0 0 25px 0 rgba(45, 69, 95, 0.1);
+  --xr-shadow-footer: 0 0 12px 0 rgba(55, 73, 72, 0.06);
+  --xr-shadow-active: 3px 2px 20px 1px rgba(0, 0, 0, 0.1);
+  --xr-shadow-table: 0 0 12px 0 rgba(120, 146, 141, 0.06);
+  --xr-control-height: 45px;
+
+  /* Poppins draws Latin letters and digits as in the template; Dari text falls through to Vazirmatn. */
+  --xr-font: 'Poppins', 'Vazirmatn', system-ui, sans-serif;
+  --xr-fs-body: 14px;
+  /* Paper and the login keep the template's line height; the working screens set a denser one on the app layout. */
+  --xr-lh-body: 1.8;
+  --xr-lh-app: 1.65;
+  --xr-fs-card-title: 17px;
+  --xr-fs-stat: 24px;
+
+  --bs-primary: var(--xr-primary);
+  --bs-primary-rgb: 8, 155, 171;
+  --bs-body-bg: var(--xr-page-bg);
+  --bs-body-color: var(--xr-text);
+  --bs-body-font-family: var(--xr-font);
+  --bs-body-font-size: var(--xr-fs-body);
+  --bs-body-line-height: var(--xr-lh-body);
+  --bs-secondary-color: var(--xr-text-muted);
+  --bs-border-color: var(--xr-border-table);
+  --bs-heading-color: var(--xr-text);
+  --bs-link-color: var(--xr-primary);
+  --bs-link-color-rgb: 8, 155, 171;
+  --bs-link-hover-color: var(--xr-primary);
+  --bs-link-hover-color-rgb: 8, 155, 171;
+}
+
+/* On a phone the header scrolls away with the page, so nothing has to stay clear of it. */
+@media (max-width: 991.98px) {
+  :root {
+    --xr-main-pad-top: 12px;
+    --xr-sticky-clear: 8px;
+  }
+}

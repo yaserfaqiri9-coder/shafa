@@ -1,0 +1,296 @@
+import { admitFromRecord, call, collectPatientFee, ensureTariffs, openDesk, paidToken, pick } from './helpers'
+import { expect, test, type Browser, type Page } from '@playwright/test'
+
+const adminUser = process.env.ALSHIFA_E2E_USER!
+const adminPassword = process.env.ALSHIFA_E2E_PASSWORD!
+const password = 'E2e-Password-123'
+
+async function login(page: Page, user: string, pass: string) {
+  await page.goto('/login')
+  await page.getByLabel('نام کاربری').fill(user)
+  await page.getByLabel('رمز عبور').fill(pass)
+  await page.getByRole('button', { name: 'ورود' }).click()
+}
+
+async function createUser(admin: Page, userName: string, roleLabel: string) {
+  await admin.goto('/users')
+  await admin.getByRole('button', { name: 'کاربر جدید' }).click()
+  const dialog = admin.getByRole('dialog')
+  await dialog.getByLabel('نام کاربری').fill(userName)
+  await dialog.getByLabel('نام کامل').fill(`کارمند ${roleLabel}`)
+  await dialog.getByLabel(/رمز عبور/).fill(password)
+  await dialog.getByLabel(roleLabel, { exact: true }).check()
+  await dialog.getByRole('button', { name: 'ذخیره' }).click()
+  await expect(dialog).toBeHidden()
+}
+
+async function staffPage(browser: Browser, userName: string, errors: string[]) {
+  const context = await browser.newContext()
+  const page = await context.newPage()
+  page.on('pageerror', (e) => errors.push(e.message))
+  await login(page, userName, password)
+  await expect(page).not.toHaveURL(/\/login/)
+  return page
+}
+
+test('drug box finds any part of a name and adds each pick as a prescription line', async ({ page, browser }) => {
+  test.setTimeout(120_000)
+  const errors: string[] = []
+  const stamp = Date.now()
+  const first = `Q${stamp} Alpha 0.25%`
+  const second = `Q${stamp} Alpha 0.5%`
+
+  await login(page, adminUser, adminPassword)
+  await expect(page).not.toHaveURL(/\/login/)
+  for (const [userName, role] of [[`drg_r${stamp}`, 'Receptionist'], [`drg_d${stamp}`, 'Doctor'], [`drg_i${stamp}`, 'Inventory']]) {
+    await call(page, 'POST', '/users', { userName, fullName: `کارمند ${role}`, password, roles: [role] })
+  }
+  const inventory = await staffPage(browser, `drg_i${stamp}`, errors)
+  for (const [index, name] of [first, second].entries()) {
+    await call(inventory, 'POST', '/inventory/products', { name, kind: 'Drug', unit: 'عدد', reorderLevel: 0, salePrice: 10, isActive: true })
+  }
+
+  const reception = await staffPage(browser, `drg_r${stamp}`, errors)
+  const patient = await call<{ id: number }>(reception, 'POST', '/patients', { firstName: `نسخه${stamp}`, gender: 'Male', confirmNotDuplicate: true })
+  const departments = await call<{ id: number; name: string }[]>(reception, 'GET', '/lookups/departments')
+  await ensureTariffs(page)
+  await openDesk(page, reception)
+  const departmentId = departments.find((d) => d.name === 'معاینه ابتدایی')!.id
+  const visit = await call<{ id: number }>(reception, 'POST', '/visits', { patientId: patient.id, departmentId, tokenId: await paidToken(reception, departmentId) })
+
+  const doctor = await staffPage(browser, `drg_d${stamp}`, errors)
+  await doctor.goto(`/chart/${visit.id}`)
+  // The drug box sits on the exam page itself, under the diagnosis, as Rx did on the paper form.
+  const field = doctor.getByRole('combobox', { name: 'افزودن دوا' })
+  const list = doctor.getByRole('listbox', { name: 'افزودن دوا' })
+
+  // The very first letter already opens the list.
+  await field.pressSequentially('q')
+  await expect(list.getByRole('option').first()).toBeVisible()
+  await field.fill('')
+  await expect(list).toHaveCount(0)
+
+  // Any part of the name finds it, not only its first letters; a click adds the drug as a line.
+  await field.pressSequentially(`${stamp} alpha`)
+  await expect(list.getByRole('option', { name: first })).toBeVisible()
+  await expect(list.getByRole('option', { name: second })).toBeVisible()
+  await list.getByRole('option', { name: second }).click()
+  await expect(doctor.getByLabel('نام دوا 1')).toHaveValue(second)
+  await expect(doctor.getByLabel('طریقه مصرف 1')).toBeFocused()
+  await expect(field).toHaveValue('')
+  await expect(list).toHaveCount(0)
+
+  // Enter takes the highlighted match, the first one unless the arrows moved it.
+  await field.fill(`Q${stamp}`)
+  await expect(list.getByRole('option', { name: first })).toBeVisible()
+  await field.press('Enter')
+  await expect(doctor.getByLabel('نام دوا 2')).toHaveValue(first)
+
+  // A drug outside the pharmacy list can still be prescribed, and nothing is sent before the doctor saves.
+  await field.fill(`بیرون از گدام ${stamp}`)
+  await expect(doctor.getByText('در فهرست دواخانه پیدا نشد.')).toBeVisible()
+  await field.press('Enter')
+  await expect(doctor.getByLabel('نام دوا 3')).toHaveValue(`بیرون از گدام ${stamp}`)
+  await expect(doctor.getByText('ذخیره شد و نسخه دوا برای دواخانه ارسال شد.')).toHaveCount(0)
+
+  await doctor.getByLabel('طریقه مصرف 1').fill('1x3')
+  await doctor.getByRole('button', { name: 'ذخیره', exact: true }).click()
+  await expect(doctor.getByText('ذخیره شد و نسخه دوا برای دواخانه ارسال شد.')).toBeVisible()
+  // The saved prescription stays on the page, ready to change until the pharmacy starts on it.
+  await expect(doctor.getByLabel('نام دوا 3')).toHaveValue(`بیرون از گدام ${stamp}`)
+  await expect(doctor.getByLabel('طریقه مصرف 1')).toHaveValue('1x3')
+  await expect(doctor.getByText(/^RX-\d+$/)).toBeVisible()
+  expect(errors).toEqual([])
+})
+
+test('full clinical journey crosses departments without re-entering data', async ({ page, browser }) => {
+  test.setTimeout(180_000)
+  const errors: string[] = []
+  const stamp = Date.now()
+
+  await login(page, adminUser, adminPassword)
+  await expect(page.getByRole('img', { name: 'تصویر خوش‌آمدگویی' })).toBeVisible()
+  await createUser(page, `rec_${stamp}`, 'پذیرش')
+  await createUser(page, `tri_${stamp}`, 'معاینه ابتدایی')
+  await createUser(page, `doc_${stamp}`, 'داکتر چشم')
+  await createUser(page, `lab_${stamp}`, 'آزمایشگاه')
+
+  const testName = `OCT-${stamp}`
+  const created = await page.evaluate(async (name) => {
+    const token = decodeURIComponent(document.cookie.match(/XSRF-TOKEN=([^;]+)/)![1])
+    const r = await fetch('/api/diagnostic-tests', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-XSRF-TOKEN': token }, body: JSON.stringify({ name, isActive: true }) })
+    return r.status
+  }, testName)
+  expect(created).toBe(201)
+
+  // Reception registers the patient and sends them to pre-exam.
+  const reception = await staffPage(browser, `rec_${stamp}`, errors)
+  await ensureTariffs(page)
+  await openDesk(page, reception)
+  const firstName = `کریم${stamp}`
+  await reception.goto('/patients')
+  await reception.getByRole('link', { name: 'مریض جدید' }).click()
+  await reception.getByLabel('نام', { exact: true }).fill(firstName)
+  await reception.getByLabel('یا سن تخمینی').fill('55')
+  await reception.getByRole('button', { name: 'ذخیره' }).click()
+  await expect(reception).toHaveURL(/\/patients\/\d+$/)
+  await admitFromRecord(reception)
+
+  // Triage lands on their queue, records values, sends to doctor.
+  const triage = await staffPage(browser, `tri_${stamp}`, errors)
+  await expect(triage).toHaveURL(/\/triage$/)
+  await triage.getByRole('row', { name: new RegExp(firstName) }).getByRole('link', { name: 'ثبت معاینه' }).click()
+  await expect(triage).toHaveURL(/\/triage\/\d+$/)
+  const visitId = triage.url().match(/(\d+)$/)![1]
+  await triage.getByLabel(/VA OD/).fill('۶/۹')
+  await expect(triage.getByText('تغییرات ذخیره نشده')).toBeVisible()
+
+  // Leaving with unsaved values asks first; declining keeps the form and what was typed.
+  triage.once('dialog', (dialog) => dialog.dismiss())
+  await triage.getByRole('link', { name: 'بینایی‌سنجی' }).click()
+  await expect(triage).toHaveURL(/\/triage\/\d+$/)
+  await expect(triage.getByLabel(/VA OD/)).toHaveValue('6/9')
+
+  await triage.getByLabel(/PH OD/).fill('6/6')
+  await triage.getByLabel(/IOP OS/).fill('17')
+  await triage.getByLabel('سوابق ضروری').fill('حساسیت به پنسلین')
+  // An allergy is answered in its own place, so the doctor is warned of it before prescribing.
+  await triage.getByRole('group', { name: 'Allergies' }).getByRole('button', { name: 'Y' }).click()
+  await triage.getByLabel('Allergic to').fill('پنسلین')
+  await triage.getByRole('button', { name: 'ذخیره و ارسال به داکتر' }).click()
+  await expect(triage).toHaveURL(/\/triage$/)
+
+  // Vision reached the doctor, who asks for refraction; the cashier collects its fee before it can start.
+  const doctor = await staffPage(browser, `doc_${stamp}`, errors)
+  await expect(doctor).toHaveURL(/\/doctor$/)
+  const docRow = doctor.getByRole('row', { name: new RegExp(firstName) }).filter({ hasText: 'آماده برای داکتر' })
+  await expect(docRow).toBeVisible()
+  const visitRow = await call<{ patientId: number; patientFileNumber: string }>(doctor, 'GET', `/visits/${visitId}`)
+  const tests = await call<{ id: number; kind: string }[]>(doctor, 'GET', '/diagnostic-tests')
+  await call(doctor, 'POST', '/diagnostic-orders', { patientId: visitRow.patientId, visitId: Number(visitId), testId: tests.find((t) => t.kind === 'Refraction')!.id })
+  await collectPatientFee(reception, visitRow.patientFileNumber)
+
+  // The optometrist records stages separately; completing sends the patient back to the same doctor.
+  await triage.goto(`/refraction/${visitId}`)
+  await triage.getByLabel('Auto Refraction: SPH OD').fill('-2.25')
+  await triage.getByLabel('Final Refraction: SPH OD').fill('-2.0')
+  await triage.getByLabel('Final Refraction: AXIS OD').fill('190')
+  await expect(triage.getByRole('alert')).toContainText('محور')
+  await triage.getByLabel('Final Refraction: AXIS OD').fill('90')
+  await triage.getByLabel('Final Refraction: CYL OD').fill('0.5')
+  await expect(triage.getByRole('alert')).toContainText('علامت')
+  await triage.getByLabel('Final Refraction: CYL OD').fill('-0.5')
+  await triage.getByLabel('Final Refraction: ADD OD').click()
+  await expect(triage.getByLabel('Final Refraction: SPH OD')).toHaveValue('-2.00')
+  await expect(triage.getByLabel('Final Refraction: CYL OD')).toHaveValue('-0.50')
+  await expect(triage.getByLabel('Final Refraction: SPH OS')).not.toHaveAttribute('placeholder')
+  await triage.getByLabel(/^PD/).fill('63')
+  await triage.getByRole('button', { name: 'ذخیره', exact: true }).click()
+  await expect(triage.getByText('ذخیره شد.')).toBeVisible()
+  await triage.getByRole('button', { name: 'ذخیره و تکمیل' }).click()
+  await expect(triage.getByText('رفرکشن تکمیل شد و مریض به صف داکتر برگشت.')).toBeVisible()
+
+  // Doctor sees it with the triage values in their places on the dossier, without retyping anything.
+  await doctor.reload()
+  await expect(docRow).toBeVisible()
+  await docRow.getByRole('link', { name: 'باز کردن پرونده' }).click()
+  const front = doctor.getByRole('article', { name: 'روی دوسیه' })
+  await expect(front).toContainText('6/9')
+  await expect(front).toContainText('17')
+  await expect(front).toContainText('پنسلین')
+  await expect(front).toContainText('-2.00')
+
+  // Nothing is recorded as a finding until the doctor enters it.
+  await expect(doctor.getByLabel('قرنیه OD')).toHaveValue('')
+  await doctor.getByLabel('شرح حال داکتر').fill('تاری دید از دو ماه')
+  await doctor.getByLabel('قرنیه OD').selectOption('Clear')
+  await doctor.getByLabel('عدسیه OS').selectOption('Nuclear Sclerosis')
+  // A click on the drawing of the eye opens the fundus choices.
+  await doctor.getByLabel('فوندوس OD').selectOption('Cup/Disc 0.4')
+  await doctor.getByRole('button', { name: 'ذخیره', exact: true }).click()
+  await expect(doctor.getByText('ذخیره شد.')).toBeVisible()
+
+  // Structured values come back from the database in their own boxes, with the free note kept apart.
+  await doctor.reload()
+  await expect(doctor.getByLabel('قرنیه OD')).toHaveValue('Clear')
+  await expect(doctor.getByLabel('قرنیه OS')).toHaveValue('')
+  await expect(doctor.getByLabel('عدسیه OS')).toHaveValue('Nuclear Sclerosis')
+  await expect(doctor.getByLabel('شرح حال داکتر')).toHaveValue('تاری دید از دو ماه')
+  await expect(doctor.getByLabel('فوندوس OD')).toHaveValue('Cup/Disc 0.4')
+  await expect(doctor.getByRole('article', { name: 'روی دوسیه' })).toContainText('Cup/Disc 0.4')
+
+  // The allergy is read beside the name, before anything is prescribed.
+  await expect(doctor.getByRole('alert').filter({ hasText: 'پنسلین' }).first()).toBeVisible()
+
+  // One click fills only the empty slit lamp boxes as normal; a finding already chosen stays.
+  await doctor.getByRole('button', { name: 'بقیه نارمل' }).click()
+  await expect(doctor.getByLabel('قرنیه OS')).toHaveValue('Clear')
+  await expect(doctor.getByLabel('عدسیه OS')).toHaveValue('Nuclear Sclerosis')
+  await doctor.getByLabel('پلان درمان').fill('پیگیری فشار چشم')
+  // The lower half of the paper: gonioscopy, dilatation, the funduscopy method and the note.
+  await doctor.getByLabel('گونیوسکوپی OD').selectOption('Grade 3')
+  await doctor.getByLabel('گشادسازی OU').check()
+  await doctor.getByLabel('قطره T+Ph').check()
+  await doctor.getByRole('button', { name: '90D', exact: true }).click()
+  await doctor.getByLabel('یادداشت', { exact: true }).fill('یادداشت آزمایشی')
+  await doctor.getByRole('button', { name: 'ذخیره', exact: true }).click()
+  await expect(doctor.getByText('ذخیره شد.')).toBeVisible()
+  await doctor.reload()
+  await expect(doctor.getByLabel('پلان درمان')).toHaveValue('پیگیری فشار چشم')
+  await expect(doctor.getByLabel('قرنیه OS')).toHaveValue('Clear')
+  await expect(doctor.getByLabel('گونیوسکوپی OD')).toHaveValue('Grade 3')
+  await expect(doctor.getByLabel('گشادسازی OD')).toBeChecked()
+  await expect(doctor.getByLabel('گشادسازی OS')).toBeChecked()
+  await expect(doctor.getByLabel('قطره T+Ph')).toBeChecked()
+  await expect(doctor.getByRole('button', { name: '90D', exact: true })).toHaveAttribute('aria-pressed', 'true')
+  await expect(doctor.getByLabel('یادداشت', { exact: true })).toHaveValue('یادداشت آزمایشی')
+
+  // The final refraction fills the glasses form only when asked, and is issued only on submit.
+  // The order opens on its form: no second click to start a new one.
+  await doctor.getByRole('button', { name: /^نسخه عینک/ }).click()
+  await expect(doctor.getByLabel('نسخه عینک: SPH OD')).toHaveValue('')
+  await doctor.getByRole('button', { name: 'انتقال از نسخه نهایی بینایی‌سنجی' }).click()
+  await expect(doctor.getByLabel('نسخه عینک: SPH OD')).toHaveValue('-2.00')
+  await expect(doctor.getByLabel('PD', { exact: true })).toHaveValue('63')
+  await expect(doctor.getByText('نسخه‌های ثبت‌شده')).toHaveCount(0)
+  await doctor.keyboard.press('Escape')
+
+  // Lab order travels to the lab, and the result comes back to the chart.
+  await doctor.getByRole('button', { name: /^درخواست تشخیصی/ }).click()
+  await pick(doctor, doctor.locator('body'), 'درخواست', testName)
+  await doctor.getByRole('button', { name: 'درخواست', exact: true }).click()
+  await expect(doctor.getByRole('row', { name: new RegExp(testName) })).toContainText('درخواست‌شده')
+
+  const lab = await staffPage(browser, `lab_${stamp}`, errors)
+  await expect(lab).toHaveURL(/\/lab$/)
+  const labRow = lab.getByRole('row', { name: new RegExp(testName) })
+  await labRow.getByRole('link', { name: 'ثبت نتیجه' }).click()
+  await lab.getByLabel('نتیجه', { exact: true }).fill('نتیجه نمونه آزمایش')
+  await lab.getByRole('button', { name: 'ثبت نتیجه' }).click()
+  await expect(lab).toHaveURL(/\/lab$/)
+  await expect(labRow).toContainText('نتیجه آماده')
+
+  await doctor.reload()
+  // The result is read at the top of the file, without opening anything.
+  await expect(doctor.getByRole('region', { name: 'خلاصه پیش از معاینه' })).toContainText('نتیجه نمونه آزمایش')
+  await doctor.getByRole('button', { name: /^درخواست تشخیصی/ }).click()
+  await expect(doctor.getByRole('row', { name: new RegExp(testName) })).toContainText('نتیجه نمونه آزمایش')
+  await doctor.keyboard.press('Escape')
+
+  // Finalise: direct edit closes, amendment stays available.
+  await doctor.getByRole('button', { name: 'نهایی‌سازی', exact: true }).click()
+  await expect(doctor.getByText('معاینه نهایی و مراجعه تکمیل شد.')).toBeVisible()
+  await expect(doctor.getByLabel('فوندوس OD')).toBeDisabled()
+  // Amendments live in the file's menu, off the page itself.
+  await expect(doctor.getByRole('button', { name: 'ثبت اصلاحیه' })).toHaveCount(0)
+  await doctor.getByRole('button', { name: 'گزینه‌های بیشتر پرونده' }).click()
+  await doctor.getByRole('menuitem', { name: 'ادامه معاینه یا اصلاحیه' }).click()
+  await expect(doctor.getByRole('button', { name: 'ثبت اصلاحیه' })).toBeVisible()
+  await doctor.keyboard.press('Escape')
+
+  // Reception still has no way into the clinical record.
+  await reception.goto(doctor.url().replace(/^https?:\/\/[^/]+/, ''))
+  await expect(reception).not.toHaveURL(/\/chart\//)
+
+  expect(errors).toEqual([])
+})

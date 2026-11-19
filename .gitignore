@@ -1,0 +1,79 @@
+# Local SDK, MySQL data and development passwords
+.tools/
+.artifacts/
+__pycache__/
+*.pyc
+
+# Build output
+bin/
+obj/
+dist/
+node_modules/
+
+# Test output
+playwright-report/
+test-results/
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.pfx
+*.key
+backup.cnf
+api.env
+appsettings.*.local.json
+
+# Uploaded files and database dumps can contain patient data
+storage/
+*.sql
+*.sql.gz
+*.wav
+*.mp3
+
+# Documentation screenshots and scans may contain patient data
+/docs/**/*.png
+/docs/**/*.jpg
+/docs/**/*.jpeg
+/docs/**/*.webp
+/docs/**/*.pdf
+
+# Reference screenshots of the commercial XRay template: third-party material, not project source
+/*.jpg
+
+# Scans of clinic paper forms: one shows a real patient's name and prescription
+/*.jpeg
+
+# Tooling and logs
+.vs/
+.vscode/
+.claude/
+*.user
+*.log
+
+# Release builds of the hospital package
+/release/
+
+# Local backups, import data and downloaded installer packages
+/backups/
+/.work/
+/outputs/
+/11111111111/
+/11111111111.zip
+/eye_clinic_backup.json
+/*.xlsx
+/AlShifa-TV.zip
+/frontend/public/tools/AlShifa-TV.zip
+/*.rar
+/*.zip
+/*.pdf
+/deploy/stock-import/hospital-drug-list-2026-11-16.csv
+/.manus/
+/.css-mobile-review.txt
+/.all-mobile-breakpoints.txt
+/voice/
+/AlShifa_Recorded_Queue_Audio/
+/frontend/public/audio/recorded-*/
+/scripts/perf/results/
+/*.png
+/alshefa_print_bundle/*.png

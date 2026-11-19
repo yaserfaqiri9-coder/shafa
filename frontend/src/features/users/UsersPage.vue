@@ -1,0 +1,374 @@
+<script setup lang="ts">
+import { computed, onMounted, reactive, ref } from 'vue'
+import { api, ApiError } from '@/api/http'
+import UiCard from '@/components/UiCard.vue'
+import UiFilterBar from '@/components/UiFilterBar.vue'
+import UiPager from '@/components/UiPager.vue'
+import UiModal from '@/components/UiModal.vue'
+import UiRowMenu from '@/components/UiRowMenu.vue'
+import { useAuthStore } from '@/stores/auth'
+import { roleLabel, roles } from './roles'
+import { isMenuParent, menu, type MenuItem } from '@/layouts/menu'
+
+interface UserRow {
+  id: number
+  userName: string
+  fullName: string
+  isActive: boolean
+  roles: string[]
+}
+
+const auth = useAuthStore()
+const rows = ref<UserRow[]>([])
+const total = ref(0)
+const page = ref(1)
+const pageSize = 25
+const q = ref('')
+const loading = ref(true)
+const error = ref('')
+
+const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
+
+function messageOf(cause: unknown) {
+  return cause instanceof ApiError ? cause.message : 'خطایی رخ داد. دوباره تلاش کنید.'
+}
+
+async function load() {
+  loading.value = true
+  error.value = ''
+  try {
+    const params = new URLSearchParams({ page: String(page.value), pageSize: String(pageSize) })
+    if (q.value.trim()) params.set('q', q.value.trim())
+    const result = await api<{ items: UserRow[]; total: number }>(`/users?${params}`)
+    rows.value = result.items
+    total.value = result.total
+  } catch (cause) {
+    error.value = messageOf(cause)
+  } finally {
+    loading.value = false
+  }
+}
+
+function search() {
+  page.value = 1
+  load()
+}
+
+function goTo(next: number) {
+  page.value = next
+  load()
+}
+
+const form = reactive({ open: false, saving: false, error: '', userName: '', fullName: '', password: '', roles: [] as string[] })
+
+function openCreate() {
+  Object.assign(form, { open: true, saving: false, error: '', userName: '', fullName: '', password: '', roles: [] })
+}
+
+async function create() {
+  if (form.roles.length === 0) {
+    form.error = 'حداقل یک نقش انتخاب کنید.'
+    return
+  }
+  form.saving = true
+  form.error = ''
+  try {
+    await api('/users', {
+      method: 'POST',
+      body: { userName: form.userName, fullName: form.fullName, password: form.password, roles: form.roles },
+    })
+    form.open = false
+    await load()
+  } catch (cause) {
+    form.error = messageOf(cause)
+  } finally {
+    form.saving = false
+  }
+}
+
+const roleForm = reactive({ user: null as UserRow | null, saving: false, error: '', roles: [] as string[] })
+
+function openRoles(user: UserRow) {
+  Object.assign(roleForm, { user, saving: false, error: '', roles: [...user.roles] })
+}
+
+async function saveRoles() {
+  if (roleForm.roles.length === 0) {
+    roleForm.error = 'حداقل یک نقش انتخاب کنید.'
+    return
+  }
+  roleForm.saving = true
+  roleForm.error = ''
+  try {
+    await api(`/users/${roleForm.user!.id}/roles`, { method: 'PUT', body: { roles: roleForm.roles } })
+    roleForm.user = null
+    await load()
+  } catch (cause) {
+    roleForm.error = messageOf(cause)
+  } finally {
+    roleForm.saving = false
+  }
+}
+
+/** Pages listed in the sidebar form: every menu page except home, grouped as in the sidebar. */
+const menuGroups = menu
+  .flatMap((section) => [
+    { label: section.title, items: section.items.filter((entry): entry is MenuItem => !isMenuParent(entry)) },
+    ...section.items.filter(isMenuParent).map((parent) => ({ label: parent.label, items: parent.children })),
+  ])
+  .map((group) => ({ ...group, items: group.items.filter((item) => item.permission) }))
+  .filter((group) => group.items.length > 0)
+
+const sidebar = reactive({
+  user: null as UserRow | null,
+  loading: false,
+  saving: false,
+  error: '',
+  permissions: [] as string[],
+  visible: [] as string[],
+})
+
+/** Only pages this user's roles open are offered; a role's other pages would not show anyway. */
+const sidebarGroups = computed(() =>
+  menuGroups
+    .map((group) => ({ ...group, items: group.items.filter((item) => sidebar.permissions.includes(item.permission!)) }))
+    .filter((group) => group.items.length > 0),
+)
+
+async function openSidebar(user: UserRow) {
+  Object.assign(sidebar, { user, loading: true, saving: false, error: '', permissions: [], visible: [] })
+  try {
+    const result = await api<{ permissions: string[]; hidden: string[] }>(`/users/${user.id}/sidebar`)
+    sidebar.permissions = result.permissions
+    sidebar.visible = sidebarGroups.value.flatMap((group) => group.items.map((item) => item.to)).filter((to) => !result.hidden.includes(to))
+  } catch (cause) {
+    sidebar.error = messageOf(cause)
+  } finally {
+    sidebar.loading = false
+  }
+}
+
+async function saveSidebar() {
+  sidebar.saving = true
+  sidebar.error = ''
+  const hidden = sidebarGroups.value.flatMap((group) => group.items.map((item) => item.to)).filter((to) => !sidebar.visible.includes(to))
+  try {
+    await api(`/users/${sidebar.user!.id}/sidebar`, { method: 'PUT', body: { hidden } })
+    // Your own menu changes at once; anyone else sees it on their next page load.
+    if (sidebar.user!.id === auth.user?.id) auth.user.hiddenMenu = hidden
+    sidebar.user = null
+  } catch (cause) {
+    sidebar.error = messageOf(cause)
+  } finally {
+    sidebar.saving = false
+  }
+}
+
+const editName = reactive({ user: null as UserRow | null, fullName: '', saving: false, error: '' })
+
+async function saveName() {
+  editName.saving = true
+  editName.error = ''
+  try {
+    await api(`/users/${editName.user!.id}`, { method: 'PUT', body: { fullName: editName.fullName } })
+    editName.user = null
+    await load()
+  } catch (cause) {
+    editName.error = messageOf(cause)
+  } finally {
+    editName.saving = false
+  }
+}
+
+const reset = reactive({ user: null as UserRow | null, password: '', saving: false, error: '' })
+
+async function saveReset() {
+  reset.saving = true
+  reset.error = ''
+  try {
+    await api(`/users/${reset.user!.id}/reset-password`, { method: 'POST', body: { newPassword: reset.password } })
+    reset.user = null
+    reset.password = ''
+  } catch (cause) {
+    reset.error = messageOf(cause)
+  } finally {
+    reset.saving = false
+  }
+}
+
+async function setActive(user: UserRow, active: boolean) {
+  error.value = ''
+  try {
+    await api(`/users/${user.id}/${active ? 'activate' : 'deactivate'}`, { method: 'POST' })
+    await load()
+  } catch (cause) {
+    error.value = messageOf(cause)
+  }
+}
+
+onMounted(load)
+</script>
+
+<template>
+  <!-- The search here is asked for, not live, so the bar sits in a form and Enter or the button sends it. -->
+  <form @submit.prevent="search">
+    <UiFilterBar v-model:search="q" title="کاربران" search-label="جستجو" search-placeholder="جستجوی نام یا نام کاربری">
+      <button type="submit" class="btn btn-soft">جستجو</button>
+      <template v-if="auth.can('users.create')" #actions>
+        <button type="button" class="btn btn-primary" @click="openCreate">کاربر جدید</button>
+      </template>
+    </UiFilterBar>
+  </form>
+
+  <UiCard>
+
+    <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
+
+    <div v-if="loading" class="xr-state" role="status">در حال بارگذاری...</div>
+    <div v-else-if="rows.length === 0" class="xr-state">کاربری پیدا نشد.</div>
+    <div v-else class="xr-table-wrap">
+      <table class="xr-table">
+        <thead>
+          <tr>
+            <th>نام کاربری</th>
+            <th>نام کامل</th>
+            <th>نقش</th>
+            <th>وضعیت</th>
+            <th v-if="auth.can('users.manage')">عملیات</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="user in rows" :key="user.id">
+            <td><span class="ltr-num">{{ user.userName }}</span></td>
+            <td>{{ user.fullName }}</td>
+            <td>{{ user.roles.map(roleLabel).join('، ') }}</td>
+            <td>
+              <span class="xr-badge" :class="user.isActive ? 'xr-badge--green' : 'xr-badge--red'">
+                {{ user.isActive ? 'فعال' : 'غیرفعال' }}
+              </span>
+            </td>
+            <td v-if="auth.can('users.manage')" class="text-nowrap">
+              <!-- The two actions used most stay on the row; the rarer ones wait in the menu. -->
+              <button type="button" class="btn btn-soft btn-sm" @click="Object.assign(reset, { user, password: '', error: '' })">بازنشانی رمز</button>
+              <button
+                v-if="user.id !== auth.user?.id"
+                type="button"
+                class="btn btn-sm ms-2"
+                :class="user.isActive ? 'btn-soft-danger' : 'btn-soft'"
+                @click="setActive(user, !user.isActive)"
+              >
+                {{ user.isActive ? 'غیرفعال‌سازی' : 'فعال‌سازی' }}
+              </button>
+              <UiRowMenu
+                class="ms-1"
+                :label="`گزینه‌های بیشتر ${user.fullName}`"
+                :items="[
+                  { label: 'ویرایش نام', icon: 'ri-edit-line', onSelect: () => Object.assign(editName, { user, fullName: user.fullName, saving: false, error: '' }) },
+                  { label: 'نقش‌ها', icon: 'ri-shield-user-line', onSelect: () => openRoles(user) },
+                  { label: 'بخش‌های منو', icon: 'ri-menu-line', onSelect: () => openSidebar(user) },
+                ]"
+              />
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <UiPager :page="page" :page-count="pageCount" @go="goTo" />
+  </UiCard>
+
+  <UiModal v-if="form.open" title="کاربر جدید" @close="form.open = false">
+    <form @submit.prevent="create">
+      <div class="mb-3">
+        <label class="form-label" for="user-name">نام کاربری</label>
+        <input id="user-name" v-model="form.userName" class="form-control" dir="ltr" autocomplete="off" required />
+      </div>
+      <div class="mb-3">
+        <label class="form-label" for="user-fullname">نام کامل</label>
+        <input id="user-fullname" v-model="form.fullName" class="form-control" required />
+      </div>
+      <div class="mb-3">
+        <label class="form-label" for="user-password">رمز عبور</label>
+        <input id="user-password" v-model="form.password" class="form-control" type="password" dir="ltr" autocomplete="new-password" required />
+      </div>
+      <fieldset class="mb-3">
+        <legend class="form-label">نقش‌ها</legend>
+        <div class="row">
+          <div v-for="role in roles" :key="role.value" class="col-6">
+            <label class="form-check-label"><input v-model="form.roles" class="form-check-input ms-2" type="checkbox" :value="role.value" />{{ role.label }}</label>
+          </div>
+        </div>
+      </fieldset>
+      <div v-if="form.error" class="alert alert-danger" role="alert">{{ form.error }}</div>
+      <div class="xr-form-actions">
+        <button type="submit" class="btn btn-primary" :disabled="form.saving">ذخیره</button>
+        <button type="button" class="btn btn-soft-danger" data-modal-cancel>انصراف</button>
+      </div>
+    </form>
+  </UiModal>
+
+  <UiModal v-if="editName.user" :title="`ویرایش ${editName.user.userName}`" @close="editName.user = null">
+    <form @submit.prevent="saveName">
+      <label class="form-label" for="edit-fullname">نام کامل</label>
+      <input id="edit-fullname" v-model="editName.fullName" class="form-control mb-3" maxlength="150" required />
+      <div v-if="editName.error" class="alert alert-danger" role="alert">{{ editName.error }}</div>
+      <div class="xr-form-actions">
+        <button type="submit" class="btn btn-primary" :disabled="editName.saving">ذخیره</button>
+        <button type="button" class="btn btn-soft-danger" data-modal-cancel>انصراف</button>
+      </div>
+    </form>
+  </UiModal>
+
+  <UiModal v-if="reset.user" :title="`بازنشانی رمز ${reset.user.fullName}`" @close="reset.user = null">
+    <form @submit.prevent="saveReset">
+      <p class="text-muted small">نشست فعلی این کاربر پایان می‌یابد. رمز جدید را حضوری به او بدهید.</p>
+      <label class="form-label" for="reset-password">رمز جدید</label>
+      <input id="reset-password" v-model="reset.password" class="form-control mb-3" type="password" dir="ltr" autocomplete="new-password" required />
+      <div v-if="reset.error" class="alert alert-danger" role="alert">{{ reset.error }}</div>
+      <div class="xr-form-actions">
+        <button type="submit" class="btn btn-primary" :disabled="reset.saving">بازنشانی رمز</button>
+        <button type="button" class="btn btn-soft-danger" data-modal-cancel>انصراف</button>
+      </div>
+    </form>
+  </UiModal>
+
+  <UiModal v-if="sidebar.user" :title="`بخش‌های منوی ${sidebar.user.fullName}`" @close="sidebar.user = null">
+    <form @submit.prevent="saveSidebar">
+      <p class="text-muted small">
+        بخش‌های تیک‌خورده در منوی این کاربر دیده می‌شوند. فقط بخش‌هایی آمده‌اند که نقش‌های او اجازه می‌دهند.
+        پنهان کردن فقط منو را تغییر می‌دهد و صلاحیت را نمی‌گیرد. تغییر با بارگذاری دوباره صفحه کاربر دیده می‌شود.
+      </p>
+      <div v-if="sidebar.loading" class="xr-state" role="status">در حال بارگذاری...</div>
+      <div v-else-if="sidebarGroups.length === 0 && !sidebar.error" class="xr-state">نقش‌های این کاربر بخشی در منو ندارند.</div>
+      <div v-else class="row mb-3">
+        <fieldset v-for="group in sidebarGroups" :key="group.label" class="col-6 mb-2">
+          <legend class="form-label small fw-bold mb-1">{{ group.label }}</legend>
+          <label v-for="item in group.items" :key="item.to" class="form-check-label d-block">
+            <input v-model="sidebar.visible" class="form-check-input ms-2" type="checkbox" :value="item.to" />{{ item.label }}
+          </label>
+        </fieldset>
+      </div>
+      <div v-if="sidebar.error" class="alert alert-danger" role="alert">{{ sidebar.error }}</div>
+      <div class="xr-form-actions">
+        <button type="submit" class="btn btn-primary" :disabled="sidebar.saving || sidebar.loading || !!sidebar.error">ذخیره</button>
+        <button type="button" class="btn btn-soft-danger" data-modal-cancel>انصراف</button>
+      </div>
+    </form>
+  </UiModal>
+
+  <UiModal v-if="roleForm.user" :title="`نقش‌های ${roleForm.user.fullName}`" @close="roleForm.user = null">
+    <form @submit.prevent="saveRoles">
+      <p class="text-muted small">با تغییر نقش، نشست فعلی این کاربر پایان می‌یابد و باید دوباره وارد شود.</p>
+      <div class="row mb-3">
+        <div v-for="role in roles" :key="role.value" class="col-6">
+          <label class="form-check-label"><input v-model="roleForm.roles" class="form-check-input ms-2" type="checkbox" :value="role.value" />{{ role.label }}</label>
+        </div>
+      </div>
+      <div v-if="roleForm.error" class="alert alert-danger" role="alert">{{ roleForm.error }}</div>
+      <div class="xr-form-actions">
+        <button type="submit" class="btn btn-primary" :disabled="roleForm.saving">ذخیره</button>
+        <button type="button" class="btn btn-soft-danger" data-modal-cancel>انصراف</button>
+      </div>
+    </form>
+  </UiModal>
+</template>
