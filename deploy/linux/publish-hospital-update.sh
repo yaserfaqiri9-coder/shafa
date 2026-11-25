@@ -77,5 +77,11 @@ PY
   systemctl reload nginx
 fi
 
-test "$(curl -fsS --resolve shafa.novatechsoft.com:443:127.0.0.1 https://shafa.novatechsoft.com/updates/manifest.json | sha256sum | awk '{print $1}')" = "$(sha256sum "$site_dir/manifest.json" | awk '{print $1}')"
+# nginx reloads in the background: give the new workers a few seconds to serve /updates/.
+served=0
+for _ in $(seq 1 15); do
+  if [ "$(curl -fsS --resolve shafa.novatechsoft.com:443:127.0.0.1 https://shafa.novatechsoft.com/updates/manifest.json 2>/dev/null | sha256sum | awk '{print $1}')" = "$(sha256sum "$site_dir/manifest.json" | awk '{print $1}')" ]; then served=1; break; fi
+  sleep 1
+done
+test "$served" = 1
 echo "Published hospital update $version (database $schema). Hospitals install it between 03:00 and 05:00."
