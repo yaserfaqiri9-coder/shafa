@@ -6,14 +6,9 @@ const adminUser = process.env.ALSHIFA_E2E_USER!
 const adminPassword = process.env.ALSHIFA_E2E_PASSWORD!
 const password = 'E2e-Password-123'
 
-const financialReports = [
-  ['profit-loss', 'مفاد و ضرر کل سیستم'],
-  ['revenue-sources', 'عواید بخش‌ها'],
-  ['expense-summary', 'خلاصه مصارف به تفکیک نوع'],
-  ['daily-finance', 'عملکرد مالی روزانه'],
-  ['cash-flow', 'گردش حساب صندوق'],
-]
-const moneyReports = ['دریافت‌ها', 'طلبات', 'مصارف', ...financialReports.map(([, name]) => name)]
+const overview = 'گزارش عمومی شفاخانه'
+const finance = 'گزارش مالی و حسابداری'
+const pharmacy = 'گزارش دواخانه و گدام'
 
 test.afterEach(async ({ browser }) => {
   await Promise.all(browser.contexts().map(context => context.close()))
@@ -42,212 +37,186 @@ async function userWithRole(browser: Browser, role: string, viewport?: { width: 
   return page
 }
 
-const title = (page: Page) => page.getByRole('heading', { level: 1 })
 const tabs = (page: Page) => page.getByRole('tablist', { name: 'دسته گزارش‌ها' })
-/** The one bar of an open report: its name, days and actions. */
-const bar = (page: Page) => page.getByRole('region', { name: /^فیلترهای / })
-const back = (page: Page) => bar(page).getByRole('link', { name: 'گزارش‌ها' })
+const tab = (page: Page, name: string) => tabs(page).getByRole('tab', { name })
+const bar = (page: Page) => page.getByRole('region', { name: 'فیلترهای گزارش‌ها' })
+const heading = (page: Page) => page.getByRole('heading', { level: 2, name: /^گزارش / })
+const tiles = (page: Page) => page.locator('.report-tiles > .rs')
+const reportItems = (page: Page) => page.locator('.report-grid > .report-item')
+const item = (page: Page, name: string) => reportItems(page).filter({ has: page.locator('.report-item__name', { hasText: new RegExp(`^${name.replace(/[:()]/g, '.')}$`) }) })
+const reportTitle = (page: Page) => page.locator('.fbar__title')
 
-/** From an open report or the gallery: back to the gallery, the report's tab, then its picture. */
-async function openReport(page: Page, tab: string, name: string) {
-  if (await back(page).isVisible()) await back(page).click()
-  await tabs(page).getByRole('tab', { name: tab }).click()
-  await page.getByRole('button', { name, exact: true }).click()
-}
-
-test('the gallery opens on the first tab, a tab survives a reload, and a picture opens its report', async ({ browser }) => {
+test('the owner opens on the overview with four main figures and each report as one picture that opens alone', async ({ browser }) => {
   const page = await userWithRole(browser, 'Manager')
   await page.goto('/reports')
-  await expect(title(page)).toHaveText('گزارش‌ها')
-  await expect(tabs(page).getByRole('tab', { name: 'کار شفاخانه' })).toHaveAttribute('aria-selected', 'true')
-  await expect(page.getByRole('button', { name: 'کار داکتران' })).toBeVisible()
+  await expect(page).toHaveURL(/tab=overview.*period=today/)
+  for (const name of [overview, finance, pharmacy]) await expect(tab(page, name)).toBeVisible()
+  await expect(tab(page, overview)).toHaveAttribute('aria-selected', 'true')
+  await expect(heading(page)).toHaveText(overview)
+  await expect(tiles(page)).toHaveCount(4)
+  for (const label of ['مریضان', 'مریضان معاینه‌شده', 'عواید', 'خالص دریافتی']) {
+    await expect(tiles(page).filter({ has: page.locator('.rs__label', { hasText: new RegExp(`^${label}$`) }) })).toHaveCount(1)
+  }
+  // No folding rows: the reports are pictures, and none of their lists is on the tab.
+  await expect(page.locator('[aria-expanded]').filter({ has: page.locator('.report-detail__title') })).toHaveCount(0)
+  await expect(reportItems(page)).toHaveCount(2)
+  await expect(page.getByRole('columnheader', { name: 'عواید خالص بخش' })).toHaveCount(0)
 
-  await tabs(page).getByRole('tab', { name: 'پول و حساب' }).click()
-  await expect(page).toHaveURL(/group=money/)
-  await page.reload()
-  await expect(tabs(page).getByRole('tab', { name: 'پول و حساب' })).toHaveAttribute('aria-selected', 'true')
-
-  await page.getByRole('button', { name: 'دریافت‌ها', exact: true }).click()
-  await expect(title(page)).toHaveText('دریافت‌ها')
-  await expect(page).toHaveURL(/report=cash/)
-  await expect(page.getByRole('heading', { name: 'فهرست دریافت‌ها' })).toBeVisible()
-
-  await back(page).click()
-  await expect(title(page)).toHaveText('گزارش‌ها')
-  await expect(tabs(page).getByRole('tab', { name: 'پول و حساب' })).toHaveAttribute('aria-selected', 'true')
-})
-
-test('a report opens as one list with its few figures and row numbers', async ({ browser }) => {
-  const page = await userWithRole(browser, 'Manager')
-  await page.goto('/reports?report=patients&period=month')
-  await expect(title(page)).toHaveText('مراجعات مریضان')
-  await expect(page.locator('.report-tiles > *')).toHaveCount(4)
-  await expect(page.locator('.report-sheet .xr-card')).toHaveCount(1)
-  await expect(page.getByRole('columnheader', { name: 'ردیف' })).toBeVisible()
-  await expect(page.getByRole('columnheader', { name: 'نام مریض' })).toBeVisible()
+  // One report opens on its own page, with only its own list; back returns to the tab with the same days.
+  await item(page, 'عواید هر بخش').click()
+  await expect(page).toHaveURL(/tab=overview.*item=sections/)
+  await expect(reportTitle(page)).toHaveText('عواید هر بخش')
+  for (const name of ['معاینه داکتر', 'رفرکشن', 'عکس‌برداری', 'لابراتوار', 'جراحی', 'دواخانه', 'عینک']) {
+    await expect(page.getByRole('cell', { name, exact: true })).toBeVisible()
+  }
+  await expect(page.getByRole('columnheader', { name: 'معاینه‌شده' })).toHaveCount(0)
+  await expect(tiles(page)).toHaveCount(0)
+  for (const name of ['چاپ', 'Excel', 'PDF']) await expect(page.getByRole('button', { name, exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'همه گزارش‌ها' }).click()
+  await expect(page).not.toHaveURL(/item=/)
+  await expect(reportItems(page)).toHaveCount(2)
   await expect(page.getByRole('alert')).toHaveCount(0)
 })
 
-test('an accountant sees the money reports and can take Excel and PDF files', async ({ browser }) => {
-  const page = await userWithRole(browser, 'Accountant')
+test('the three tabs keep the same days, and a tab and its days survive a reload', async ({ browser }) => {
+  const page = await userWithRole(browser, 'Manager')
   await page.goto('/reports')
-  for (const group of ['کار شفاخانه', 'پول و حساب', 'دوا و گدام']) await expect(tabs(page).getByRole('tab', { name: group })).toBeVisible()
-  await tabs(page).getByRole('tab', { name: 'پول و حساب' }).click()
-  for (const name of moneyReports) await expect(page.getByRole('button', { name, exact: true })).toBeVisible()
+  await expect(heading(page)).toHaveText(overview)
 
-  await page.getByRole('button', { name: 'مصارف', exact: true }).click()
-  await expect(title(page)).toHaveText('مصارف')
+  // Only the simple choices: no «ماه گذشته».
+  for (const name of ['امروز', 'دیروز', 'این هفته', 'این ماه', 'دوره دلخواه']) await expect(bar(page).getByRole('button', { name, exact: true })).toBeVisible()
+  await expect(bar(page).getByRole('button', { name: 'ماه گذشته' })).toHaveCount(0)
 
-  const [excel] = await Promise.all([page.waitForEvent('download'), bar(page).getByRole('button', { name: 'Excel' }).click()])
-  expect(excel.suggestedFilename()).toMatch(/^report-expenses-\d{4}-\d{2}-\d{2}\.xlsx$/)
-  const workbook = await readFile(await excel.path())
-  expect([...workbook.subarray(0, 2)]).toEqual([0x50, 0x4b])
+  const month = page.waitForResponse((r) => r.url().includes('/api/reports/overview') && r.url().includes('from='))
+  await bar(page).getByRole('button', { name: 'این ماه' }).click()
+  const asked = new URL((await month).url()).searchParams
+  expect(asked.get('from')! <= asked.get('to')!).toBe(true)
+  await expect(page).toHaveURL(/period=month/)
 
-  const [pdf] = await Promise.all([page.waitForEvent('download'), bar(page).getByRole('button', { name: 'PDF' }).click()])
-  expect(pdf.suggestedFilename()).toMatch(/^report-expenses-\d{4}-\d{2}-\d{2}\.pdf$/)
+  const money = page.waitForResponse((r) => r.url().includes('/api/reports/finance'))
+  await tab(page, finance).click()
+  const same = new URL((await money).url()).searchParams
+  expect([same.get('from'), same.get('to')]).toEqual([asked.get('from'), asked.get('to')])
+  await expect(heading(page)).toHaveText(finance)
+  await expect(page).toHaveURL(/tab=finance.*period=month/)
+
+  await page.reload()
+  await expect(heading(page)).toHaveText(finance)
+  await expect(bar(page).getByRole('button', { name: 'این ماه' })).toHaveAttribute('aria-pressed', 'true')
+
+  await bar(page).getByRole('button', { name: 'دوره دلخواه' }).click()
+  const custom = page.waitForResponse((r) => r.url().includes('/api/reports/finance') && r.url().includes('from=2026-03-21'))
+  await page.getByRole('textbox', { name: 'از تاریخ' }).fill('1405/01/01')
+  await page.getByRole('textbox', { name: 'از تاریخ' }).press('Tab')
+  await page.getByRole('textbox', { name: 'تا تاریخ' }).fill('1405/01/05')
+  await page.getByRole('textbox', { name: 'تا تاریخ' }).press('Tab')
+  await bar(page).getByRole('button', { name: 'نمایش', exact: true }).click()
+  await custom
+  await expect(page).toHaveURL(/period=custom.*from=2026-03-21.*to=2026-03-25/)
+  await expect(bar(page).getByText('1 حمل تا 5 حمل 1405')).toBeVisible()
+})
+
+test('an accountant reads the books and takes one report alone as Excel and PDF', async ({ browser }) => {
+  const page = await userWithRole(browser, 'Accountant')
+  await page.goto('/reports?tab=finance')
+  await expect(heading(page)).toHaveText(finance)
+  await expect(tiles(page)).toHaveCount(4)
+  for (const name of ['عواید هر بخش', 'محاسبه خالص دریافتی', 'پول نقد شفاخانه', 'صندوق‌ها', 'مصارف به تفکیک نوع', 'طلبات: فاکتورهای پرداخت‌نشده']) {
+    await expect(item(page, name)).toBeVisible()
+  }
+  // The debt to companies cannot be known, and the page says so instead of showing a number.
+  await expect(page.getByRole('note').filter({ hasText: 'بدهی شفاخانه به شرکت‌ها' })).toBeVisible()
+
+  await item(page, 'مصارف به تفکیک نوع').click()
+  await expect(page).toHaveURL(/item=expenses/)
+  await expect(reportTitle(page)).toHaveText('مصارف به تفکیک نوع')
+  const [excel] = await Promise.all([page.waitForEvent('download'), page.getByRole('button', { name: 'Excel', exact: true }).click()])
+  expect(excel.suggestedFilename()).toMatch(/^report-finance-expenses-\d{4}-\d{2}-\d{2}\.xlsx$/)
+  expect([...(await readFile(await excel.path())).subarray(0, 2)]).toEqual([0x50, 0x4b])
+
+  const [pdf] = await Promise.all([page.waitForEvent('download'), page.getByRole('button', { name: 'PDF', exact: true }).click()])
+  expect(pdf.suggestedFilename()).toMatch(/^report-finance-expenses-\d{4}-\d{2}-\d{2}\.pdf$/)
   expect((await readFile(await pdf.path())).subarray(0, 4).toString('ascii')).toBe('%PDF')
   await expect(page.getByRole('alert')).toHaveCount(0)
 })
 
-test('the five financial reports open through the existing gallery with periods, files and a single table on desktop and mobile', async ({ browser }) => {
-  const page = await userWithRole(browser, 'Accountant')
-  await page.goto('/reports?group=money')
-  await expect(page.locator('.rg__item')).toHaveCount(8)
-  expect(await page.getByRole('button', { name: 'خلاصه مصارف به تفکیک نوع', exact: true }).locator('.rg__name').evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true)
-  await page.locator('.rg').screenshot({ path: '../.artifacts/financial-reports/gallery-desktop.png' })
-  for (const [key, name] of financialReports) {
-    await openReport(page, 'پول و حساب', name)
-    await expect(title(page)).toHaveText(name)
-    await expect(page).toHaveURL(new RegExp(`report=${key}`))
-    await expect(page.locator('.report-tiles > *')).toHaveCount(4)
-    await expect(page.locator('.report-sheet .xr-card')).toHaveCount(1)
-    await expect(page.getByRole('group', { name: 'دوره گزارش' })).toBeVisible()
-    await expect(bar(page).getByRole('button', { name: 'Excel' })).toBeVisible()
-    await expect(bar(page).getByRole('button', { name: 'PDF' })).toBeVisible()
-    await expect(page.getByRole('alert')).toHaveCount(0)
-    await page.screenshot({ path: `../.artifacts/financial-reports/${key}-desktop.png`, fullPage: true })
-    await page.setViewportSize({ width: 375, height: 812 })
-    await expect.poll(() => page.locator('.layout__main').evaluate(el => Math.round(parseFloat(getComputedStyle(el).marginInlineStart)))) .toBe(0)
-    await expect.poll(() => page.locator('.sidebar').evaluate(el => el.getBoundingClientRect().left >= window.innerWidth)).toBe(true)
-    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
-    await page.screenshot({ path: `../.artifacts/financial-reports/${key}-mobile.png`, fullPage: true })
-    await page.setViewportSize({ width: 1400, height: 900 })
-  }
-  await page.goto('/reports?group=money')
-  await page.setViewportSize({ width: 375, height: 812 })
-  await expect(page.locator('.rg__item')).toHaveCount(8)
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
-  expect(await page.getByRole('button', { name: 'خلاصه مصارف به تفکیک نوع', exact: true }).locator('.rg__name').evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true)
-  await page.locator('.rg').screenshot({ path: '../.artifacts/financial-reports/gallery-mobile.png' })
-})
-
-test('a doctor sees no money report, cannot take files, and an address asking for one falls back without asking the server', async ({ browser }) => {
+test('a doctor sees the work of the hospital but no money, no other tab and no files', async ({ browser }) => {
   const page = await userWithRole(browser, 'Doctor')
   const asked: string[] = []
   page.on('request', (request) => {
     if (request.url().includes('/api/reports/')) asked.push(new URL(request.url()).pathname)
   })
 
-  await page.goto('/reports?report=cash&period=month')
-  await expect(title(page)).toHaveText('گزارش‌ها')
-  await expect(page).not.toHaveURL(/report=/)
-  await expect(tabs(page).getByRole('tab', { name: 'کار شفاخانه' })).toBeVisible()
-  await expect(tabs(page).getByRole('tab', { name: 'پول و حساب' })).toHaveCount(0)
-  await expect(tabs(page).getByRole('tab', { name: 'دوا و گدام' })).toHaveCount(0)
-  await expect(page.getByRole('button', { name: 'مراجعات مریضان' })).toBeVisible()
-
-  await page.getByRole('button', { name: 'کار داکتران' }).click()
-  await expect(title(page)).toHaveText('کار داکتران')
-  await expect(bar(page).getByRole('button', { name: 'Excel' })).toHaveCount(0)
-  await expect(bar(page).getByRole('button', { name: 'PDF' })).toHaveCount(0)
+  await page.goto('/reports?tab=finance&period=month')
+  await expect(heading(page)).toHaveText(overview)
+  await expect(page).toHaveURL(/tab=overview/)
+  await expect(tabs(page)).toHaveCount(0)
+  await expect(tiles(page)).toHaveCount(2)
+  await expect(page.getByText('خالص دریافتی')).toHaveCount(0)
+  await item(page, 'مریضان هر داکتر').click()
+  await expect(reportTitle(page)).toHaveText('مریضان هر داکتر')
+  for (const name of ['چاپ', 'Excel', 'PDF']) await expect(page.getByRole('button', { name, exact: true })).toHaveCount(0)
   await expect(page.getByRole('alert')).toHaveCount(0)
-  expect(asked).not.toContain('/api/reports/cash')
+  expect(asked).not.toContain('/api/reports/finance')
 })
 
-test('changing the period loads at once and survives a reload', async ({ browser }) => {
-  const page = await userWithRole(browser, 'Manager')
-  await page.goto('/reports?report=doctors')
-  await expect(title(page)).toHaveText('کار داکتران')
-
-  const patients = page.waitForResponse((r) => r.url().includes('/api/reports/patients'))
-  await openReport(page, 'کار شفاخانه', 'مراجعات مریضان')
-  await patients
-  await expect(title(page)).toHaveText('مراجعات مریضان')
-  await expect(page).toHaveURL(/report=patients/)
-
-  const lastMonth = page.waitForResponse((r) => r.url().includes('/api/reports/patients') && r.url().includes('from='))
-  await page.getByRole('button', { name: 'ماه گذشته' }).click()
-  const response = await lastMonth
-  const asked = new URL(response.url()).searchParams
-  expect(asked.get('from')! < asked.get('to')!).toBe(true)
-  await expect(page).toHaveURL(/period=last-month/)
-  await expect(page.getByRole('button', { name: 'ماه گذشته' })).toHaveAttribute('aria-pressed', 'true')
-
-  await page.reload()
-  await expect(title(page)).toHaveText('مراجعات مریضان')
-  await expect(page.getByRole('button', { name: 'ماه گذشته' })).toHaveAttribute('aria-pressed', 'true')
-
-  await page.getByRole('button', { name: 'دوره دلخواه' }).click()
-  await expect(page.getByRole('textbox', { name: 'از تاریخ' })).toBeVisible()
-  const custom = page.waitForResponse((r) => r.url().includes('/api/reports/patients') && r.url().includes('from='))
-  await page.getByRole('textbox', { name: 'از تاریخ' }).fill('1405/01/01')
-  await page.getByRole('textbox', { name: 'از تاریخ' }).press('Tab')
-  await page.getByRole('textbox', { name: 'تا تاریخ' }).fill('1405/01/05')
-  await page.getByRole('textbox', { name: 'تا تاریخ' }).press('Tab')
-  await page.getByRole('button', { name: 'نمایش', exact: true }).click()
-  await custom
-  await expect(page).toHaveURL(/period=custom.*from=2026-03-21.*to=2026-03-25/)
-  await expect(bar(page).getByText('1 حمل تا 5 حمل 1405')).toBeVisible()
+test('the pharmacy tab shows sales, profit and the store in four figures', async ({ browser }) => {
+  const page = await userWithRole(browser, 'Pharmacist')
+  // A pharmacist also reads the overview's counts, so the pharmacy tab is chosen.
+  await page.goto('/reports?tab=pharmacy')
+  await expect(heading(page)).toHaveText(pharmacy)
+  await expect(tiles(page)).toHaveCount(4)
+  for (const label of ['فروشات', 'سود فروشات', 'ارزش موجودی گدام', 'اجناس تمام‌شده یا کمبود']) {
+    await expect(tiles(page).filter({ has: page.locator('.rs__label', { hasText: new RegExp(`^${label}$`) }) })).toHaveCount(1)
+  }
+  for (const name of ['فروشات', 'اجناس تمام‌شده و کمبود', 'اجناس منقضی و نزدیک به انقضا', 'موجودی همه اجناس']) await expect(item(page, name)).toBeVisible()
+  await item(page, 'فروشات').click()
+  await expect(page.getByRole('cell', { name: 'دواخانه', exact: true })).toBeVisible()
+  await expect(page.getByRole('cell', { name: 'عینک', exact: true })).toHaveCount(0)
 })
 
 test('a late answer never replaces a newer choice', async ({ browser }) => {
   const page = await userWithRole(browser, 'Manager')
-  await page.goto('/reports?report=doctors')
-  await expect(title(page)).toHaveText('کار داکتران')
+  await page.goto('/reports')
+  await expect(heading(page)).toHaveText(overview)
 
-  await page.route('**/api/reports/patients*', async (route) => {
+  await page.route('**/api/reports/finance*', async (route) => {
     await new Promise((resolve) => setTimeout(resolve, 1500))
     await route.continue().catch(() => {})
   })
-  await openReport(page, 'کار شفاخانه', 'مراجعات مریضان')
-  await openReport(page, 'کار شفاخانه', 'عملیات‌ها')
-  await expect(title(page)).toHaveText('عملیات‌ها')
+  await tab(page, finance).click()
+  await tab(page, pharmacy).click()
+  await expect(heading(page)).toHaveText(pharmacy)
   await page.waitForTimeout(2000)
-  await expect(title(page)).toHaveText('عملیات‌ها')
+  await expect(heading(page)).toHaveText(pharmacy)
   await expect(page.getByRole('alert')).toHaveCount(0)
-})
-
-test('a report of the present moment has no period controls', async ({ browser }) => {
-  const page = await userWithRole(browser, 'Manager')
-  await page.goto('/reports?report=stock')
-  await expect(title(page)).toHaveText('موجودی گدام')
-  await expect(bar(page).getByText(/وضعیت همین حالا/)).toBeVisible()
-  await expect(page.getByRole('group', { name: 'دوره گزارش' })).toHaveCount(0)
-
-  await openReport(page, 'کار شفاخانه', 'کار داکتران')
-  await expect(page.getByRole('group', { name: 'دوره گزارش' })).toBeVisible()
 })
 
 test('a failed report says so and retry brings it back', async ({ browser }) => {
   const page = await userWithRole(browser, 'Manager')
-  await page.route('**/api/reports/doctors*', (route) => route.fulfill({ status: 500, json: {} }))
-  await page.goto('/reports?report=doctors')
+  await page.route('**/api/reports/overview*', (route) => route.fulfill({ status: 500, json: {} }))
+  await page.goto('/reports')
   await expect(page.getByRole('alert')).toBeVisible()
-  await page.unroute('**/api/reports/doctors*')
+  await page.unroute('**/api/reports/overview*')
   await page.getByRole('button', { name: 'تلاش دوباره' }).click()
-  await expect(title(page)).toHaveText('کار داکتران')
+  await expect(heading(page)).toHaveText(overview)
   await expect(page.getByRole('alert')).toHaveCount(0)
 })
 
-test('at phone width a report still works and the page never scrolls sideways', async ({ browser }) => {
+test('at phone width every tab works and the page never scrolls sideways', async ({ browser }) => {
   const page = await userWithRole(browser, 'Manager', { width: 375, height: 760 })
-  await page.goto('/reports?report=doctors&period=month')
-  await expect(title(page)).toHaveText('کار داکتران')
-  await expect(back(page)).toBeVisible()
-
-  await openReport(page, 'پول و حساب', 'دریافت‌ها')
-  await expect(title(page)).toHaveText('دریافت‌ها')
-  await expect(page).toHaveURL(/report=cash/)
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
-  expect(overflow).toBeLessThanOrEqual(0)
+  await page.goto('/reports?period=month')
+  for (const name of [overview, finance, pharmacy]) {
+    await tab(page, name).click()
+    await expect(heading(page)).toHaveText(name)
+    const sideways = () => page.evaluate(() => {
+      const main = document.querySelector('.layout__main')!
+      return Math.max(document.documentElement.scrollWidth - document.documentElement.clientWidth, main.scrollWidth - main.clientWidth)
+    })
+    expect(await sideways()).toBeLessThanOrEqual(0)
+    await reportItems(page).first().click()
+    await expect(page).toHaveURL(/item=/)
+    expect(await sideways()).toBeLessThanOrEqual(0)
+    await page.getByRole('button', { name: 'همه گزارش‌ها' }).click()
+  }
 })

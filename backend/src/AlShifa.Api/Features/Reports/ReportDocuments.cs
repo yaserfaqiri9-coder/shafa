@@ -2,7 +2,6 @@ using AlShifa.Api.Features.Auth;
 using AlShifa.Api.Features.Clinical;
 using AlShifa.Api.Features.Finance;
 using AlShifa.Api.Features.Inventory;
-using AlShifa.Api.Features.Patients;
 using AlShifa.Api.Features.Settings;
 using AlShifa.Api.Features.Visits;
 using AlShifa.Api.Infrastructure;
@@ -21,24 +20,36 @@ public static class ReportKind
     public const string DateTime = "datetime";
 }
 
-public sealed record ReportTile(string Label, decimal Value, string Kind);
+/// <param name="Value">Null when the recorded data cannot give a true figure; it is then shown as «نامعلوم», never as a guess.</param>
+/// <param name="Note">One short line under the figure that says what it is, such as what it is not to be confused with.</param>
+/// <param name="Main">One of the few (at most four) figures the page shows on top of the tab. The others stay in the document for
+/// the home page and the checks that tie the tabs together, and each is also a line of one of the reports below.</param>
+public sealed record ReportTile(string Label, decimal? Value, string Kind, string? Note = null, bool Main = false);
 
 public sealed record ReportColumn(string Label, string Kind);
 
 /// <param name="Note">One plain sentence, only when a reader could otherwise misread the list, such as a list cut short.</param>
-public sealed record ReportTable(string Title, IReadOnlyList<ReportColumn> Columns, IReadOnlyList<IReadOnlyList<object?>> Rows, IReadOnlyList<object?>? Total = null, string? Note = null);
+/// <param name="Key">The report's own name in the page address and the export link, so one report opens, prints and exports alone.</param>
+public sealed record ReportTable(string Title, IReadOnlyList<ReportColumn> Columns, IReadOnlyList<IReadOnlyList<object?>> Rows, IReadOnlyList<object?>? Total = null, string? Note = null, string Key = "");
 
 public sealed record ReportPoint(DateOnly Date, decimal Value);
 
 public sealed record ReportTrend(string Title, string Kind, IReadOnlyList<ReportPoint> Points);
 
 /// <summary>
-/// One report in the single shape the page shows and the Excel and PDF files are made from: at most four figures and one
-/// list with the detail behind them. From and To are null on a report of the present moment.
+/// One report tab in the single shape the page shows and the Excel and PDF files are made from: the main figures on top,
+/// then the lists behind them, which the page opens only on request.
 /// </summary>
-public sealed record ReportDocument(string Title, string Description, DateOnly? From, DateOnly? To, IReadOnlyList<ReportTile> Tiles, ReportTrend? Trend, IReadOnlyList<ReportTable> Tables);
+/// <param name="Warnings">Plain sentences on what the figures cannot show, such as a profit that cannot be known.</param>
+public sealed record ReportDocument(
+    string Title, string Description, DateOnly? From, DateOnly? To, IReadOnlyList<ReportTile> Tiles, ReportTrend? Trend, IReadOnlyList<ReportTable> Tables,
+    IReadOnlyList<string>? Warnings = null);
 
-public static partial class ReportDocuments
+/// <summary>
+/// The three reports: the hospital at a glance, money and accounts, pharmacy and store. Every money figure comes from
+/// <see cref="ReportFigures"/>, so a figure shown on two tabs is always the same number.
+/// </summary>
+public static class ReportDocuments
 {
     /// <summary>A list longer than this is cut, with a sentence saying so; a narrower period shows the rest.</summary>
     private const int MaxListRows = 3000;
@@ -50,26 +61,15 @@ public static partial class ReportDocuments
     private delegate Task<ReportDocument> Builder(Period period, AppDbContext db, HttpContext http, CancellationToken ct);
 
     /// <param name="Permission">Needed to reach the report at all.</param>
-    /// <param name="AlsoAny">When not empty, one of these is needed too: a list that names patients needs the right to see them.</param>
-    private sealed record Definition(string Permission, string[] AlsoAny, bool NoPeriod, Builder Build);
+    private sealed record Definition(string Permission, Builder Build);
 
     private static readonly Dictionary<string, Definition> Reports = new()
     {
-        ["patients"] = new("reports.view", ["patients.view"], false, PatientsAsync),
-        ["doctors"] = new("reports.view", [], false, DoctorsAsync),
-        ["surgeries"] = new("reports.view", ["surgery.view"], false, SurgeriesAsync),
-        ["diagnostics"] = new("reports.view", ["diagnostics.view"], false, DiagnosticsAsync),
-        ["diseases"] = new("reports.view", [], false, DiseasesAsync),
-        ["cash"] = new("ledger.view", [], false, CashAsync),
-        ["outstanding"] = new("ledger.view", [], true, (_, db, _, ct) => OutstandingAsync(db, ct)),
-        ["expenses"] = new("ledger.view", [], false, ExpensesAsync),
-        ["profit-loss"] = new("ledger.view", [], false, ProfitLossAsync),
-        ["revenue-sources"] = new("ledger.view", [], false, RevenueSourcesAsync),
-        ["expense-summary"] = new("ledger.view", [], false, ExpenseSummaryAsync),
-        ["daily-finance"] = new("ledger.view", [], false, DailyFinanceAsync),
-        ["cash-flow"] = new("ledger.view", [], false, CashFlowAsync),
-        ["sales"] = new("reports.view", ["pharmacy.view", "optical.view"], false, SalesAsync),
-        ["stock"] = new("inventory.view", [], true, (_, db, _, ct) => StockAsync(db, ct)),
+        // Counts for everyone who may see reports; its money only for those who may see the books.
+        ["overview"] = new("reports.view", OverviewAsync),
+        ["finance"] = new("ledger.view", FinanceAsync),
+        // Sales are shown to each section that may see them; the store's state is the same for all.
+        ["pharmacy"] = new("inventory.view", PharmacyAsync),
     };
 
     public static void MapReportDocuments(this IEndpointRouteBuilder group)
@@ -80,7 +80,7 @@ public static partial class ReportDocuments
                 Results.Ok(await BuildAsync(definition, from, to, db, http, ct))).RequirePermission(definition.Permission);
 
             // The same document as the page, written as an Excel workbook or a PDF page by page.
-            group.MapGet($"/{key}/export", async (string? format, DateOnly? from, DateOnly? to, AppDbContext db, HttpContext http, CancellationToken ct) =>
+            group.MapGet($"/{key}/export", async (string? format, string? item, DateOnly? from, DateOnly? to, AppDbContext db, HttpContext http, CancellationToken ct) =>
             {
                 var excel = string.Equals(format, "xlsx", StringComparison.OrdinalIgnoreCase);
                 if (!excel && !string.Equals(format, "pdf", StringComparison.OrdinalIgnoreCase))
@@ -90,8 +90,14 @@ public static partial class ReportDocuments
 
                 Need(http, excel ? ["reports.export"] : ["reports.print", "reports.export"]);
                 var document = await BuildAsync(definition, from, to, db, http, ct);
-                var hospital = (await SettingsEndpoints.LoadAsync(db, ct)).HospitalName;
                 var name = $"report-{key}-{ReportText.FileDate(document.From ?? KabulClock.Today)}";
+                if (!string.IsNullOrEmpty(item))
+                {
+                    document = Single(document, item);
+                    name = $"report-{key}-{item}-{ReportText.FileDate(document.From ?? KabulClock.Today)}";
+                }
+
+                var hospital = (await SettingsEndpoints.LoadAsync(db, ct)).HospitalName;
                 return excel
                     ? Results.File(ReportExcel.Build(document, hospital), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"{name}.xlsx")
                     : Results.File(ReportPdf.Build(document, hospital), "application/pdf", $"{name}.pdf");
@@ -99,21 +105,34 @@ public static partial class ReportDocuments
         }
     }
 
+    /// <summary>Reports whose figures rest on the tab's definitions and warnings, such as a profit that cannot be known; they carry both into their file.</summary>
+    private static readonly HashSet<string> ExplainedReports = ["sections", "profit", "cash", "sales"];
+
+    /// <summary>
+    /// One report of a tab as a document of its own: its title, days, rows and total, built from the very same document the page shows,
+    /// so the file always holds exactly the numbers on screen and nothing of the other reports.
+    /// </summary>
+    private static ReportDocument Single(ReportDocument document, string item)
+    {
+        var table = document.Tables.FirstOrDefault(t => t.Key == item)
+            ?? throw new AppException(StatusCodes.Status404NotFound, "report_not_found", "این گزارش پیدا نشد یا شما به آن دسترسی ندارید.");
+        var explained = ExplainedReports.Contains(item);
+        // The tab's name heads the file, and the report's own title stands over its list, so the two are never printed twice.
+        return new ReportDocument(document.Title, explained ? document.Description : "", document.From, document.To, [], null, [table], explained ? document.Warnings : null);
+    }
+
     private static Task<ReportDocument> BuildAsync(Definition definition, DateOnly? from, DateOnly? to, AppDbContext db, HttpContext http, CancellationToken ct)
     {
-        if (definition.AlsoAny.Length > 0)
-        {
-            Need(http, definition.AlsoAny);
-        }
-
         var (start, end) = ReportEndpoints.Range(from, to);
         var (startUtc, endUtc) = ReportEndpoints.UtcRange(start, end);
         return definition.Build(new Period(start, end, startUtc, endUtc), db, http, ct);
     }
 
+    private static bool Has(HttpContext http, string permission) => http.User.HasClaim(RolePermissions.ClaimType, permission);
+
     private static void Need(HttpContext http, string[] any)
     {
-        if (!any.Any(permission => http.User.HasClaim(RolePermissions.ClaimType, permission)))
+        if (!any.Any(permission => Has(http, permission)))
         {
             throw new AppException(StatusCodes.Status403Forbidden, "forbidden", "شما به این گزارش دسترسی ندارید.");
         }
@@ -129,13 +148,14 @@ public static partial class ReportDocuments
 
     private static ReportColumn Date(string label) => new(label, ReportKind.Date);
 
-    private static ReportColumn Time(string label) => new(label, ReportKind.DateTime);
+    private static ReportTile CountTile(string label, decimal value, string? note = null, bool main = false) => new(label, value, ReportKind.Count, note, main);
 
-    private static ReportTile CountTile(string label, decimal value) => new(label, value, ReportKind.Count);
-
-    private static ReportTile MoneyTile(string label, decimal value) => new(label, value, ReportKind.Money);
+    private static ReportTile MoneyTile(string label, decimal? value, string? note = null, bool main = false) => new(label, value, ReportKind.Money, note, main);
 
     private static object?[] Row(params object?[] cells) => cells;
+
+    /// <summary>A figure that cannot be known is written as a word in a list, the same as on a tile.</summary>
+    private static object Known(decimal? value) => value is { } v ? v : ReportText.Unknown;
 
     private static string? Cut(int shown, int total, string what) => total > shown ? $"فقط {shown} {what} اول نشان داده شده است. برای دیدن بقیه، دوره کوتاه‌تری انتخاب کنید." : null;
 
@@ -143,290 +163,114 @@ public static partial class ReportDocuments
 
     private static DateOnly KabulDay(DateTime utc) => DateOnly.FromDateTime(utc.AddHours(4.5));
 
-    private static string GenderName(Gender gender) => gender switch
+    private static string ProfitNote(decimal? profit) => profit switch
     {
-        Gender.Male => "مرد",
-        Gender.Female => "زن",
-        _ => "دیگر",
+        null => "قیمت خرید بعضی اجناس ثبت نیست",
+        < 0 => "زیان",
+        _ => "سود",
     };
 
-    private static string EyeName(EyeSide eye) => eye switch
-    {
-        EyeSide.OD => "چشم راست",
-        EyeSide.OS => "چشم چپ",
-        EyeSide.Both => "هر دو چشم",
-        _ => "—",
-    };
+    /// <summary>Why a profit cannot be known, in words the owner can act on.</summary>
+    private static string UnknownCostWarning(int lines, decimal amount) =>
+        $"قیمت خرید {ReportText.Number(lines)} قلم جنس فروخته‌شده (به ارزش فروش {ReportText.Money(amount)}) در سیستم ثبت نیست؛ " +
+        "این‌ها اجناسی‌اند که بدون قیمت خرید وارد گدام شده‌اند یا شیشه عینکی که از بیرون سفارش شده است. " +
+        "تا قیمت خرید آن‌ها معلوم نباشد، سود واقعی حساب نمی‌شود و به‌جای رقم «نامعلوم» نوشته می‌شود.";
 
-    private static string VisitStatusName(VisitStatus status) => status switch
-    {
-        VisitStatus.Registered => "ثبت شده",
-        VisitStatus.Waiting => "در انتظار",
-        VisitStatus.InPreExam => "معاینه اولیه",
-        VisitStatus.ReadyForDoctor => "آماده برای داکتر",
-        VisitStatus.InConsultation => "نزد داکتر",
-        VisitStatus.AwaitingDiagnostic => "منتظر آزمایش",
-        VisitStatus.FollowUpRequired => "نیاز به پیگیری",
-        VisitStatus.Completed => "تکمیل شده",
-        VisitStatus.Cancelled => "لغو شده",
-        _ => "در انتظار پرداخت",
-    };
+    private const string MoneyDefinition =
+        "عواید فقط پولی است که واقعاً از مریضان گرفته شده، به تاریخ دریافت؛ خدمت پرداخت‌نشده عاید نیست، چه لغو شود چه نه. " +
+        "پول برگشت‌داده‌شده به تاریخ برگشت جدا نشان داده می‌شود. خالص دریافتی = عواید − پول برگشت‌داده‌شده − مصارف. " +
+        "پول رسیدی که برای چند بخش بوده، به نسبت قیمت خدمات هر بخش تقسیم شده است.";
 
-    private static string SurgeryStatusName(SurgeryStatus status) => status switch
-    {
-        SurgeryStatus.Proposed => "پیشنهاد شده",
-        SurgeryStatus.Scheduled => "وقت داده شده",
-        SurgeryStatus.InProgress => "در جریان",
-        SurgeryStatus.Completed => "انجام شده",
-        SurgeryStatus.FollowUp => "انجام شده، در پیگیری",
-        SurgeryStatus.Closed => "انجام شده، بسته",
-        _ => "لغو شده",
-    };
+    /// <summary>The same four money figures on the overview and the money tab; the overview keeps two of them on top, beside its patients.</summary>
+    private static ReportTile[] MoneyTiles(FinanceFigures f, bool allMain = true) =>
+    [
+        MoneyTile("عواید", f.Receipts, $"پول دریافت‌شده · {ReportText.Number(f.ReceiptCount)} رسید", main: true),
+        MoneyTile("پول برگشت‌داده‌شده", f.RefundsPaid, "پولی که به مریضان پس داده شد", main: allMain),
+        MoneyTile("مصارف", f.Expenses, main: allMain),
+        MoneyTile("خالص دریافتی", f.NetReceived, "عواید − برگشت پول − مصارف", main: true),
+    ];
 
-    private static string DiagnosticStatusName(DiagnosticStatus status) => status switch
-    {
-        DiagnosticStatus.Requested => "درخواست شده",
-        DiagnosticStatus.InProgress => "در جریان",
-        DiagnosticStatus.ResultReady => "نتیجه آماده",
-        _ => "لغو شده",
-    };
+    private static ReportTable SectionsTable(FinanceFigures f) =>
+        new("عواید هر بخش",
+            [Text("بخش"), Count("تعداد رسید"), Money("پول دریافت‌شده"), Money("پول برگشت‌داده‌شده"), Money("عواید خالص بخش")],
+            f.Sections.Select(s => (IReadOnlyList<object?>)Row(s.Name, s.Count, s.Received, -s.Refunded, s.Net)).ToList(),
+            Row("مجموع", f.ReceiptCount, f.Receipts, -f.RefundsPaid, f.NetRevenue),
+            "فقط پول واقعاً دریافت‌شده، به تاریخ دریافت. مصارف شفاخانه به بخش‌ها تقسیم نمی‌شود.",
+            "sections");
 
-    private static string DiagnosticKindName(DiagnosticKind kind) => kind switch
-    {
-        DiagnosticKind.Lab => "آزمایشگاه",
-        DiagnosticKind.Refraction => "رفرکشن",
-        _ => "عکس‌برداری",
-    };
+    // ───────────────────────────── 1. The hospital at a glance ─────────────────────────────
 
-    /// <summary>Every visit of the period, one line each: who came, when, to whom, and how it ended.</summary>
-    private static async Task<ReportDocument> PatientsAsync(Period p, AppDbContext db, HttpContext http, CancellationToken ct)
+    private static async Task<ReportDocument> OverviewAsync(Period p, AppDbContext db, HttpContext http, CancellationToken ct)
     {
-        var visits = db.Visits.AsNoTracking().Where(v => v.VisitDate >= p.Start && v.VisitDate <= p.End && v.Status != VisitStatus.AwaitingPayment);
-        var attended = visits.Where(v => v.Status != VisitStatus.Cancelled);
-        var total = await visits.CountAsync(ct);
+        var money = Has(http, "ledger.view");
+        var visits = db.Visits.AsNoTracking().Where(v => v.VisitDate >= p.Start && v.VisitDate <= p.End && v.Status != VisitStatus.AwaitingPayment && v.Status != VisitStatus.Cancelled);
+        var seen = ClinicalEndpoints.SeenByDoctor(db, visits);
 
-        var rows = await visits.OrderBy(v => v.VisitDate).ThenBy(v => v.QueueNumber).ThenBy(v => v.Id).Take(MaxListRows)
-            .Select(v => new
+        var visitCount = await visits.CountAsync(ct);
+        var patients = await visits.Select(v => v.PatientId).Distinct().CountAsync(ct);
+        var examined = await seen.Select(v => v.PatientId).Distinct().CountAsync(ct);
+        var cancelled = await db.Visits.AsNoTracking().CountAsync(v => v.VisitDate >= p.Start && v.VisitDate <= p.End && v.Status == VisitStatus.Cancelled, ct);
+
+        var byDoctor = await visits.GroupBy(v => v.Doctor != null ? v.Doctor.FullName : null).Select(g => new { Name = g.Key, Count = g.Count() }).ToListAsync(ct);
+        var seenByDoctor = await seen.GroupBy(v => v.Doctor != null ? v.Doctor.FullName : null).Select(g => new { Name = g.Key, Count = g.Count() }).ToListAsync(ct);
+        var doctors = byDoctor.Select(d => d.Name).Concat(seenByDoctor.Select(d => d.Name)).Distinct()
+            .Select(name => new
             {
-                v.VisitDate,
-                v.QueueNumber,
-                v.Patient!.FileNumber,
-                v.Patient.FirstName,
-                v.Patient.LastName,
-                v.Patient.Gender,
-                v.Patient.BirthDate,
-                v.Patient.EstimatedBirthYear,
-                Department = v.Department!.Name,
-                Doctor = v.Doctor != null ? v.Doctor.FullName : null,
-                v.Status,
-            }).ToListAsync(ct);
+                Name = name ?? "داکتر تعیین نشده",
+                Visits = byDoctor.Where(d => d.Name == name).Sum(d => d.Count),
+                Seen = seenByDoctor.Where(d => d.Name == name).Sum(d => d.Count),
+            })
+            .OrderBy(d => d.Name == "داکتر تعیین نشده").ThenByDescending(d => d.Seen).ThenBy(d => d.Name).ToList();
+
+        var f = await ReportFigures.LoadAsync(p.StartUtc, p.EndUtc, db, ct);
+
+        var tiles = new List<ReportTile>
+        {
+            CountTile("مریضان", patients, $"{ReportText.Number(visitCount)} مراجعه", main: true),
+            CountTile("مریضان معاینه‌شده", examined, "داکتر معاینه یا راجع کرده است", main: true),
+        };
+        var tables = new List<ReportTable>();
+        var warnings = new List<string>();
+
+        if (money)
+        {
+            tiles.AddRange(MoneyTiles(f, allMain: false));
+            tables.Add(SectionsTable(f));
+        }
+        else
+        {
+            tables.Add(new ReportTable("رسیدهای هر بخش", [Text("بخش"), Count("تعداد رسید")],
+                f.Sections.Select(s => (IReadOnlyList<object?>)Row(s.Name, s.Count)).ToList(),
+                Row("مجموع", f.ReceiptCount), "رسیدهایی که در این دوره برای خدمات هر بخش گرفته شد.", "sections"));
+        }
+
+        tables.Add(new ReportTable("مریضان هر داکتر", [Text("داکتر"), Count("مراجعات"), Count("معاینه‌شده")],
+            doctors.Select(d => (IReadOnlyList<object?>)Row(d.Name, d.Visits, d.Seen)).ToList(),
+            doctors.Count > 1 ? Row("مجموع", doctors.Sum(d => d.Visits), doctors.Sum(d => d.Seen)) : null,
+            cancelled > 0 ? $"{ReportText.Number(cancelled)} مراجعه لغو شده در این دوره شمرده نشده است." : null, "doctors"));
 
         return new ReportDocument(
-            "مراجعات مریضان", "هر مراجعه در یک سطر: تاریخ، مریض، بخش، داکتر و وضعیت.", p.Start, p.End,
-            [
-                CountTile("مراجعات", await attended.CountAsync(ct)),
-                CountTile("مریضان", await attended.Select(v => v.PatientId).Distinct().CountAsync(ct)),
-                CountTile("مریضان جدید", await db.Patients.AsNoTracking().CountAsync(x => x.CreatedAt >= p.StartUtc && x.CreatedAt < p.EndUtc, ct)),
-                CountTile("لغو شده", await visits.CountAsync(v => v.Status == VisitStatus.Cancelled, ct)),
-            ],
-            null,
-            [
-                new ReportTable("فهرست مراجعات",
-                    [Date("تاریخ"), Text("نوبت"), Text("شماره پرونده"), Text("نام مریض"), Text("جنسیت"), Count("سن"), Text("بخش"), Text("داکتر"), Text("وضعیت")],
-                    rows.Select(r => Row(r.VisitDate, r.QueueNumber?.ToString(), r.FileNumber, FullName(r.FirstName, r.LastName), GenderName(r.Gender),
-                        PatientEndpoints.AgeOf(r.BirthDate, r.EstimatedBirthYear), r.Department, r.Doctor ?? "—", VisitStatusName(r.Status))).ToList(),
-                    Note: Cut(rows.Count, total, "مراجعه")),
-            ]);
+            "گزارش عمومی شفاخانه",
+            "مریضان: هر مریض یک بار شمرده می‌شود، حتی اگر چند بار آمده باشد؛ مراجعات لغوشده شمرده نمی‌شوند. " +
+            "معاینه‌شده: داکتر معاینه را ثبت کرده یا مریض را به رفراکشن، عکس‌برداری یا لابراتوار راجع کرده است." +
+            (money ? " " + MoneyDefinition + " همه ارقام به وقت کابل." : " همه ارقام به وقت کابل."),
+            p.Start, p.End, tiles, null, tables, warnings);
     }
 
-    /// <summary>One line per doctor with what they did in the period. Counts only.</summary>
-    private static async Task<ReportDocument> DoctorsAsync(Period p, AppDbContext db, HttpContext http, CancellationToken ct)
+    // ───────────────────────────── 2. Money and accounts ─────────────────────────────
+
+    private static async Task<ReportDocument> FinanceAsync(Period p, AppDbContext db, HttpContext http, CancellationToken ct)
     {
-        var visits = await db.Visits.AsNoTracking()
-            .Where(v => v.VisitDate >= p.Start && v.VisitDate <= p.End && v.Status != VisitStatus.AwaitingPayment && v.Status != VisitStatus.Cancelled && v.Doctor != null)
-            .GroupBy(v => v.Doctor!.FullName).Select(g => new { Name = g.Key, Count = g.Count() }).ToListAsync(ct);
-        var finalized = await (
-            from c in db.Consultations.AsNoTracking()
-            join u in db.Users on c.AuthorUserId equals u.Id
-            where c.FinalizedAt != null && c.FinalizedAt >= p.StartUtc && c.FinalizedAt < p.EndUtc
-            group c by u.FullName into g
-            select new { Name = g.Key, Count = g.Count() }).ToListAsync(ct);
-        var prescriptions = await (
-            from x in db.MedicalPrescriptions.AsNoTracking()
-            join u in db.Users on x.DoctorUserId equals u.Id
-            where x.CreatedAt >= p.StartUtc && x.CreatedAt < p.EndUtc && x.Status != PrescriptionStatus.Cancelled
-            group x by u.FullName into g
-            select new { Name = g.Key, Count = g.Count() }).ToListAsync(ct);
-        var surgeries = await (
-            from x in db.SurgeryCases.AsNoTracking()
-            join u in db.Users on x.ResponsibleUserId equals u.Id
-            where x.CreatedAt >= p.StartUtc && x.CreatedAt < p.EndUtc && x.Status != SurgeryStatus.Cancelled
-            group x by u.FullName into g
-            select new { Name = g.Key, Count = g.Count() }).ToListAsync(ct);
+        var f = await ReportFigures.LoadAsync(p.StartUtc, p.EndUtc, db, ct);
 
-        int Visits(string name) => visits.FirstOrDefault(r => r.Name == name)?.Count ?? 0;
-        int Finalized(string name) => finalized.FirstOrDefault(r => r.Name == name)?.Count ?? 0;
-        int Prescriptions(string name) => prescriptions.FirstOrDefault(r => r.Name == name)?.Count ?? 0;
-        int Surgeries(string name) => surgeries.FirstOrDefault(r => r.Name == name)?.Count ?? 0;
-
-        var names = visits.Select(r => r.Name).Concat(finalized.Select(r => r.Name)).Concat(prescriptions.Select(r => r.Name)).Concat(surgeries.Select(r => r.Name))
-            .Distinct().OrderByDescending(Visits).ThenBy(name => name).ToList();
-
-        return new ReportDocument(
-            "کار داکتران", "هر داکتر در این دوره چند مریض دید، چند معاینه را نهایی کرد و چند نسخه و عملیات ثبت کرد.", p.Start, p.End,
-            [
-                CountTile("داکتران", names.Count),
-                CountTile("مراجعات", visits.Sum(r => r.Count)),
-                CountTile("معاینات نهایی‌شده", finalized.Sum(r => r.Count)),
-                CountTile("عملیات", surgeries.Sum(r => r.Count)),
-            ],
-            null,
-            [
-                new ReportTable("کار هر داکتر", [Text("داکتر"), Count("مراجعات"), Count("معاینات نهایی‌شده"), Count("نسخه دوا"), Count("عملیات")],
-                    names.Select(name => Row(name, Visits(name), Finalized(name), Prescriptions(name), Surgeries(name))).ToList(),
-                    names.Count > 1 ? Row("مجموع", visits.Sum(r => r.Count), finalized.Sum(r => r.Count), prescriptions.Sum(r => r.Count), surgeries.Sum(r => r.Count)) : null),
-            ]);
-    }
-
-    /// <summary>Every surgery case opened in the period, one line each.</summary>
-    private static async Task<ReportDocument> SurgeriesAsync(Period p, AppDbContext db, HttpContext http, CancellationToken ct)
-    {
-        var cases = db.SurgeryCases.AsNoTracking().Where(s => s.CreatedAt >= p.StartUtc && s.CreatedAt < p.EndUtc);
-        var statuses = await cases.GroupBy(s => s.Status).Select(g => new { Status = g.Key, Count = g.Count() }).ToListAsync(ct);
-        int Of(params SurgeryStatus[] wanted) => statuses.Where(s => wanted.Contains(s.Status)).Sum(s => s.Count);
-
-        var rows = await (
-            from s in cases
-            join u in db.Users on s.ResponsibleUserId equals u.Id
-            orderby s.CreatedAt
-            select new { s.CreatedAt, s.CaseNumber, s.Patient!.FileNumber, s.Patient.FirstName, s.Patient.LastName, s.SurgeryType, s.Eye, Doctor = u.FullName, s.ScheduledAt, s.Status })
-            .Take(MaxListRows).ToListAsync(ct);
-
-        return new ReportDocument(
-            "عملیات‌ها", "هر عملیات ثبت‌شده در این دوره در یک سطر: مریض، نوع عملیات، چشم، داکتر و وضعیت.", p.Start, p.End,
-            [
-                CountTile("همه عملیات‌ها", statuses.Sum(s => s.Count) - Of(SurgeryStatus.Cancelled)),
-                CountTile("انجام شده", Of(SurgeryStatus.Completed, SurgeryStatus.FollowUp, SurgeryStatus.Closed)),
-                CountTile("در انتظار", Of(SurgeryStatus.Proposed, SurgeryStatus.Scheduled, SurgeryStatus.InProgress)),
-                CountTile("لغو شده", Of(SurgeryStatus.Cancelled)),
-            ],
-            null,
-            [
-                new ReportTable("فهرست عملیات‌ها",
-                    [Date("تاریخ ثبت"), Text("شماره"), Text("شماره پرونده"), Text("نام مریض"), Text("نوع عملیات"), Text("چشم"), Text("داکتر"), Time("وقت عملیات"), Text("وضعیت")],
-                    rows.Select(r => Row(KabulDay(r.CreatedAt), r.CaseNumber, r.FileNumber, FullName(r.FirstName, r.LastName), r.SurgeryType, EyeName(r.Eye), r.Doctor, r.ScheduledAt, SurgeryStatusName(r.Status))).ToList(),
-                    Note: Cut(rows.Count, statuses.Sum(s => s.Count), "عملیات")),
-            ]);
-    }
-
-    /// <summary>Every lab, refraction and imaging request of the period, one line each.</summary>
-    private static async Task<ReportDocument> DiagnosticsAsync(Period p, AppDbContext db, HttpContext http, CancellationToken ct)
-    {
-        var orders = db.DiagnosticOrders.AsNoTracking().Where(o => o.CreatedAt >= p.StartUtc && o.CreatedAt < p.EndUtc);
-        var statuses = await orders.GroupBy(o => o.Status).Select(g => new { Status = g.Key, Count = g.Count() }).ToListAsync(ct);
-        int Of(params DiagnosticStatus[] wanted) => statuses.Where(s => wanted.Contains(s.Status)).Sum(s => s.Count);
-
-        var rows = await orders.OrderBy(o => o.CreatedAt).Take(MaxListRows)
-            .Select(o => new { o.CreatedAt, o.OrderNumber, o.Patient!.FileNumber, o.Patient.FirstName, o.Patient.LastName, Test = o.Test!.Name, o.Test.Kind, o.Status })
-            .ToListAsync(ct);
-
-        return new ReportDocument(
-            "آزمایش و عکس‌برداری", "هر درخواست آزمایش، رفرکشن و عکس‌برداری در یک سطر با وضعیت آن.", p.Start, p.End,
-            [
-                CountTile("همه درخواست‌ها", statuses.Sum(s => s.Count) - Of(DiagnosticStatus.Cancelled)),
-                CountTile("نتیجه آماده", Of(DiagnosticStatus.ResultReady)),
-                CountTile("هنوز باز", Of(DiagnosticStatus.Requested, DiagnosticStatus.InProgress)),
-                CountTile("لغو شده", Of(DiagnosticStatus.Cancelled)),
-            ],
-            null,
-            [
-                new ReportTable("فهرست درخواست‌ها",
-                    [Time("زمان"), Text("شماره"), Text("شماره پرونده"), Text("نام مریض"), Text("خدمت"), Text("بخش"), Text("وضعیت")],
-                    rows.Select(r => Row(r.CreatedAt, r.OrderNumber, r.FileNumber, FullName(r.FirstName, r.LastName), r.Test, DiagnosticKindName(r.Kind), DiagnosticStatusName(r.Status))).ToList(),
-                    Note: Cut(rows.Count, statuses.Sum(s => s.Count), "درخواست")),
-            ]);
-    }
-
-    /// <summary>Which diagnoses were made most, counted from finalized examinations only. No patient is named.</summary>
-    private static async Task<ReportDocument> DiseasesAsync(Period p, AppDbContext db, HttpContext http, CancellationToken ct)
-    {
-        var finalized = db.Diagnoses.AsNoTracking().Where(d => d.Consultation!.FinalizedAt != null && d.Consultation.FinalizedAt >= p.StartUtc && d.Consultation.FinalizedAt < p.EndUtc);
-        var rows = await finalized.GroupBy(d => d.Text)
-            .Select(g => new { Name = g.Key, Count = g.Count(), Right = g.Count(d => d.Eye == EyeSide.OD), Left = g.Count(d => d.Eye == EyeSide.OS), Both = g.Count(d => d.Eye == EyeSide.Both) })
-            .OrderByDescending(r => r.Count).ThenBy(r => r.Name).ToListAsync(ct);
-
-        return new ReportDocument(
-            "بیماری‌های شایع", "کدام تشخیص‌ها در این دوره بیشتر ثبت شده‌اند، از بیشتر به کمتر.", p.Start, p.End,
-            [
-                CountTile("تشخیص‌های ثبت‌شده", rows.Sum(r => r.Count)),
-                CountTile("نوع بیماری", rows.Count),
-                CountTile("مریضان", await finalized.Select(d => d.Consultation!.Visit!.PatientId).Distinct().CountAsync(ct)),
-            ],
-            null,
-            [
-                new ReportTable("تشخیص‌ها از بیشتر به کمتر", [Text("تشخیص"), Count("تعداد"), Count("چشم راست"), Count("چشم چپ"), Count("هر دو چشم")],
-                    rows.Select(r => Row(r.Name, r.Count, r.Right, r.Left, r.Both)).ToList(),
-                    rows.Count > 1 ? Row("مجموع", rows.Sum(r => r.Count), rows.Sum(r => r.Right), rows.Sum(r => r.Left), rows.Sum(r => r.Both)) : null),
-            ]);
-    }
-
-    /// <summary>Every receipt of the period, one line each, with who took it and how.</summary>
-    private static async Task<ReportDocument> CashAsync(Period p, AppDbContext db, HttpContext http, CancellationToken ct)
-    {
-        var payments = db.Payments.AsNoTracking().Where(x => x.CreatedAt >= p.StartUtc && x.CreatedAt < p.EndUtc);
-        var totals = await payments.GroupBy(x => x.Method).Select(g => new { Method = g.Key, Amount = g.Sum(x => x.Amount), Count = g.Count() }).ToListAsync(ct);
-        var cash = totals.Where(t => t.Method == PaymentMethod.Cash).Sum(t => t.Amount);
-        var other = totals.Where(t => t.Method != PaymentMethod.Cash).Sum(t => t.Amount);
-        var count = totals.Sum(t => t.Count);
-
-        var rows = await (
-            from x in payments
-            join u in db.Users on x.ReceivedByUserId equals u.Id
-            orderby x.CreatedAt
-            select new
-            {
-                x.CreatedAt,
-                x.ReceiptNumber,
-                x.Invoice!.InvoiceNumber,
-                File = x.Invoice.Patient != null ? x.Invoice.Patient.FileNumber : null,
-                First = x.Invoice.Patient != null ? x.Invoice.Patient.FirstName : null,
-                Last = x.Invoice.Patient != null ? x.Invoice.Patient.LastName : null,
-                x.Method,
-                Cashier = u.FullName,
-                x.Amount,
-            }).Take(MaxListRows).ToListAsync(ct);
-
-        return new ReportDocument(
-            "دریافت‌ها", "هر پولی که در این دوره در صندوق گرفته شد، در یک سطر.", p.Start, p.End,
-            [
-                MoneyTile("مجموع دریافت", cash + other),
-                MoneyTile("نقد", cash),
-                MoneyTile("غیرنقد", other),
-                CountTile("تعداد رسید", count),
-            ],
-            null,
-            [
-                new ReportTable("فهرست دریافت‌ها",
-                    [Time("زمان"), Text("رسید"), Text("فاکتور"), Text("شماره پرونده"), Text("نام مریض"), Text("روش"), Text("صندوق‌دار"), Money("مبلغ")],
-                    rows.Select(r => Row(r.CreatedAt, r.ReceiptNumber, r.InvoiceNumber, r.File ?? "—", r.First is null ? "بدون مریض" : FullName(r.First, r.Last),
-                        r.Method == PaymentMethod.Cash ? "نقد" : "غیرنقد", r.Cashier, r.Amount)).ToList(),
-                    rows.Count > 1 && rows.Count == count ? Row("مجموع", null, null, null, null, null, null, rows.Sum(r => r.Amount)) : null,
-                    Cut(rows.Count, count, "رسید")),
-            ]);
-    }
-
-    /// <summary>Invoices not yet fully paid, oldest first.</summary>
-    private static async Task<ReportDocument> OutstandingAsync(AppDbContext db, CancellationToken ct)
-    {
         var open = db.Invoices.AsNoTracking().Where(i => (i.Status == InvoiceStatus.Issued || i.Status == InvoiceStatus.PartiallyPaid) && i.Total - i.Discount - i.Paid > 0);
-        var count = await open.CountAsync(ct);
-        var total = await open.SumAsync(i => (decimal?)(i.Total - i.Discount - i.Paid), ct) ?? 0;
-        var rows = await open.OrderBy(i => i.Id).Take(MaxListRows)
+        var openCount = await open.CountAsync(ct);
+        var outstanding = await open.SumAsync(i => (decimal?)(i.Total - i.Discount - i.Paid), ct) ?? 0;
+        var openRows = await open.OrderBy(i => i.Id).Take(MaxListRows)
             .Select(i => new
             {
                 i.InvoiceNumber,
                 i.CreatedAt,
-                File = i.Patient != null ? i.Patient.FileNumber : null,
                 First = i.Patient != null ? i.Patient.FirstName : null,
                 Last = i.Patient != null ? i.Patient.LastName : null,
                 Item = i.Items.Where(x => !x.IsVoid).OrderBy(x => x.Id).Select(x => x.Description).FirstOrDefault(),
@@ -434,111 +278,126 @@ public static partial class ReportDocuments
                 i.Paid,
                 Balance = i.Total - i.Discount - i.Paid,
             }).ToListAsync(ct);
-
         var today = KabulClock.Today;
-        int Age(DateTime created) => today.DayNumber - KabulDay(created).DayNumber;
+
+        var categories = await (
+            from e in db.LedgerEntries.AsNoTracking()
+            join t in db.LedgerTransactions.AsNoTracking() on e.TransactionId equals t.Id
+            join expense in db.Expenses.AsNoTracking() on new { t.SourceType, t.SourceId } equals new { SourceType = nameof(Expense), SourceId = expense.Id } into expenses
+            from expense in expenses.DefaultIfEmpty()
+            where t.CreatedAt >= p.StartUtc && t.CreatedAt < p.EndUtc && e.AccountCode == Accounts.Expenses
+            group e by expense.Category ?? "بدون نوع" into g
+            select new { Category = g.Key, Amount = g.Sum(e => e.Debit - e.Credit) }).ToListAsync(ct);
+
+        var registers = await RegistersAsync(p, db, ct);
+
+        var calculation = new List<IReadOnlyList<object?>>
+        {
+            Row("عواید: پول دریافت‌شده از مریضان", f.Receipts),
+            Row("کسر: پول برگشت‌داده‌شده به مریضان", -f.RefundsPaid),
+            Row("کسر: مصارف", -f.Expenses),
+        };
+
+        var cash = new List<IReadOnlyList<object?>>
+        {
+            Row("پول نقد دفتری در آغاز دوره", f.CashOpening),
+            Row("دریافت از مریضان — نقد", f.ReceiptsCash),
+            Row("دریافت از مریضان — غیرنقد", f.Receipts - f.ReceiptsCash),
+            Row("پول برگشت‌داده‌شده به مریضان", -f.RefundsPaid),
+            Row("مصارف پرداخت‌شده", -f.Expenses),
+        };
+        if (f.CashOther != 0)
+        {
+            cash.Add(Row("سایر ثبت‌های صندوق (مانند موجودی آغاز سیستم)", f.CashOther));
+        }
+
+        var warnings = new List<string>();
+        // The system records purchases on credit but not the money later paid to the companies, so the debt itself is not known.
+        warnings.Add($"پرداخت پول به شرکت‌ها در سیستم ثبت نمی‌شود؛ بنابراین بدهی شفاخانه به شرکت‌ها حساب نمی‌شود. خرید اجناس از شرکت‌ها در این دوره: {ReportText.Money(f.Purchases)}.");
 
         return new ReportDocument(
-            "طلبات", "فاکتورهایی که هنوز کامل پرداخت نشده‌اند، از کهنه‌ترین به تازه‌ترین.", null, null,
+            "گزارش مالی و حسابداری",
+            MoneyDefinition + " طلبات و تخفیفات عاید نیستند و جدا نشان داده می‌شوند. " +
+            "تحویل و انتقال پول میان صندوق‌ها عاید یا مصرف نیست و در هیچ رقم این گزارش نمی‌آید. پول نقد دفتری، پولی است که طبق اسناد باید نزد شفاخانه باشد؛ پولی که از صندوق بیرون برده شده و ثبت نشده در آن نیست. همه ارقام به وقت کابل.",
+            p.Start, p.End,
             [
-                MoneyTile("مجموع طلب", total),
-                CountTile("فاکتورهای باز", count),
-                CountTile("کهنه‌تر از ۷ روز", rows.Count(r => Age(r.CreatedAt) > 7)),
+                .. MoneyTiles(f),
+                MoneyTile("طلبات از مریضان", outstanding, $"همین حالا · {ReportText.Number(openCount)} فاکتور · عاید نیست"),
+                MoneyTile("تخفیفات", f.Discounts, "عاید نیست"),
+                MoneyTile("پول نقد دفتری", f.CashClosing, "در پایان دوره"),
             ],
             null,
             [
-                new ReportTable("فاکتورهای پرداخت‌نشده",
-                    [Date("تاریخ"), Text("فاکتور"), Text("شماره پرونده"), Text("نام مریض"), Text("بابت"), Count("چند روز"), Money("مبلغ فاکتور"), Money("پرداخت‌شده"), Money("باقی")],
-                    rows.Select(r => Row(KabulDay(r.CreatedAt), r.InvoiceNumber, r.File ?? "—", r.First is null ? "بدون مریض" : FullName(r.First, r.Last), r.Item ?? "—",
-                        Age(r.CreatedAt), r.Payable, r.Paid, r.Balance)).ToList(),
-                    count > 1 && count <= MaxListRows ? Row("مجموع", null, null, null, null, null, rows.Sum(r => r.Payable), rows.Sum(r => r.Paid), rows.Sum(r => r.Balance)) : null,
-                    Cut(rows.Count, count, "فاکتور")),
-            ]);
-    }
-
-    /// <summary>Every recorded expense of the period, one line each.</summary>
-    private static async Task<ReportDocument> ExpensesAsync(Period p, AppDbContext db, HttpContext http, CancellationToken ct)
-    {
-        var expenses = db.Expenses.AsNoTracking().Where(e => e.Status == ExpenseStatus.Recorded && e.CreatedAt >= p.StartUtc && e.CreatedAt < p.EndUtc);
-        var count = await expenses.CountAsync(ct);
-        var total = await expenses.SumAsync(e => (decimal?)e.Amount, ct) ?? 0;
-        var rows = await expenses.OrderBy(e => e.ExpenseDate).ThenBy(e => e.Id).Take(MaxListRows)
-            .Select(e => new { e.ExpenseDate, e.ExpenseNumber, e.Category, e.Description, e.Amount }).ToListAsync(ct);
-
-        return new ReportDocument(
-            "مصارف", "هر مصرف ثبت‌شده در این دوره در یک سطر.", p.Start, p.End,
-            [
-                MoneyTile("مجموع مصارف", total),
-                CountTile("تعداد مصارف", count),
+                SectionsTable(f),
+                new ReportTable("محاسبه خالص دریافتی", [Text("شرح"), Money("مبلغ")], calculation, Row("خالص دریافتی", f.NetReceived), Key: "net"),
+                new ReportTable("پول نقد شفاخانه", [Text("شرح"), Money("مبلغ")], cash, Row("پول نقد دفتری در پایان دوره", f.CashClosing), Key: "cash"),
+                registers,
+                new ReportTable("مصارف به تفکیک نوع", [Text("نوع مصرف"), Money("مبلغ")],
+                    categories.OrderByDescending(c => c.Amount).ThenBy(c => c.Category).Select(c => (IReadOnlyList<object?>)Row(c.Category, c.Amount)).ToList(),
+                    Row("مجموع", f.Expenses), "مصرف لغوشده در روزی که لغو شده کم می‌شود.", "expenses"),
+                new ReportTable("طلبات: فاکتورهای پرداخت‌نشده", [Date("تاریخ"), Text("فاکتور"), Text("نام مریض"), Text("بابت"), Count("چند روز"), Money("مبلغ فاکتور"), Money("پرداخت‌شده"), Money("باقی")],
+                    openRows.Select(r => (IReadOnlyList<object?>)Row(KabulDay(r.CreatedAt), r.InvoiceNumber, r.First is null ? "بدون مریض" : FullName(r.First, r.Last), r.Item ?? "—",
+                        today.DayNumber - KabulDay(r.CreatedAt).DayNumber, r.Payable, r.Paid, r.Balance)).ToList(),
+                    openCount > 1 && openCount <= MaxListRows ? Row("مجموع", null, null, null, null, openRows.Sum(r => r.Payable), openRows.Sum(r => r.Paid), outstanding) : null,
+                    Cut(openRows.Count, openCount, "فاکتور") ?? "وضعیت همین حالا، از کهنه‌ترین به تازه‌ترین.", "outstanding"),
             ],
-            null,
-            [
-                new ReportTable("فهرست مصارف", [Date("تاریخ"), Text("شماره"), Text("نوع مصرف"), Text("شرح"), Money("مبلغ")],
-                    rows.Select(e => Row(e.ExpenseDate, e.ExpenseNumber, e.Category, e.Description ?? "—", e.Amount)).ToList(),
-                    count > 1 && count <= MaxListRows ? Row("مجموع", null, null, null, total) : null,
-                    Cut(rows.Count, count, "مصرف")),
-            ]);
+            warnings);
     }
 
-    /// <summary>Every delivered sale of the period, one line each. Each department sees only its own sales.</summary>
-    private static async Task<ReportDocument> SalesAsync(Period p, AppDbContext db, HttpContext http, CancellationToken ct)
+    /// <summary>Each cash register: who holds it now, the cash it took in the period, and any shortage or excess found at closing.</summary>
+    private static async Task<ReportTable> RegistersAsync(Period p, AppDbContext db, CancellationToken ct)
     {
-        var seesPharmacy = http.User.HasClaim(RolePermissions.ClaimType, "pharmacy.view");
-        var seesOptical = http.User.HasClaim(RolePermissions.ClaimType, "optical.view");
-
-        // A bill counts as a sale once its goods were handed over; a returned sale is left out.
-        var sales = db.Sales.AsNoTracking()
-            .Where(s => s.DeliveredAt >= p.StartUtc && s.DeliveredAt < p.EndUtc && !s.IsReturned && ((s.Kind == SaleKind.Pharmacy && seesPharmacy) || (s.Kind == SaleKind.Optical && seesOptical)));
-        var lines = await sales.SelectMany(s => s.Items.Select(i => new { s.Id, s.Kind, Amount = i.Quantity * i.UnitPrice })).ToListAsync(ct);
-        var totals = lines.GroupBy(l => l.Kind).Select(g => new { Kind = g.Key, Count = g.Select(l => l.Id).Distinct().Count(), Amount = g.Sum(l => l.Amount) }).ToList();
-        var count = totals.Sum(t => t.Count);
-
-        var rows = await sales.OrderBy(s => s.DeliveredAt).Take(MaxListRows)
-            .Select(s => new
+        var registers = await db.CashRegisters.AsNoTracking().OrderBy(r => r.Id).Select(r => new { r.Id, r.Name, r.IsActive }).ToListAsync(ct);
+        var open = await (
+            from s in db.CashSessions.AsNoTracking()
+            join u in db.Users on s.OpenedByUserId equals u.Id
+            where s.ClosedAt == null
+            select new
             {
-                s.DeliveredAt,
-                s.SaleNumber,
-                s.Kind,
-                File = s.Patient != null ? s.Patient.FileNumber : null,
-                First = s.Patient != null ? s.Patient.FirstName : null,
-                Last = s.Patient != null ? s.Patient.LastName : null,
-                Items = s.Items.Select(i => new { i.Product!.Name, i.Quantity }).ToList(),
-                Amount = s.Items.Sum(i => i.Quantity * i.UnitPrice),
+                s.RegisterId,
+                s.OpenedAt,
+                Cashier = u.FullName,
+                Expected = s.OpeningAmount + (db.Payments.Where(x => x.CashSessionId == s.Id && x.Method == PaymentMethod.Cash).Sum(x => (decimal?)x.Amount) ?? 0),
             }).ToListAsync(ct);
+        var received = await db.Payments.AsNoTracking().Where(x => x.CreatedAt >= p.StartUtc && x.CreatedAt < p.EndUtc && x.Method == PaymentMethod.Cash)
+            .GroupBy(x => x.CashSession!.RegisterId).Select(g => new { RegisterId = g.Key, Amount = g.Sum(x => x.Amount) }).ToListAsync(ct);
+        var closed = await db.CashSessions.AsNoTracking()
+            .Where(s => s.ClosedAt >= p.StartUtc && s.ClosedAt < p.EndUtc && s.CountedAmount != null && s.ExpectedAmount != null)
+            .GroupBy(s => s.RegisterId).Select(g => new { RegisterId = g.Key, Difference = g.Sum(s => s.CountedAmount!.Value - s.ExpectedAmount!.Value) }).ToListAsync(ct);
 
-        static string Goods(IEnumerable<(string Name, decimal Quantity)> items) =>
-            string.Join("، ", items.Select(i => $"{i.Name} ({ReportText.Number(i.Quantity)})"));
+        var rows = registers
+            .Where(r => r.IsActive || open.Any(o => o.RegisterId == r.Id) || received.Any(x => x.RegisterId == r.Id) || closed.Any(c => c.RegisterId == r.Id))
+            .Select(r =>
+            {
+                var session = open.Where(o => o.RegisterId == r.Id).OrderBy(o => o.OpenedAt).FirstOrDefault();
+                return (IReadOnlyList<object?>)Row(
+                    r.Name,
+                    session is null ? "بسته" : $"باز از {ReportText.Time(session.OpenedAt)}",
+                    session?.Cashier ?? "—",
+                    received.Where(x => x.RegisterId == r.Id).Sum(x => x.Amount),
+                    session?.Expected,
+                    closed.Where(c => c.RegisterId == r.Id).Sum(c => c.Difference));
+            }).ToList();
 
-        var tiles = new List<ReportTile>();
-        if (seesPharmacy)
-        {
-            tiles.Add(MoneyTile("فروش دواخانه", totals.Where(t => t.Kind == SaleKind.Pharmacy).Sum(t => t.Amount)));
-            tiles.Add(CountTile("تعداد فروش دواخانه", totals.Where(t => t.Kind == SaleKind.Pharmacy).Sum(t => t.Count)));
-        }
-
-        if (seesOptical)
-        {
-            tiles.Add(MoneyTile("فروش عینک", totals.Where(t => t.Kind == SaleKind.Optical).Sum(t => t.Amount)));
-            tiles.Add(CountTile("تعداد فروش عینک", totals.Where(t => t.Kind == SaleKind.Optical).Sum(t => t.Count)));
-        }
-
-        return new ReportDocument(
-            "فروش دواخانه و عینک", "هر فروش تحویل‌شده در این دوره در یک سطر با اجناس و مبلغ آن.", p.Start, p.End, tiles, null,
-            [
-                new ReportTable("فهرست فروش‌ها", [Time("زمان تحویل"), Text("شماره"), Text("بخش"), Text("نام مریض"), Text("اجناس"), Money("مبلغ")],
-                    rows.Select(r => Row(r.DeliveredAt, r.SaleNumber, r.Kind == SaleKind.Pharmacy ? "دواخانه" : "عینک",
-                        r.First is null ? "فروش مستقل" : FullName(r.First, r.Last), Goods(r.Items.Select(i => (i.Name, i.Quantity))), r.Amount)).ToList(),
-                    rows.Count > 1 && rows.Count == count ? Row("مجموع", null, null, null, null, rows.Sum(r => r.Amount)) : null,
-                    Cut(rows.Count, count, "فروش")),
-            ]);
+        return new ReportTable("صندوق‌ها",
+            [Text("صندوق"), Text("وضعیت"), Text("صندوق‌دار"), Money("دریافت نقد در این دوره"), Money("پول نقد که اکنون باید در صندوق باشد"), Money("کمی یا زیادی هنگام بستن")],
+            rows,
+            rows.Count > 1 ? Row("مجموع", null, null, received.Sum(x => x.Amount), open.Count > 0 ? open.Sum(o => o.Expected) : null, closed.Sum(c => c.Difference)) : null,
+            "پول باز صندوق = پول آغاز صندوق + پول نقد دریافت‌شده در همان نوبت. کمی با منفی و زیادی با مثبت نشان داده می‌شود.", "registers");
     }
 
-    /// <summary>Every active product with what is left, its nearest expiry, its value and one plain word on its state, problems first.</summary>
-    private static async Task<ReportDocument> StockAsync(AppDbContext db, CancellationToken ct)
+    // ───────────────────────────── 3. Pharmacy and store ─────────────────────────────
+
+    private static async Task<ReportDocument> PharmacyAsync(Period p, AppDbContext db, HttpContext http, CancellationToken ct)
     {
+        var seesPharmacy = Has(http, "pharmacy.view");
+        var seesOptical = Has(http, "optical.view");
+        var f = await ReportFigures.LoadAsync(p.StartUtc, p.EndUtc, db, ct);
+        var sales = f.Sales.Where(s => (s.Name == ReportSections.Pharmacy && seesPharmacy) || (s.Name == ReportSections.Optical && seesOptical)).ToList();
+        decimal? salesProfit = sales.Any(s => s.Profit is null) ? null : sales.Sum(s => s.Net - s.Cost);
+
         var today = KabulClock.Today;
         var soon = today.AddDays(NearExpiryDays);
-
         var products = await db.Products.AsNoTracking().Where(x => x.IsActive)
             .Select(x => new
             {
@@ -551,15 +410,18 @@ public static partial class ReportDocuments
                 Value = db.StockBatches.Where(b => b.ProductId == x.Id && b.Quantity > 0).Sum(b => (decimal?)(b.Quantity * b.UnitCost)) ?? 0,
                 Expiry = db.StockBatches.Where(b => b.ProductId == x.Id && b.Quantity > 0 && b.ExpiryDate != null).Min(b => b.ExpiryDate),
             }).ToListAsync(ct);
+        var batches = await db.StockBatches.AsNoTracking()
+            .Where(b => b.Quantity > 0 && b.ExpiryDate != null && b.ExpiryDate <= soon && b.Product!.IsActive)
+            .OrderBy(b => b.ExpiryDate).ThenBy(b => b.Product!.Name)
+            .Select(b => new { b.Product!.Name, b.LotNumber, b.ExpiryDate, b.Quantity, b.Product.Unit, Value = b.Quantity * b.UnitCost }).ToListAsync(ct);
 
-        // The order is the urgency: what is gone or spoiled first, ordinary stock last.
-        (int Rank, string Name) State(decimal onHand, decimal reorder, DateOnly? expiry) =>
-            onHand <= 0 ? (0, "ختم شده")
-            : expiry < today ? (1, "تاریخ گذشته")
-            : reorder > 0 && onHand <= reorder ? (2, "رو به ختم")
-            : expiry <= soon ? (3, "نزدیک به ختم تاریخ")
-            : (4, "عادی");
-
+        static bool Short(decimal onHand, decimal reorder) => onHand <= 0 || (reorder > 0 && onHand <= reorder);
+        string State(decimal onHand, decimal reorder, DateOnly? expiry) =>
+            onHand <= 0 ? "تمام شده"
+            : expiry < today ? "تاریخ گذشته"
+            : reorder > 0 && onHand <= reorder ? "کمبود"
+            : expiry <= soon ? "نزدیک به تاریخ انقضا"
+            : "عادی";
         static string KindName(ProductKind kind) => kind switch
         {
             ProductKind.Drug => "دوا",
@@ -568,25 +430,48 @@ public static partial class ReportDocuments
             _ => "عمومی",
         };
 
-        var rows = products.Select(x => new { x, State = State(x.OnHand, x.ReorderLevel, x.Expiry) })
-            .OrderBy(r => r.State.Rank).ThenBy(r => r.x.Name).ToList();
-        var shown = rows.Take(MaxListRows).ToList();
+        var shortages = products.Where(x => Short(x.OnHand, x.ReorderLevel)).OrderBy(x => x.OnHand > 0).ThenBy(x => x.Name).ToList();
+        var expiring = batches.Select(b => b.Name).Distinct().Count();
+        var stock = products.OrderBy(x => x.Name).Take(MaxListRows).ToList();
+
+        var tiles = new List<ReportTile>();
+        var tables = new List<ReportTable>();
+        var warnings = new List<string>();
+        if (sales.Count > 0)
+        {
+            tiles.Add(MoneyTile("فروشات", sales.Sum(s => s.Net), "پول دریافت‌شده، پس از کسر برگشت پول", main: true));
+            tiles.Add(MoneyTile("قیمت تمام‌شده", sales.Sum(s => s.Cost), "قیمت خرید اجناس تحویل‌شده"));
+            tiles.Add(MoneyTile("سود فروشات", salesProfit, ProfitNote(salesProfit), main: true));
+            tables.Add(new ReportTable("فروشات", [Text("بخش"), Count("تعداد رسید"), Money("فروشات"), Money("قیمت تمام‌شده"), Money("سود")],
+                sales.Select(s => (IReadOnlyList<object?>)Row(s.Name, s.Count, s.Net, s.Cost, Known(s.Profit))).ToList(),
+                sales.Count > 1 ? Row("مجموع", sales.Sum(s => s.Count), sales.Sum(s => s.Net), sales.Sum(s => s.Cost), Known(salesProfit)) : null, Key: "sales"));
+            if (salesProfit is null)
+            {
+                warnings.Add(UnknownCostWarning(sales.Sum(s => s.UnknownCostLines), sales.Sum(s => s.UnknownCostRevenue)));
+            }
+        }
+
+        tiles.Add(MoneyTile("ارزش موجودی گدام", products.Sum(x => x.Value), "به قیمت خرید · همین حالا", main: true));
+        tiles.Add(CountTile("اجناس تمام‌شده یا کمبود", shortages.Count, "همین حالا", main: true));
+        // A section that sells already fills four figures; without sales the store's expiry joins the top row.
+        tiles.Add(CountTile("منقضی یا نزدیک به انقضا", expiring, $"تا {ReportText.Number(NearExpiryDays)} روز آینده", main: sales.Count == 0));
+
+        tables.Add(new ReportTable("اجناس تمام‌شده و کمبود", [Text("جنس"), Text("نوع"), Quantity("موجودی"), Text("واحد"), Quantity("حد سفارش"), Text("وضعیت")],
+            shortages.Select(x => (IReadOnlyList<object?>)Row(x.Name, KindName(x.Kind), x.OnHand, x.Unit, x.ReorderLevel > 0 ? x.ReorderLevel : null, x.OnHand <= 0 ? "تمام شده" : "کمبود")).ToList(),
+            Key: "shortages"));
+        tables.Add(new ReportTable("اجناس منقضی و نزدیک به انقضا", [Text("جنس"), Text("نمبر لات"), Date("تاریخ انقضا"), Quantity("موجودی"), Text("واحد"), Money("ارزش"), Text("وضعیت")],
+            batches.Select(b => (IReadOnlyList<object?>)Row(b.Name, string.IsNullOrWhiteSpace(b.LotNumber) ? "—" : b.LotNumber, b.ExpiryDate, b.Quantity, b.Unit, b.Value,
+                b.ExpiryDate < today ? "تاریخ گذشته" : "نزدیک به انقضا")).ToList(),
+            batches.Count > 1 ? Row("مجموع", null, null, null, null, batches.Sum(b => b.Value), null) : null, Key: "expiring"));
+        tables.Add(new ReportTable("موجودی همه اجناس", [Text("جنس"), Text("کد"), Text("نوع"), Quantity("موجودی"), Text("واحد"), Date("نزدیک‌ترین تاریخ انقضا"), Money("ارزش"), Text("وضعیت")],
+            stock.Select(x => (IReadOnlyList<object?>)Row(x.Name, x.Code, KindName(x.Kind), x.OnHand, x.Unit, x.Expiry, x.Value, State(x.OnHand, x.ReorderLevel, x.Expiry))).ToList(),
+            stock.Count > 1 && stock.Count == products.Count ? Row("مجموع", null, null, null, null, null, products.Sum(x => x.Value), null) : null,
+            Cut(stock.Count, products.Count, "جنس"), "stock"));
 
         return new ReportDocument(
-            "موجودی گدام", "هر جنس با مقدار باقی‌مانده، نزدیک‌ترین تاریخ ختم و ارزش آن. اجناسی که توجه می‌خواهند اول آمده‌اند.", null, null,
-            [
-                MoneyTile("ارزش موجودی", products.Sum(x => x.Value)),
-                CountTile("اجناس", products.Count),
-                CountTile("ختم یا رو به ختم", rows.Count(r => r.State.Rank is 0 or 2)),
-                CountTile("تاریخ گذشته یا نزدیک", rows.Count(r => r.State.Rank is 1 or 3)),
-            ],
-            null,
-            [
-                new ReportTable("فهرست اجناس",
-                    [Text("جنس"), Text("کد"), Text("نوع"), Quantity("موجودی"), Text("واحد"), Quantity("حد سفارش"), Date("نزدیک‌ترین تاریخ ختم"), Money("ارزش"), Text("وضعیت")],
-                    shown.Select(r => Row(r.x.Name, r.x.Code, KindName(r.x.Kind), r.x.OnHand, r.x.Unit, r.x.ReorderLevel > 0 ? r.x.ReorderLevel : null, r.x.Expiry, r.x.Value, r.State.Name)).ToList(),
-                    rows.Count > 1 && shown.Count == rows.Count ? Row("مجموع", null, null, null, null, null, null, products.Sum(x => x.Value), null) : null,
-                    Cut(shown.Count, rows.Count, "جنس")),
-            ]);
+            "گزارش دواخانه و گدام",
+            "فروشات: پولی که در این دوره بابت دوا و عینک واقعاً دریافت شده، پس از کسر پول برگشت‌داده‌شده؛ بل پرداخت‌نشده فروش نیست. قیمت تمام‌شده: قیمت خرید اجناسی که در این دوره تحویل شده یا برگشته است. سود فروشات = فروشات − قیمت تمام‌شده. " +
+            "ارزش، کمبود و انقضای گدام وضعیت همین حالا را نشان می‌دهند، نه تاریخ انتخاب‌شده. همه ارقام به وقت کابل.",
+            p.Start, p.End, tiles, null, tables, warnings);
     }
 }

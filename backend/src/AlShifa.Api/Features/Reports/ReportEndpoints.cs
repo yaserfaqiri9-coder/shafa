@@ -12,6 +12,7 @@ public sealed record CountRow(string Name, int Count);
 
 public sealed record CashierRow(string Cashier, decimal Total);
 
+/// <summary>Home page money. Revenue fields are money received less money paid back, on the day it changed hands; Refunds is money paid back.</summary>
 public sealed record FinancialReport(
     DateOnly From, DateOnly To, decimal ServiceRevenue, decimal PharmacyRevenue, decimal OpticalRevenue, decimal Discounts, decimal Refunds,
     decimal NetRevenue, decimal CostOfGoods, decimal Expenses, decimal InventoryAdjustments, decimal Receipts, IReadOnlyList<CashierRow> ReceiptsByCashier,
@@ -78,26 +79,12 @@ public static class ReportEndpoints
         }).RequirePermission("ledger.view");
     }
 
-    /// <summary>Every figure comes from the ledger and source tables, so a report cannot disagree with the books.</summary>
+    /// <summary>The home page figures, from the same calculation as the report tabs, so the two can never disagree.</summary>
     internal static async Task<FinancialReport> LoadFinancialAsync(DateOnly start, DateOnly end, AppDbContext db, CancellationToken ct)
     {
         var (startUtc, endUtc) = UtcRange(start, end);
-
-        var movement = await (
-            from e in db.LedgerEntries.AsNoTracking()
-            join t in db.LedgerTransactions.AsNoTracking() on e.TransactionId equals t.Id
-            where t.CreatedAt >= startUtc && t.CreatedAt < endUtc
-            group e by e.AccountCode into g
-            select new { Code = g.Key, Debit = g.Sum(x => x.Debit), Credit = g.Sum(x => x.Credit) }).ToListAsync(ct);
-
-        decimal CreditNet(string code) => movement.Where(m => m.Code == code).Sum(m => m.Credit - m.Debit);
-        decimal DebitNet(string code) => movement.Where(m => m.Code == code).Sum(m => m.Debit - m.Credit);
-
-        var service = CreditNet(Accounts.ServiceRevenue);
-        var pharmacy = CreditNet(Accounts.PharmacyRevenue);
-        var optical = CreditNet(Accounts.OpticalRevenue);
-        var discounts = DebitNet(Accounts.Discounts);
-        var refunds = DebitNet(Accounts.Refunds);
+        var f = await ReportFigures.LoadAsync(startUtc, endUtc, db, ct);
+        decimal Revenue(string name) => f.Sections.Where(x => x.Name == name).Sum(x => x.Net);
 
         var byCashier = await (
             from p in db.Payments.AsNoTracking()
@@ -107,18 +94,20 @@ public static class ReportEndpoints
             select new CashierRow(g.Key, g.Sum(x => x.Amount))).ToListAsync(ct);
 
         var open = db.Invoices.AsNoTracking().Where(i => (i.Status == InvoiceStatus.Issued || i.Status == InvoiceStatus.PartiallyPaid) && i.Total - i.Discount - i.Paid > 0);
+        var pharmacy = Revenue(ReportSections.Pharmacy);
+        var optical = Revenue(ReportSections.Optical);
 
         return new FinancialReport(
-            start, end, service, pharmacy, optical, discounts, refunds,
-            service + pharmacy + optical - discounts - refunds,
-            DebitNet(Accounts.CostOfGoods),
-            DebitNet(Accounts.Expenses),
-            DebitNet(Accounts.InventoryAdjustments),
-            byCashier.Sum(c => c.Total),
+            start, end, f.NetRevenue - pharmacy - optical, pharmacy, optical, f.Discounts, f.RefundsPaid,
+            f.NetRevenue,
+            f.Cost,
+            f.Expenses,
+            f.StockAdjustments,
+            f.Receipts,
             byCashier,
             await open.SumAsync(i => (decimal?)(i.Total - i.Discount - i.Paid), ct) ?? 0,
             await open.CountAsync(ct),
-            await db.StockBatches.AsNoTracking().SumAsync(b => (decimal?)(b.Quantity * b.UnitCost), ct) ?? 0);
+            await db.StockBatches.AsNoTracking().Where(b => b.Quantity > 0).SumAsync(b => (decimal?)(b.Quantity * b.UnitCost), ct) ?? 0);
     }
 
     internal static (DateOnly Start, DateOnly End) Range(DateOnly? from, DateOnly? to)

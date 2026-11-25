@@ -1,56 +1,44 @@
-export { addDays, periodChoices, previousRange, quickRange, type DateRange, type PeriodKind } from '@/utils/period'
+import type { PeriodKind } from '@/utils/period'
 
-export interface ReportEntry {
-  key: string
-  name: string
-  /** One plain line on what the report shows, for a user who does not know the report names. */
-  hint: string
-  /** Any one of these opens the report; the server checks the same. */
-  needs: string[]
-  /** Shows the present moment, so it has no period to choose. */
-  noPeriod?: boolean
-}
-
-export interface ReportGroup {
-  /** Names the group's tab in the address, so a reload or back lands on the same tab. */
-  key: string
+export interface ReportTab {
+  /** The report's address on the server and the tab's name in the page address. */
+  key: 'overview' | 'finance' | 'pharmacy'
   title: string
-  reports: ReportEntry[]
+  icon: string
+  /** Any one of these opens the tab; the server checks the same. */
+  needs: string[]
 }
 
-/** Fifteen plain reports, each one list with the detail behind its few figures. */
-export const reportGroups: ReportGroup[] = [
-  {
-    key: 'clinic',
-    title: 'کار شفاخانه',
-    reports: [
-      { key: 'patients', name: 'مراجعات مریضان', hint: 'هر مراجعه با نام مریض، بخش، داکتر و وضعیت', needs: ['patients.view'] },
-      { key: 'doctors', name: 'کار داکتران', hint: 'هر داکتر چند مریض دید و چه کاری ثبت کرد', needs: ['reports.view'] },
-      { key: 'surgeries', name: 'عملیات‌ها', hint: 'هر عملیات با مریض، نوع، چشم و وضعیت', needs: ['surgery.view'] },
-      { key: 'diagnostics', name: 'آزمایش و عکس‌برداری', hint: 'هر درخواست آزمایش، رفرکشن و عکس‌برداری', needs: ['diagnostics.view'] },
-      { key: 'diseases', name: 'بیماری‌های شایع', hint: 'کدام تشخیص بیشتر ثبت شده است', needs: ['reports.view'] },
-    ],
-  },
-  {
-    key: 'money',
-    title: 'پول و حساب',
-    reports: [
-      { key: 'cash', name: 'دریافت‌ها', hint: 'هر پولی که در صندوق گرفته شد', needs: ['ledger.view'] },
-      { key: 'outstanding', name: 'طلبات', hint: 'فاکتورهایی که هنوز پرداخت نشده‌اند', needs: ['ledger.view'], noPeriod: true },
-      { key: 'expenses', name: 'مصارف', hint: 'هر مصرف ثبت‌شده', needs: ['ledger.view'] },
-      { key: 'profit-loss', name: 'مفاد و ضرر کل سیستم', hint: 'عواید خالص، قیمت خرید فروش‌ها، مصارف و مفاد ثبت‌شده', needs: ['ledger.view'] },
-      { key: 'revenue-sources', name: 'عواید بخش‌ها', hint: 'عواید خدمات هر بخش، دواخانه و عینک با کسورات مشترک', needs: ['ledger.view'] },
-      { key: 'expense-summary', name: 'خلاصه مصارف به تفکیک نوع', hint: 'جمع مصارف هر نوع با برگشت اسناد و مبلغ خالص', needs: ['ledger.view'] },
-      { key: 'daily-finance', name: 'عملکرد مالی روزانه', hint: 'مقایسه روزانه عواید خالص، مصارف و مفاد', needs: ['ledger.view'] },
-      { key: 'cash-flow', name: 'گردش حساب صندوق', hint: 'ورودی، خروجی و مانده دفتری حساب صندوق', needs: ['ledger.view'] },
-    ],
-  },
-  {
-    key: 'stock',
-    title: 'دوا و گدام',
-    reports: [
-      { key: 'sales', name: 'فروش دواخانه و عینک', hint: 'هر فروش با اجناس و مبلغ آن', needs: ['pharmacy.view', 'optical.view'] },
-      { key: 'stock', name: 'موجودی گدام', hint: 'هر جنس با موجودی، تاریخ ختم و ارزش', needs: ['inventory.view'], noPeriod: true },
-    ],
-  },
+/** Three reports, no more: the hospital at a glance, money and accounts, pharmacy and store. */
+export const reportTabs: ReportTab[] = [
+  { key: 'overview', title: 'گزارش عمومی شفاخانه', icon: 'ri-hospital-line', needs: ['reports.view'] },
+  { key: 'finance', title: 'گزارش مالی و حسابداری', icon: 'ri-money-dollar-circle-line', needs: ['ledger.view'] },
+  { key: 'pharmacy', title: 'گزارش دواخانه و گدام', icon: 'ri-capsule-line', needs: ['inventory.view'] },
 ]
+
+/** The one filter every report shares. */
+export const reportPeriods: PeriodKind[] = ['today', 'yesterday', 'week', 'month', 'custom']
+
+export interface ReportItemInfo {
+  /** The report's picture from the gallery artwork (ReportAvatar). */
+  art: string
+  /** One plain line on what the report shows, for an owner who does not know accounting words. */
+  hint: string
+  /** Rests on the tab's definitions and warnings (such as a profit that cannot be known), so it shows them too. */
+  explained?: boolean
+}
+
+/** Every report of the three tabs, by the key the server gives it. A report the server sends without an entry still opens, with a plain picture. */
+export const reportItems: Record<string, ReportItemInfo> = {
+  sections: { art: 'patients', hint: 'پول واقعاً دریافت‌شده هر بخش', explained: true },
+  doctors: { art: 'doctors', hint: 'هر داکتر چند مریض داشت و چند نفر را معاینه کرد' },
+  net: { art: 'income', hint: 'از پول دریافت‌شده تا خالص دریافتی، قدم به قدم', explained: true },
+  cash: { art: 'cash', hint: 'پول نقدی که طبق اسناد باید نزد شفاخانه باشد', explained: true },
+  registers: { art: 'adjustments', hint: 'هر صندوق: باز یا بسته، دریافت و کمی و زیادی' },
+  expenses: { art: 'expenses', hint: 'مصارف این دوره به تفکیک نوع' },
+  outstanding: { art: 'outstanding', hint: 'فاکتورهایی که مریضان هنوز نپرداخته‌اند' },
+  sales: { art: 'sales', hint: 'پول دریافت‌شده دواخانه و عینک، قیمت خرید و سود', explained: true },
+  shortages: { art: 'stock', hint: 'اجناسی که تمام شده یا کم مانده است' },
+  expiring: { art: 'outstanding', hint: 'اجناسی که تاریخ آن‌ها گذشته یا نزدیک است' },
+  stock: { art: 'overview', hint: 'موجودی و ارزش همه اجناس گدام' },
+}

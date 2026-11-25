@@ -12,12 +12,13 @@ using AlShifa.Api.Features.Settings;
 using AlShifa.Api.Features.Users;
 using AlShifa.Api.Features.Visits;
 using AlShifa.Api.Infrastructure;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace AlShifa.Tests;
 
 [Collection("api")]
-public sealed class ReportTests(ApiFixture api)
+public sealed class ReportTests(ApiFixture api) : PhysicalQueueTestScope(api)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } };
 
@@ -72,9 +73,10 @@ public sealed class ReportTests(ApiFixture api)
 
         var after = (await accountant.GetFromJsonAsync<FinancialReport>("/api/reports/financial", JsonOptions))!;
 
-        Assert.Equal(1000, after.ServiceRevenue - before.ServiceRevenue);
+        // Revenue is the money received less the money paid back; the 400 still owed is not revenue.
+        Assert.Equal(500, after.ServiceRevenue - before.ServiceRevenue);
         Assert.Equal(100, after.Refunds - before.Refunds);
-        Assert.Equal(900, after.NetRevenue - before.NetRevenue);
+        Assert.Equal(500, after.NetRevenue - before.NetRevenue);
         Assert.Equal(600, after.Receipts - before.Receipts);
         Assert.Equal(50, after.Expenses - before.Expenses);
         Assert.Equal(400, after.OutstandingNow - before.OutstandingNow);
@@ -134,12 +136,12 @@ public sealed class ReportTests(ApiFixture api)
     {
         var doctor = await UserAsync(Roles.Doctor);
         Assert.Equal(HttpStatusCode.Forbidden, (await doctor.GetAsync("/api/reports/financial")).StatusCode);
-        Assert.Equal(HttpStatusCode.OK, (await doctor.GetAsync("/api/reports/doctors")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await doctor.GetAsync("/api/reports/overview")).StatusCode);
 
         var manager = await UserAsync(Roles.Manager);
         Assert.Equal(HttpStatusCode.OK, (await manager.GetAsync("/api/reports/financial")).StatusCode);
 
-        var bad = await manager.GetAsync("/api/reports/doctors?from=2026-02-01&to=2026-01-01");
+        var bad = await manager.GetAsync("/api/reports/overview?from=2026-02-01&to=2026-01-01");
         Assert.Contains("invalid_range", await bad.Content.ReadAsStringAsync());
     }
 
@@ -158,10 +160,167 @@ public sealed class ReportTests(ApiFixture api)
         var doc = (await cashier.GetFromJsonAsync<PrintDocument>($"/api/print/receipt/{first.Id}", JsonOptions))!;
         Assert.Equal(first.ReceiptNumber, doc.Number);
         Assert.Equal(hospital, doc.Hospital.HospitalName);
-        Assert.Equal(("مبلغ", "100 افغانی"), (doc.Totals![0].Label, doc.Totals[0].Value));
+        Assert.Equal(("مبلغ این پرداخت", "100 افغانی"), (doc.Totals![0].Label, doc.Totals[0].Value));
 
         // 150 of the 300 is still owed after both payments, so the receipt names the balance rather than reading as settled.
         Assert.Contains(doc.Fields, f => f.Label == "مانده فاکتور" && f.Value == "150 افغانی");
+    }
+
+    [Theory]
+    [InlineData("visit", "رسید پرداخت فیس معاینه", "پذیرش و معاینه")]
+    [InlineData("surgery", "رسید پرداخت عملیات", "عملیات")]
+    [InlineData("refraction", "رسید پرداخت رفراکشن", "رفراکشن / بینایی‌سنجی")]
+    [InlineData("lab", "رسید پرداخت لابراتوار", "لابراتوار / آزمایشگاه")]
+    [InlineData("imaging", "رسید پرداخت تصویربرداری", "تصویربرداری")]
+    [InlineData("pharmacy", "رسید پرداخت دواخانه", "دواخانه")]
+    [InlineData("optical", "رسید پرداخت عینک", "عینک")]
+    public async Task Payment_papers_name_the_billed_section_and_only_real_items(string category, string title, string department)
+    {
+        var (cashier, invoice) = await ChargedInvoiceAsync(300);
+        var payment = await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, 100, PaymentMethod.Cash, null))));
+        var description = "خدمت آزمایشی " + category;
+        await api.InDbAsync(async db =>
+        {
+            var line = await db.InvoiceItems.SingleAsync(i => i.InvoiceId == invoice.Id);
+            line.Description = description;
+            if (category is "refraction" or "lab" or "imaging")
+            {
+                var patient = new Patient { FileNumber = Name("P"), FirstName = "آزمایشی", Gender = Gender.Male };
+                var storedInvoice = await db.Invoices.SingleAsync(i => i.Id == invoice.Id);
+                var test = new DiagnosticTest { Name = Name("test"), Kind = category == "refraction" ? DiagnosticKind.Refraction : category == "imaging" ? DiagnosticKind.Imaging : DiagnosticKind.Lab };
+                var order = new DiagnosticOrder { Patient = patient, Test = test, OrderNumber = Name("D"), InvoiceId = invoice.Id, RequestedByUserId = storedInvoice.IssuedByUserId };
+                db.DiagnosticOrders.Add(order);
+                await db.SaveChangesAsync();
+                line.SourceType = nameof(DiagnosticOrder);
+                line.SourceId = order.Id;
+            }
+            else if (category == "visit") line.SourceType = nameof(VisitToken);
+            else if (category == "surgery") line.SourceType = nameof(SurgeryCase);
+            else line.RevenueAccount = category == "pharmacy" ? Accounts.PharmacyRevenue : Accounts.OpticalRevenue;
+            await db.SaveChangesAsync();
+            return true;
+        });
+        var receipt = (await cashier.GetFromJsonAsync<PrintDocument>($"/api/print/receipt/{payment.Id}", JsonOptions))!;
+        Assert.Equal(title, receipt.Title);
+        Assert.Equal(department, receipt.Department);
+        Assert.Equal(description, Assert.Single(receipt.PurposeItems!));
+        Assert.Null(receipt.Note);
+        Assert.Null(receipt.Highlight);
+        Assert.Null(receipt.Headers);
+        Assert.Contains(receipt.Fields, f => f.Label == "مانده فاکتور" && f.Value == "200 افغانی");
+        Assert.Equal("100 افغانی", receipt.Totals![0].Value);
+        var bill = (await cashier.GetFromJsonAsync<PrintDocument>($"/api/print/invoice/{invoice.Id}", JsonOptions))!;
+        Assert.Equal(department, bill.Department);
+        Assert.DoesNotContain("#", bill.Headers!);
+        Assert.DoesNotContain(bill.Fields, f => f.Label == "آیتم‌های باطل‌شده");
+    }
+
+    [Fact]
+    public async Task Mixed_receipt_names_every_section_instead_of_only_the_visit_fee()
+    {
+        var (cashier, invoice) = await ChargedInvoiceAsync(300);
+        var payment = await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, 100, PaymentMethod.Cash, null))));
+        await api.InDbAsync(async db =>
+        {
+            var fee = await db.InvoiceItems.SingleAsync(i => i.InvoiceId == invoice.Id);
+            fee.SourceType = nameof(VisitToken); fee.Description = "فیس معاینه آزمایشی"; fee.UnitPrice = 150; fee.LineTotal = 150;
+            db.InvoiceItems.Add(new InvoiceItem { InvoiceId = invoice.Id, Description = "دوای آزمایشی", Quantity = 1, UnitPrice = 150, LineTotal = 150, RevenueAccount = Accounts.PharmacyRevenue });
+            db.InvoiceItems.Add(new InvoiceItem { InvoiceId = invoice.Id, Description = "خدمت لغوشده", Quantity = 1, UnitPrice = 999, LineTotal = 999, RevenueAccount = Accounts.ServiceRevenue, IsVoid = true });
+            await db.SaveChangesAsync(); return true;
+        });
+        var receipt = (await cashier.GetFromJsonAsync<PrintDocument>($"/api/print/receipt/{payment.Id}", JsonOptions))!;
+        Assert.Equal("رسید پرداخت خدمات چند بخش", receipt.Title);
+        Assert.Contains("پذیرش و معاینه", receipt.Department);
+        Assert.Contains("دواخانه", receipt.Department);
+        Assert.Equal(new[] { "فیس معاینه آزمایشی", "دوای آزمایشی" }, receipt.PurposeItems);
+        Assert.Equal("100 افغانی", receipt.Totals![0].Value);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Print_combines_only_the_same_product_without_changing_stored_billing(bool differentProducts)
+    {
+        var (cashier, invoice) = await ChargedInvoiceAsync(300);
+        await api.InDbAsync(async db =>
+        {
+            var first = new Product { Code = Name("G"), Name = "دوای آزمایشی", Unit = "عدد", Kind = ProductKind.Drug };
+            var second = differentProducts ? new Product { Code = Name("G"), Name = first.Name, Unit = "بوتل", Kind = ProductKind.Drug } : first;
+            db.Products.Add(first);
+            if (differentProducts) db.Products.Add(second);
+            var locationId = await db.StockLocations.Select(l => l.Id).FirstAsync();
+            var batchOne = new StockBatch { Product = first, LocationId = locationId, LotNumber = Name("B") };
+            var batchTwo = new StockBatch { Product = second, LocationId = locationId, LotNumber = Name("B") };
+            db.StockBatches.AddRange(batchOne, batchTwo);
+            await db.SaveChangesAsync();
+            var stored = await db.Invoices.SingleAsync(i => i.Id == invoice.Id);
+            var sale = new Sale
+            {
+                SaleNumber = Name("S"), Kind = SaleKind.Pharmacy, InvoiceId = invoice.Id, CreatedByUserId = stored.IssuedByUserId,
+                Items = [new() { ProductId = first.Id, BatchId = batchOne.Id, Quantity = 1, UnitPrice = 150 },
+                    new() { ProductId = second.Id, BatchId = batchTwo.Id, Quantity = 1, UnitPrice = 150 }],
+            };
+            db.Sales.Add(sale);
+            await db.SaveChangesAsync();
+            var line = await db.InvoiceItems.SingleAsync(i => i.InvoiceId == invoice.Id);
+            line.Description = "دوای آزمایشی"; line.UnitPrice = 150; line.LineTotal = 150; line.ServiceId = null;
+            line.SourceType = nameof(SaleItem); line.SourceId = sale.Items[0].Id; line.RevenueAccount = Accounts.PharmacyRevenue;
+            db.InvoiceItems.Add(new InvoiceItem { InvoiceId = invoice.Id, Description = line.Description, Quantity = 1, UnitPrice = 150, LineTotal = 150, SourceType = nameof(SaleItem), SourceId = sale.Items[1].Id, RevenueAccount = Accounts.PharmacyRevenue });
+            await db.SaveChangesAsync(); return true;
+        });
+        var bill = (await cashier.GetFromJsonAsync<PrintDocument>($"/api/print/invoice/{invoice.Id}", JsonOptions))!;
+        Assert.Equal("فاکتور دواخانه", bill.Title);
+        if (differentProducts)
+        {
+            Assert.Equal(2, bill.Rows!.Count);
+            Assert.All(bill.Rows, row => Assert.Equal(new[] { "دوای آزمایشی", "1", "150 افغانی" }, row));
+        }
+        else Assert.Equal(new[] { "دوای آزمایشی", "2", "300 افغانی" }, Assert.Single(bill.Rows!));
+        Assert.Equal("300 افغانی", bill.Totals![0].Value);
+        Assert.Equal(2, await api.InDbAsync(db => db.InvoiceItems.CountAsync(i => i.InvoiceId == invoice.Id)));
+        Assert.Equal(0m, await api.InDbAsync(db => db.Invoices.Where(i => i.Id == invoice.Id).Select(i => i.Paid).SingleAsync()));
+    }
+
+    [Fact]
+    public async Task Refunded_void_papers_keep_the_original_section_and_state()
+    {
+        var (cashier, invoice) = await ChargedInvoiceAsync(300);
+        var payment = await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, 100, PaymentMethod.Cash, null))));
+        var accountant = await UserAsync(Roles.Accountant);
+        var refund = await Created<JsonElement>(await accountant.SendAsync(Post("/api/refunds", new RefundRequest(payment.Id, 100, "برگشت آزمایشی"))));
+        var originalStatus = await api.InDbAsync(db => db.Invoices.Where(i => i.Id == invoice.Id).Select(i => i.Status).SingleAsync());
+        try
+        {
+            await api.InDbAsync(async db =>
+            {
+                var line = await db.InvoiceItems.SingleAsync(i => i.InvoiceId == invoice.Id);
+                line.RevenueAccount = Accounts.OpticalRevenue; line.Description = "عینک آزمایشی"; line.IsVoid = true;
+                var stored = await db.Invoices.SingleAsync(i => i.Id == invoice.Id); stored.Status = InvoiceStatus.Void;
+                await db.SaveChangesAsync(); return true;
+            });
+            var receipt = (await cashier.GetFromJsonAsync<PrintDocument>($"/api/print/receipt/{payment.Id}", JsonOptions))!;
+            Assert.Equal("رسید پرداخت عینک", receipt.Title);
+            Assert.Contains(receipt.Fields, f => f.Label == "وضعیت" && f.Value == "باطل");
+            Assert.DoesNotContain(receipt.Fields, f => f.Label == "مانده فاکتور" && f.Value is not null);
+            var paper = (await cashier.GetFromJsonAsync<PrintDocument>($"/api/print/refund/{refund.GetProperty("id").GetInt64()}", JsonOptions))!;
+            Assert.Equal("رسید برگشت وجه عینک", paper.Title);
+            Assert.Equal("عینک", paper.Department);
+            Assert.Equal("عینک آزمایشی", Assert.Single(paper.PurposeItems!));
+            Assert.Equal("100 افغانی", paper.Totals![0].Value);
+        }
+        finally
+        {
+            // This is a display-only void fixture, not an accounting reversal.
+            // Restore it before other tests reconcile the shared synthetic ledger.
+            await api.InDbAsync(async db =>
+            {
+                var stored = await db.Invoices.SingleAsync(i => i.Id == invoice.Id);
+                stored.Status = originalStatus;
+                var line = await db.InvoiceItems.SingleAsync(i => i.InvoiceId == invoice.Id);
+                line.IsVoid = false;
+                await db.SaveChangesAsync(); return true;
+            });
+        }
     }
 
     [Fact]
