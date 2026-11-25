@@ -56,7 +56,9 @@ function Test-UpgradeCandidate([string]$MySql,[string]$Cnf,[string]$Database,[st
     $old=@{}
     try {
         foreach($key in $values.Keys){$old[$key]=[Environment]::GetEnvironmentVariable($key,'Process');[Environment]::SetEnvironmentVariable($key,$values[$key],'Process')}
+        $clock=[Diagnostics.Stopwatch]::StartNew()
         Invoke-Native (Join-Path $CandidateApp 'AlShifa.Api.exe') @('--migrate','--backup-taken','--contentRoot',$Work) | Out-Null
+        $migrationSeconds=[int][Math]::Ceiling($clock.Elapsed.TotalSeconds)
         $after=Get-UpgradeDataProof $MySql $Cnf $Database $before.layout
         if(@(Compare-Object $before.values $after.values).Count){throw 'The candidate changed protected business rows or account credentials.'}
     } catch {
@@ -66,4 +68,5 @@ function Test-UpgradeCandidate([string]$MySql,[string]$Cnf,[string]$Database,[st
         foreach($key in $old.Keys){[Environment]::SetEnvironmentVariable($key,$old[$key],'Process')}
     }
     'RESULT: candidate migrations and protected data preservation verified on restored copy'
+    "MIGRATION-SECONDS: $migrationSeconds"
 }

@@ -5,7 +5,10 @@ param(
     [Parameter(Mandatory)][string]$BackupDestination,
     [string]$Root = 'C:\AlShifa',
     [switch]$AllowSameDisk,
-    [switch]$HoldOnlineServices
+    [switch]$HoldOnlineServices,
+    # The stop before the first change, and the migration measured on a restored copy, must stay within these.
+    [int]$SwitchBudgetSeconds = 90,
+    [int]$MigrationBudgetSeconds = 60
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -50,14 +53,12 @@ if([int]$identity[0] -ne [int]$connection['Port'] -or [IO.Path]::GetFullPath($id
 $keyDirectory = [string]$hostConfig.DataProtection.KeysPath
 if (-not $keyDirectory) { throw 'DataProtection:KeysPath is required for a safe maintenance barrier.' }
 $maintenanceFile = Join-Path $keyDirectory 'update-maintenance'
-[IO.File]::WriteAllText($maintenanceFile, $runId)
+$quickDumpDir = Join-Path $Root "backup-staging\update-$runId"
+$quickDump = Join-Path $quickDumpDir 'db.sql'
 
-# Stopped first, so nothing entered after the backup is lost if the backup has to be restored.
-'== Stop the application'
-try { Stop-Service AlShifaApi } catch { Remove-Item -LiteralPath $maintenanceFile -Force -ErrorAction SilentlyContinue; throw }
-
-'== Database integrity check'
-# A damaged database is never upgraded or backed up over: the old version keeps running and nothing is changed.
+# Everything slow happens first, while staff keep working: integrity check, encrypted backup with restore proof,
+# and the new migrations rehearsed on a restored copy. The application is stopped only for the short switch below.
+'== Prepare (users keep working)'
 try {
     $integrityProblems = @(Test-AlShifaDatabaseIntegrity $Root -Deep)
     if ($integrityProblems.Count) {
@@ -71,29 +72,53 @@ try {
     try {
         Write-ClientCnf $rootCnf 'root' (Get-Content (Join-Path $Root 'secrets\mysql-root.txt') -Raw).Trim() ([int]$connection['Port'])
         Invoke-Native (Join-Path $Root 'mysql\bin\mysql.exe') @("--defaults-extra-file=$rootCnf", '-e', 'SET PERSIST innodb_lock_wait_timeout=20; SET PERSIST_ONLY performance_schema=OFF;') | Out-Null
-    } catch { "WARNING: innodb_lock_wait_timeout was not changed: $_" } finally { Remove-Item -LiteralPath $rootCnf -Force -ErrorAction SilentlyContinue }
-} catch {
-    Remove-Item -LiteralPath $maintenanceFile -Force -ErrorAction SilentlyContinue
-    Start-Service AlShifaApi
-    throw "The update was not started and the current version is running again. Reason: $_"
-}
+    } catch { "WARNING: MySQL settings were not changed: $_" } finally { Remove-Item -LiteralPath $rootCnf -Force -ErrorAction SilentlyContinue }
 
-'== Backup before changing anything'
-try {
-    $sourceProof=Get-UpgradeDataProof (Join-Path $Root 'mysql\bin\mysql.exe') (Join-Path $Root 'secrets\backup.cnf') 'alshifa' -ReadOnlySource
     $backupOutput = & (Join-Path $PSScriptRoot 'backup.ps1') -Root $Root -Destination $BackupDestination -AllowSameDisk:$AllowSameDisk
     $backupOutput
     if ($LASTEXITCODE) { throw 'The backup failed.' }
     $line = @($backupOutput | ForEach-Object { "$_" } | Where-Object { $_ -match '^Backup complete: (.+)$' }) | Select-Object -Last 1
     if (-not $line) { throw 'The backup did not report its file.' }
     $backupFile = [regex]::Match($line, '^Backup complete: (.+)$').Groups[1].Value
-    # backup.ps1 now performs the restore drill before reporting success. Require proof for this exact archive.
     $backupStatus = Get-Content -LiteralPath (Join-Path $Root 'logs\backup-status.json') -Raw | ConvertFrom-Json
-    if (-not $backupStatus.restoreVerifiedAt -or $backupStatus.restoreVerifiedFile -ne (Split-Path $backupFile -Leaf)) { throw 'The exact pre-update backup has no verified restore result.' }
-    # Execute the NEW migrations on a second disposable restoration first. A
-    # rejected migration or change to protected rows must never reach the live DB.
-    & (Join-Path $PSScriptRoot 'restore-test.ps1') -Backup $backupFile -Root $Root -CandidateApp (Join-Path $release 'app') -ExpectedSourceProof $sourceProof | Out-Null
+    if (-not $backupStatus.restoreVerifiedAt -or $backupStatus.restoreVerifiedFile -ne (Split-Path $backupFile -Leaf)) { throw 'The pre-update backup has no verified restore result.' }
+    # A rejected migration or a change to protected rows must never reach the live database.
+    $rehearsal = @(& (Join-Path $PSScriptRoot 'restore-test.ps1') -Backup $backupFile -Root $Root -CandidateApp (Join-Path $release 'app'))
+    $seconds = @($rehearsal | ForEach-Object { "$_" } | Where-Object { $_ -match '^MIGRATION-SECONDS: \d+$' }) | Select-Object -Last 1
+    if (-not $seconds) { throw 'The migration rehearsal did not report its duration.' }
+    $migrationSeconds = [int]($seconds -replace '\D', '')
+    "Migration rehearsal on a restored copy: OK in $migrationSeconds s"
+    $stagedApp = Join-Path $Root "app.next-$runId"
+    Copy-Item (Join-Path $release 'app') $stagedApp -Recurse
+    Protect-Path $stagedApp @('NT SERVICE\AlShifaApi=RX')
+    if ($migrationSeconds -gt $MigrationBudgetSeconds) {
+        throw "The new database changes take $migrationSeconds s on a copy (limit $MigrationBudgetSeconds s), so the system would be stopped too long. Install this version with Setup.exe outside working hours."
+    }
 } catch {
+    if ($stagedApp) { Remove-Item -LiteralPath $stagedApp -Recurse -Force -ErrorAction SilentlyContinue }
+    throw "The update was not started; the current version keeps running unchanged. Reason: $_"
+}
+
+# The short switch. Staff are kept out by the maintenance marker; a fresh dump taken after the stop holds every
+# last entry and is what a rollback restores, so nothing typed during the preparation can be lost.
+'== Switch (short stop)'
+$switchClock = [Diagnostics.Stopwatch]::StartNew()
+[IO.File]::WriteAllText($maintenanceFile, $runId)
+try {
+    Stop-Service AlShifaApi
+    $quickProblems = @(Test-AlShifaDatabaseIntegrity $Root)
+    if ($quickProblems.Count) { throw "Database damage detected at the switch: $($quickProblems[0])" }
+    New-Item -ItemType Directory -Force $quickDumpDir | Out-Null
+    Invoke-Native (Join-Path $Root 'mysql\bin\mysqldump.exe') @(
+        "--defaults-extra-file=$(Join-Path $Root 'secrets\backup.cnf')",
+        '--single-transaction', '--quick', '--no-tablespaces', '--set-gtid-purged=OFF', '--triggers', '--hex-blob',
+        '--default-character-set=utf8mb4', "--result-file=$quickDump", 'alshifa') | Out-Null
+    if ((Get-Content $quickDump -Tail 1) -notmatch '^-- Dump completed') { throw 'The switch dump is incomplete.' }
+    $sourceProof = Get-UpgradeDataProof (Join-Path $Root 'mysql\bin\mysql.exe') (Join-Path $Root 'secrets\backup.cnf') 'alshifa' -ReadOnlySource
+    "Stopped, dump and protected-row proof: $([int]$switchClock.Elapsed.TotalSeconds) s"
+    if ($switchClock.Elapsed.TotalSeconds -gt $SwitchBudgetSeconds) { throw "Preparing the switch took $([int]$switchClock.Elapsed.TotalSeconds) s (limit $SwitchBudgetSeconds s); stopped safely before any change." }
+} catch {
+    Remove-Item -LiteralPath $quickDumpDir, $stagedApp -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $maintenanceFile -Force -ErrorAction SilentlyContinue
     Start-Service AlShifaApi
     throw "The update was not started and the current version is running again. Reason: $_"
@@ -105,8 +130,8 @@ try {
     if (Test-Path -LiteralPath $previous) { throw 'Rollback directory already exists.' }
     Move-Item -LiteralPath $appDir -Destination $previous
     $swapped=$true
-    New-Item -ItemType Directory $appDir | Out-Null
-    Copy-Item (Join-Path $release 'app\*') $appDir -Recurse
+    # Copied before the stop; on the same disk this is a rename, not a copy.
+    Move-Item -LiteralPath $stagedApp -Destination $appDir
     Copy-Item (Join-Path $previous 'appsettings.Production.json') $appDir
     $updatedConfigPath = Join-Path $appDir 'appsettings.Production.json'
     $updatedConfig = Get-Content -LiteralPath $updatedConfigPath -Raw | ConvertFrom-Json
@@ -118,7 +143,6 @@ try {
         $updatedConfig.Sync | Add-Member -NotePropertyName RequireCompatibilityApproval -NotePropertyValue $true -Force
     }
     [IO.File]::WriteAllText($updatedConfigPath, ($updatedConfig | ConvertTo-Json -Depth 32))
-    Protect-Path $appDir @('NT SERVICE\AlShifaApi=RX')
     Copy-Item (Join-Path $PSScriptRoot '*') (Join-Path $Root 'scripts') -Recurse -Force
     foreach ($old in 'director-access.ps1', 'remote-access.ps1') { Remove-Item (Join-Path $Root "scripts\$old") -Force -ErrorAction SilentlyContinue }
     Add-BackupRequestTrigger
@@ -130,6 +154,7 @@ try {
         if (Test-Path -LiteralPath $appDir) { Move-Item -LiteralPath $appDir -Destination $failed }
         Move-Item -LiteralPath $previous -Destination $appDir
     }
+    Remove-Item -LiteralPath $stagedApp -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $maintenanceFile -Force -ErrorAction SilentlyContinue
     Start-Service AlShifaApi
     throw "Copying the new version failed; the old version is running again. Reason: $_"
@@ -139,15 +164,18 @@ try {
 Push-Location $appDir
 try {
     Invoke-Native (Join-Path $appDir 'AlShifa.Api.exe') @('--migrate', '--backup-taken') | Out-Null
+    # The same proof as the rehearsal, now on the real database: no patient, money, stock or account row may change.
+    $afterProof = Get-UpgradeDataProof (Join-Path $Root 'mysql\bin\mysql.exe') (Join-Path $Root 'secrets\backup.cnf') 'alshifa' $sourceProof.layout -ReadOnlySource
+    if (@(Compare-Object $sourceProof.values $afterProof.values).Count) { throw 'The migration changed protected business rows.' }
 } catch {
     $reason = $_
     Pop-Location
-    # A failed migration can leave the schema half changed. The backup taken and restore-tested above goes back,
+    # A failed migration can leave the schema half changed. The dump taken at the stop goes back,
     # with the previous version of the program, so the hospital is never left with a half-installed system.
     "Migration failed: $reason"
     '== Automatic rollback: the database from the backup above, then the previous version'
     try {
-        Restore-AlShifaDatabase $Root $backupFile
+        Restore-AlShifaDatabaseFromDump $Root $quickDump
         Move-Item -LiteralPath $appDir -Destination $failed
         Move-Item -LiteralPath $previous -Destination $appDir
         Remove-Item -LiteralPath $maintenanceFile -Force -ErrorAction SilentlyContinue
@@ -157,9 +185,9 @@ try {
         Invoke-Native 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Root 'scripts\health-check.ps1'), '-Root', $Root, '-Maintenance') | Out-Null
     } catch {
         Stop-Service AlShifaApi -ErrorAction SilentlyContinue
-        throw "Migration failed and the automatic rollback failed too. The application is stopped. Follow 'Rollback' in DEPLOYMENT-WINDOWS.md with $backupFile. Migration: $reason. Rollback: $_"
+        throw "Migration failed and the automatic rollback failed too. The application is stopped. Restore $quickDump (taken at the stop; $backupFile is the encrypted copy from just before). Migration: $reason. Rollback: $_"
     }
-    throw "The update failed and was undone: the previous version runs on the database as it was before the update ($backupFile). Reason: $reason"
+    throw "The update failed and was undone: the previous version runs on the database as it was at the stop. Reason: $reason"
 }
 Pop-Location
 
@@ -181,7 +209,7 @@ try {
     # No staff writes are allowed during the maintenance window. Stop before restoring the pre-update database.
     Stop-Service AlShifaApi -ErrorAction SilentlyContinue
     try {
-        Restore-AlShifaDatabase $Root $backupFile
+        Restore-AlShifaDatabaseFromDump $Root $quickDump
         Move-Item -LiteralPath $appDir -Destination $failed
         Move-Item -LiteralPath $previous -Destination $appDir
         Remove-Item -LiteralPath $maintenanceFile -Force -ErrorAction SilentlyContinue
@@ -209,6 +237,8 @@ try {
 # Old program copies only (no data): the two most recent stay for going back by hand.
 Get-ChildItem -LiteralPath $Root -Directory -Filter 'app.previous-*' | Sort-Object Name -Descending | Select-Object -Skip 2 |
     ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+Get-ChildItem -LiteralPath $Root -Directory -Filter 'app.next-*' | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 Get-ChildItem -LiteralPath $Root -Directory -Filter 'app.failed-*' | Sort-Object Name -Descending | Select-Object -Skip 1 |
     ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-"Update verified. Previous application retained at $previous."
+Remove-Item -LiteralPath $quickDumpDir -Recurse -Force -ErrorAction SilentlyContinue
+"Update verified in $([int]$switchClock.Elapsed.TotalSeconds) s of stopped time. Previous application retained at $previous."

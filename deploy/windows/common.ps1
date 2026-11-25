@@ -188,6 +188,19 @@ function Expand-Backup([string]$Gpg, [string]$File, [string]$OutputDir, [string]
 
 # Puts a backup back into the live database. Only for an update whose migration failed: the application service must be stopped,
 # and the backup must be the one taken (and restore-tested) at the start of that update.
+# Puts a plain mysqldump file back as the live database (the update's rollback, from the dump taken at the stop).
+function Restore-AlShifaDatabaseFromDump([string]$Root, [string]$Dump, [string]$Database = 'alshifa') {
+    if ((Get-Content $Dump -Tail 1) -notmatch '^-- Dump completed') { throw 'The dump is incomplete.' }
+    $mysql = Join-Path $Root 'mysql\bin\mysql.exe'
+    $port = [int](Select-String -Path (Join-Path $Root 'mysql\alshifa.ini') -Pattern '^port=(\d+)').Matches[0].Groups[1].Value
+    $cnf = Join-Path $Root "secrets\rollback-$([Guid]::NewGuid().ToString('N')).cnf"
+    try {
+        Write-ClientCnf $cnf 'root' (Get-Content (Join-Path $Root 'secrets\mysql-root.txt') -Raw).Trim() $port
+        Invoke-Native $mysql @("--defaults-extra-file=$cnf", '-e', "DROP DATABASE IF EXISTS $Database; CREATE DATABASE $Database CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;") | Out-Null
+        Invoke-Native $mysql @("--defaults-extra-file=$cnf", '--default-character-set=utf8mb4', $Database, '-e', "source $($Dump -replace '\\', '/')") | Out-Null
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+}
+
 function Restore-AlShifaDatabase([string]$Root, [string]$BackupFile, [string]$Database = 'alshifa') {
     $mysql = Join-Path $Root 'mysql\bin\mysql.exe'
     $port = [int](Select-String -Path (Join-Path $Root 'mysql\alshifa.ini') -Pattern '^port=(\d+)').Matches[0].Groups[1].Value

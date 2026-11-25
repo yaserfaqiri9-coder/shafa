@@ -159,7 +159,8 @@ try {
         $task = Get-ScheduledTask -TaskName 'AlShifa Backup' -ErrorAction SilentlyContinue
         $match = if ($task) { [regex]::Match($task.Actions[0].Arguments, '-Destination "([^"]+)"') }
         if (-not $match -or -not $match.Success) { throw 'The backup destination of this installation was not found, so nothing was changed.' }
-        $updateArguments = @('-BackupDestination', $match.Groups[1].Value, '-Root', $Root, '-HoldOnlineServices')
+        # Someone is at the computer: longer database changes are allowed than for the unattended night update.
+        $updateArguments = @('-BackupDestination', $match.Groups[1].Value, '-Root', $Root, '-HoldOnlineServices', '-SwitchBudgetSeconds', '900', '-MigrationBudgetSeconds', '1800')
         if ($task.Actions[0].Arguments -match '-AllowSameDisk') { $updateArguments += '-AllowSameDisk' }
         Invoke-Script 'update.ps1' $updateArguments
         $syncStatusPath=Join-Path $Root 'logs\sync-bootstrap-status.json'
