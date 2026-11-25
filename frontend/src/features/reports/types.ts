@@ -28,8 +28,14 @@ export type ReportCell = string | number | null
 
 export interface ReportTile {
   label: string
-  value: number
+  /** Null when the recorded data cannot give a true figure; shown as «نامعلوم». */
+  value: number | null
   kind: ReportValueKind
+  note: string | null
+  /** One of the at most four figures shown on top of the tab; the rest are lines of the reports below. */
+  main: boolean
+  /** The report that details this figure, opened by clicking it; only when that report is in this tab. */
+  item?: string | null
 }
 
 export interface ReportColumn {
@@ -43,6 +49,8 @@ export interface ReportTable {
   rows: ReportCell[][]
   total: ReportCell[] | null
   note: string | null
+  /** The report's own name in the address and the export link. */
+  key: string
 }
 
 export interface ReportTrend {
@@ -60,4 +68,6 @@ export interface ReportDocument {
   tiles: ReportTile[]
   trend: ReportTrend | null
   tables: ReportTable[]
+  /** What the figures cannot show, such as a profit that cannot be known. */
+  warnings: string[] | null
 }

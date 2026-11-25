@@ -17,7 +17,16 @@ function New-Password {
 }
 
 function Test-Port {
-    return [bool](Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $connection = $client.ConnectAsync('127.0.0.1', $port)
+        if (-not $connection.Wait(1000)) { return $false }
+        return $client.Connected
+    } catch {
+        return $false
+    } finally {
+        $client.Dispose()
+    }
 }
 
 function Wait-Port {

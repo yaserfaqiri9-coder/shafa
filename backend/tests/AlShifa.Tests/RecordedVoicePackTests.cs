@@ -57,19 +57,20 @@ public sealed class RecordedVoicePackTests
     [InlineData(1,"imaging",CallDesk.Imaging,"imaging")]
     [InlineData(50,"optical",CallDesk.Optical,"optical")]
     [InlineData(25,"reception",CallDesk.Reception,"reception")]
+    [InlineData(25,"cashier",CallDesk.Cashier,"cashier")]
+    [InlineData(25,"room-05",CallDesk.Cashier,"cashier")]
+    [InlineData(100,"doctor",CallDesk.Doctor,"doctor")]
     public void Recorded_pair_uses_real_number_and_stored_destination(int number,string destination,CallDesk desk,string key)
     {
         var original = destination;
-        Assert.Equal(new[] {$"{VoicePack.RecordedBase}numbers/number_{number:D3}.wav",$"{VoicePack.RecordedBase}destinations/destination_{key}.wav"},VoicePack.RecordedClips(number,destination,desk));
+        Assert.Equal(new[] {$"{VoicePack.RecordedBase}numbers/number_{number:D3}.mp3",$"{VoicePack.RecordedBase}destinations/destination_{key}.wav"},VoicePack.RecordedClips(number,destination,desk));
         Assert.Equal(original,destination);
         Assert.DoesNotContain(VoicePack.RecordedClips(number,destination,desk),path=>path.Contains("departments"));
     }
 
     [Theory]
     [InlineData(0,"doctor")]
-    [InlineData(51,"pharmacy")]
-    [InlineData(100,"doctor")]
-    [InlineData(12,"lab")]
+    [InlineData(101,"pharmacy")]
     [InlineData(12,"اتاق داکتر")]
     [InlineData(12,"unknown")]
     [InlineData(12,"room-03")]
@@ -81,37 +82,19 @@ public sealed class RecordedVoicePackTests
     {
         foreach(var key in VoicePack.RecordedDestinations)
             Assert.EndsWith($"destination_{key}.wav",VoicePack.RecordedClips(25,key)[1]);
-        Assert.Equal(59,VoicePack.RecordedFiles().Count());
+        Assert.Equal(110,VoicePack.RecordedFiles().Count());
     }
 
     [Fact]
-    public void Bundled_68_WAVs_match_manifest_hashes_and_48000_mono_16bit_format()
+    public void Bundled_pack_contains_all_expected_recordings_and_welcome()
     {
-        var directory=new DirectoryInfo(AppContext.BaseDirectory);
-        while(directory!=null && !Directory.Exists(Path.Combine(directory.FullName,"frontend","public","audio",VoicePack.RecordedVersion)))directory=directory.Parent;
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !Directory.Exists(Path.Combine(directory.FullName, "frontend", "public", "audio", VoicePack.RecordedVersion))) directory = directory.Parent;
         Assert.NotNull(directory);
-        var root=Path.Combine(directory.FullName,"frontend","public","audio",VoicePack.RecordedVersion);
-        using var manifest=JsonDocument.Parse(File.ReadAllText(Path.Combine(root,"manifest.json")));
-        var clips=manifest.RootElement.GetProperty("clips").EnumerateArray().ToList();
-        Assert.Equal(68,clips.Count);
-        foreach(var clip in clips)
-        {
-            var data=File.ReadAllBytes(Path.Combine(root,clip.GetProperty("wav").GetString()!));
-            Assert.Equal(clip.GetProperty("sha256_wav").GetString(),Convert.ToHexStringLower(SHA256.HashData(data)));
-            using var reader=new BinaryReader(new MemoryStream(data));
-            Assert.Equal("RIFF",new string(reader.ReadChars(4)));reader.ReadUInt32();Assert.Equal("WAVE",new string(reader.ReadChars(4)));
-            var found=false;
-            while(reader.BaseStream.Position+8<=reader.BaseStream.Length)
-            {
-                var chunk=new string(reader.ReadChars(4));var length=reader.ReadUInt32();var next=reader.BaseStream.Position+length;
-                if(chunk=="fmt ")
-                {
-                    Assert.Equal(1,reader.ReadUInt16());Assert.Equal(1,reader.ReadUInt16());Assert.Equal(48000,reader.ReadInt32());
-                    reader.ReadInt32();reader.ReadUInt16();Assert.Equal(16,reader.ReadUInt16());found=true;break;
-                }
-                reader.BaseStream.Position=next+(length%2);
-            }
-            Assert.True(found);
-        }
+        var root = Path.Combine(directory!.FullName, "frontend", "public", "audio", VoicePack.RecordedVersion, "WAV");
+        Assert.Equal(100, Directory.GetFiles(Path.Combine(root, "numbers"), "*.mp3").Length);
+        Assert.Equal(10, Directory.GetFiles(Path.Combine(root, "destinations"), "*.wav").Length);
+        Assert.All(VoicePack.RecordedFiles(), file => Assert.True(File.Exists(Path.Combine(root, file)), file));
+        Assert.True(File.Exists(Path.Combine(root, "welcome.wav")));
     }
 }

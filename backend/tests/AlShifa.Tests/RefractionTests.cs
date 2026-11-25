@@ -10,9 +10,9 @@ using AlShifa.Api.Features.Visits;
 namespace AlShifa.Tests;
 
 [Collection("api")]
-public sealed class RefractionTests(ApiFixture api)
+public sealed class RefractionTests(ApiFixture api) : PhysicalQueueTestScope(api)
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } };
 
     private static string Name(string prefix) => $"{prefix}_{Guid.NewGuid():N}"[..20];
 
@@ -54,7 +54,7 @@ public sealed class RefractionTests(ApiFixture api)
     {
         var doctor = await UserAsync(Roles.Doctor);
         var tests = await doctor.GetFromJsonAsync<JsonElement>("/api/diagnostic-tests");
-        var testId = tests.EnumerateArray().First(t => t.GetProperty("kind").GetString() == "Refraction").GetProperty("id").GetInt32();
+        var testId = tests.EnumerateArray().First(t => t.GetProperty("kind").GetString() == "Refraction" && t.GetProperty("serviceId").ValueKind == JsonValueKind.Number).GetProperty("id").GetInt32();
         var order = await Read<DiagnosticOrderDto>(await doctor.SendAsync(Post("/api/diagnostic-orders", new CreateDiagnosticOrderRequest(patientId, visitId, testId, null))), HttpStatusCode.Created);
 
         var fileNumber = (await doctor.GetFromJsonAsync<PatientDto>($"/api/patients/{patientId}", JsonOptions))!.FileNumber;
@@ -184,5 +184,45 @@ public sealed class RefractionTests(ApiFixture api)
         Assert.Equal(HttpStatusCode.Forbidden, (await doctor.PutAsJsonAsync($"/api/refractions/{visit.Id}", Sample(null))).StatusCode);
         Assert.Equal(HttpStatusCode.Forbidden, (await reception.GetAsync($"/api/refractions/{visit.Id}")).StatusCode);
         Assert.Equal(HttpStatusCode.NoContent, (await doctor.GetAsync($"/api/refractions/{visit.Id}")).StatusCode);
+    }
+
+    [Fact]
+    public async Task Paper_prescription_roundtrips_all_four_rows_and_independent_lenses()
+    {
+        var (patient, visit) = await NewVisitAsync();
+        var triage = await UserAsync(Roles.Triage);
+        const string lenses = "Lens: ph-Brown, Ph-Gray, White, Distance, Near, Bifocal, Progressive, Antireflex, Plastic";
+        var input = Sample(null) with
+        {
+            UnaidedVaOd = "6/12.5", UnaidedVaOs = "+0.75", Pd = "62.75",
+            Measurements = "K1 43.25\n" + lenses,
+            Lines = [
+                new(RefractionStage.Subjective, EyeSide.OD, "+1.125", "-0.375", "90.5", null, "6/7.5"),
+                new(RefractionStage.Subjective, EyeSide.OS, "-2.25", "+0.50", "-1.5", null, "N6"),
+                new(RefractionStage.Final, EyeSide.OD, "+1.00", "-0.25", "180", "+2.125", "6/6"),
+                new(RefractionStage.Final, EyeSide.OS, "-2.00", "+0.75", "0", "+2.125", "6/9"),
+            ],
+        };
+        var saved = await Read<RefractionDto>(await triage.PutAsJsonAsync($"/api/refractions/{visit.Id}", input));
+        var doctor = await UserAsync(Roles.Doctor);
+        var loaded = await Read<RefractionDto>(await doctor.GetAsync($"/api/refractions/{visit.Id}"));
+        Assert.Equal(JsonSerializer.Serialize(saved, JsonOptions), JsonSerializer.Serialize(loaded, JsonOptions));
+        Assert.Equal(4, loaded.Lines.Count);
+        foreach (var line in input.Lines!)
+        {
+            var actual = loaded.Lines.Single(l => l.Stage == line.Stage.ToString() && l.Eye == line.Eye.ToString());
+            Assert.Equal((line.Sphere, line.Cylinder, line.Axis, line.Add, line.Va),
+                (actual.Sphere, actual.Cylinder, actual.Axis, actual.Add, actual.Va));
+        }
+        Assert.Equal(("6/12.5", "+0.75", "62.75", input.Measurements),
+            (loaded.UnaidedVaOd, loaded.UnaidedVaOs, loaded.Pd, loaded.Measurements));
+        var edited = await Read<RefractionDto>(await triage.PutAsJsonAsync($"/api/refractions/{visit.Id}", input with
+        {
+            Version = loaded.Version, Measurements = "K1 43.25\nLens: Near, Plastic", Pd = "-0.5",
+        }));
+        Assert.Equal("K1 43.25\nLens: Near, Plastic", edited.Measurements);
+        Assert.Equal("-0.5", edited.Pd);
+        var history = await doctor.GetFromJsonAsync<List<RefractionDto>>($"/api/clinical/patients/{patient.Id}/refractions", JsonOptions);
+        Assert.Equal(edited.Measurements, history!.Single(r => r.VisitId == visit.Id).Measurements);
     }
 }

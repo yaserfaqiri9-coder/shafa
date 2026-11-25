@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
+import QueueCardInput from './QueueCardInput.vue'
+import { todayIso } from '@/utils/date'
 import { api, ApiError, errorMessage, newIdempotencyKey } from '@/api/http'
 import { doctorOptions } from '@/api/lookups'
 import UiComboBox, { type ComboOption } from '@/components/UiComboBox.vue'
@@ -13,7 +15,8 @@ const props = defineProps<{ token: VisitToken }>()
 const emit = defineEmits<{ close: []; saved: [visit: VisitRow] }>()
 
 const doctors = ref<ComboOption[]>([])
-const form = reactive({ patientId: null as number | null, doctorStaffId: props.token.doctorStaffId, reason: '' })
+const needsCard = computed(() => props.token.tokenDate !== todayIso() || props.token.queueNumber === null)
+const form = reactive({ patientId: null as number | null, doctorStaffId: props.token.doctorStaffId, reason: '', queueNumber: null as number | null })
 const saving = ref(false)
 const error = ref('')
 const visitKey = ref(newIdempotencyKey())
@@ -29,7 +32,7 @@ async function save() {
     const visit = await api<VisitRow>('/visits', {
       method: 'POST',
       idempotencyKey: visitKey.value,
-      body: { patientId: form.patientId, departmentId: props.token.departmentId, doctorStaffId: form.doctorStaffId, reason: form.reason, tokenId: props.token.id },
+      body: { patientId: form.patientId, departmentId: props.token.departmentId, doctorStaffId: form.doctorStaffId, reason: form.reason, tokenId: props.token.id, queueNumber: needsCard.value ? form.queueNumber : props.token.queueNumber },
     })
     emit('saved', visit)
   } catch (cause) {
@@ -56,8 +59,9 @@ onMounted(async () => {
       <div class="alert alert-success" role="status">فیس این نوبت قبلاً دریافت شده است. {{ token.departmentName }}</div>
       <div class="mb-3">
         <PatientPicker v-model="form.patientId" required />
-        <RouterLink :to="{ name: 'patient-new', query: { token: token.id } }" class="btn btn-soft btn-sm mt-2">مریض جدید</RouterLink>
+        <RouterLink :to="{ name: 'patient-new', query: { token: token.id, card: needsCard ? form.queueNumber ?? undefined : undefined } }" class="btn btn-soft btn-sm mt-2">مریض جدید</RouterLink>
       </div>
+      <div v-if="needsCard" class="mb-3"><QueueCardInput v-model="form.queueNumber" /></div>
       <div class="mb-3"><UiComboBox v-model="form.doctorStaffId" label="داکتر (اختیاری)" :options="doctors" chip placeholder="بدون انتخاب" /></div>
       <div class="mb-3">
         <label class="form-label" for="v-reason">علت مراجعه</label>
@@ -65,7 +69,7 @@ onMounted(async () => {
       </div>
       <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
       <div class="xr-form-actions">
-        <button type="submit" class="btn btn-primary" :disabled="saving">ثبت مراجعه</button>
+        <button type="submit" class="btn btn-primary" :disabled="saving || (needsCard && form.queueNumber === null)">ثبت مراجعه</button>
         <button type="button" class="btn btn-soft-danger" data-modal-cancel>بعداً</button>
       </div>
     </form>

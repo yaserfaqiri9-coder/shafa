@@ -605,6 +605,30 @@ fieldset:disabled .xr-combo__field {
   white-space: nowrap;
 }
 
+/* On a phone each line is a small card: the item across the top, then its labelled fields side by side, so nothing is squeezed to an unusable width. */
+@media screen and (max-width: 575.98px) {
+  .xr-lines thead { display: none; }
+  .xr-lines tbody { display: block; }
+  .xr-lines tr {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(120px, 100%), 1fr));
+    gap: 8px 10px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--xr-row-border);
+  }
+  .xr-lines td { width: auto !important; padding: 0 !important; border: 0; }
+  .xr-lines td:first-child { grid-column: 1 / -1; }
+  .xr-lines td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 4px;
+    color: var(--xr-text-soft);
+    font-size: 12px;
+  }
+  .xr-lines .xr-lines__money { align-self: end; white-space: normal; }
+  .xr-lines .xr-lines__remove { display: flex; align-items: end; justify-content: flex-end; }
+}
+
 /* A titled group of fields on a long form. */
 .xr-group {
   margin-bottom: 24px;
@@ -978,45 +1002,71 @@ fieldset:disabled .xr-combo__field {
   min-width: 130px;
 }
 
-/* Tabs: soft pill on the active tab */
+/* Tabs everywhere are one switch: a light bar, the chosen part filled deep teal. Same look on every page, so a list switch is never mistaken for a button. */
 .xr-tabs {
-  display: flex;
+  display: inline-flex;
   flex-wrap: wrap;
-  gap: 4px;
+  max-width: 100%;
+  align-items: center;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--xr-switch-border);
+  border-radius: 10px;
+  background: var(--xr-switch-bg);
 }
 
 .xr-tab {
-  padding: 4px 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 0 14px;
   border: 0;
-  border-radius: var(--xr-radius-button);
+  border-radius: 8px;
   background: transparent;
-  color: var(--xr-primary);
-  font-size: var(--xr-fs-body);
+  color: var(--xr-switch-text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-align: center;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
 
-.xr-tab--active {
-  background: var(--xr-primary-light);
-  color: var(--xr-tone-primary-text);
-  font-weight: 600;
+.xr-tab:hover { background: var(--xr-switch-hover); color: var(--xr-tone-primary-text); }
+
+.xr-tab--active,
+.xr-tab--active:hover {
+  background: var(--xr-switch-on);
+  box-shadow: var(--xr-switch-on-shadow);
+  color: #fff;
 }
 
 /* How many rows wait behind a tab. */
 .xr-tab__count {
   display: inline-block;
   min-width: 22px;
-  margin-inline-start: 4px;
-  padding: 0 6px;
-  border-radius: 10px;
-  background: var(--xr-border);
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--xr-switch-border);
   color: var(--xr-text);
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 11px;
+  font-weight: 700;
   text-align: center;
 }
 
 .xr-tab--active .xr-tab__count {
-  background: var(--xr-primary);
+  background: rgba(255, 255, 255, .22);
   color: #fff;
+}
+
+/* Every search field looks the same: a magnifier inside the field, never a separate look per page. */
+input[type='search'].form-control {
+  padding-right: 40px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%239ca3af'%3E%3Cpath d='M18.03 16.62l4.28 4.28-1.41 1.41-4.28-4.28A9 9 0 1 1 18.03 16.62zM11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 18px;
 }
 
 /* A page's few numbers on one slim line, where a row of large cards would push the work below the screen. */

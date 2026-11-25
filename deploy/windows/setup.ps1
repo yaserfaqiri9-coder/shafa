@@ -16,6 +16,7 @@ param(
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
+. (Join-Path $PSScriptRoot 'runtime-common.ps1')
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 # Persian on the command line can arrive as '?' on some systems. The name is then rebuilt from its letters (Sistem Alshifa).
@@ -66,14 +67,7 @@ function Install-Package([string]$File, [string[]]$Arguments, [int[]]$Success) {
 
 # Inside the package, or beside the installer. A file from beside it came from outside the checked package, so its signature is checked here.
 function Find-VisualCppRuntime {
-    $packaged = Join-Path $prerequisites 'vc_redist.x64.exe'
-    if (Test-Path $packaged) { return $packaged }
-    if (-not $InstallerFolder) { return $null }
-    $beside = Join-Path $InstallerFolder 'vc_redist.x64.exe'
-    if (-not (Test-Path $beside)) { return $null }
-    $signature = Get-AuthenticodeSignature $beside
-    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'CN=Microsoft Corporation') { throw "$beside is not signed by Microsoft. It was not run." }
-    return $beside
+    Get-VisualCppRuntime $prerequisites $InstallerFolder (Join-Path $setupDir 'runtime-download')
 }
 
 function Set-PrivateNetwork([string]$Address) {
@@ -165,9 +159,12 @@ try {
         $task = Get-ScheduledTask -TaskName 'AlShifa Backup' -ErrorAction SilentlyContinue
         $match = if ($task) { [regex]::Match($task.Actions[0].Arguments, '-Destination "([^"]+)"') }
         if (-not $match -or -not $match.Success) { throw 'The backup destination of this installation was not found, so nothing was changed.' }
-        $updateArguments = @('-BackupDestination', $match.Groups[1].Value, '-Root', $Root)
+        $updateArguments = @('-BackupDestination', $match.Groups[1].Value, '-Root', $Root, '-HoldOnlineServices')
         if ($task.Actions[0].Arguments -match '-AllowSameDisk') { $updateArguments += '-AllowSameDisk' }
         Invoke-Script 'update.ps1' $updateArguments
+        $syncStatusPath=Join-Path $Root 'logs\sync-bootstrap-status.json'
+        $syncStatus=if(Test-Path -LiteralPath $syncStatusPath){Get-Content -LiteralPath $syncStatusPath -Raw|ConvertFrom-Json}
+        if(-not $syncStatus.Ready){'##SYNC pending'}else{'##SYNC configured'}
 
         $config = Get-Content (Join-Path $Root 'app\appsettings.Production.json') -Raw | ConvertFrom-Json
         $loopback = $config.Kestrel.Endpoints.Loopback.Url
@@ -246,6 +243,7 @@ try {
     if ($runtime) {
         # 1638: a newer version is already installed. 3010: installed, a restart is wanted later; MySQL still runs.
         Install-Package $runtime @('/install', '/quiet', '/norestart') @(0, 1638, 3010)
+        Invoke-Native (Join-Path $mysqlFolder 'bin\mysqld.exe') @('--version') | Out-Null
     }
     $gpgFound = $false
     try { Find-Gpg | Out-Null; $gpgFound = $true } catch { }

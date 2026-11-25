@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using AlShifa.Api.Features.Auth;
+using AlShifa.Api.Features.Sync;
 using AlShifa.Api.Features.Visits;
 using AlShifa.Api.Infrastructure;
 using Microsoft.EntityFrameworkCore;
@@ -10,7 +11,7 @@ namespace AlShifa.Api.Features.Clinical;
 /// Record-level check on top of permissions. A user may open a clinical record only with a care
 /// relationship: assigned doctor on any visit, a currently open visit, or an audited emergency grant.
 /// </summary>
-public sealed class ClinicalAccess(AppDbContext db, CurrentUser user, AuditService audit, IHttpContextAccessor accessor)
+public sealed class ClinicalAccess(AppDbContext db, CurrentUser user, AuditService audit, IHttpContextAccessor accessor, SyncSwitch sync)
 {
     public static readonly TimeSpan GrantDuration = TimeSpan.FromHours(4);
 
@@ -33,6 +34,13 @@ public sealed class ClinicalAccess(AppDbContext db, CurrentUser user, AuditServi
 
     private async Task<bool> HasCareRelationshipAsync(long patientId, CancellationToken ct)
     {
+        // The online copy is read-only and serves management review: anyone allowed to read clinical records there may read
+        // every patient's. Emergency grants cannot be written there, and nothing can be changed. The hospital rules are unchanged.
+        if (sync.IsOnline)
+        {
+            return true;
+        }
+
         var userId = user.Id;
         var today = KabulClock.Today;
 

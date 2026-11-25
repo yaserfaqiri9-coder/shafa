@@ -8,7 +8,8 @@ namespace AlShifa.Api.Features.Inventory;
 /// <param name="UnitPrice">Optical only: the price agreed with the customer, since frames and lenses have no fixed price. Empty uses the product's price.</param>
 public sealed record SaleLineInput(int ProductId, decimal Quantity, long? PrescriptionItemId = null, decimal? UnitPrice = null);
 
-public sealed record CustomLineInput(string Description, decimal Amount);
+/// <param name="IsNonStockLens">A made-to-order lens is billed to optical revenue but never allocates or moves a warehouse batch.</param>
+public sealed record CustomLineInput(string Description, decimal Amount, bool IsNonStockLens = false);
 
 public sealed class StockService(AppDbContext db, CurrentUser user, IConfiguration config)
 {
@@ -125,7 +126,7 @@ public sealed class StockService(AppDbContext db, CurrentUser user, IConfigurati
 public sealed class SaleService(AppDbContext db, NumberService numbers, StockService stock, InvoiceService invoices, LedgerService ledger, CurrentUser user, AuditService audit, Outbox outbox)
 {
     /// <summary>Must run inside a transaction. Stock, invoice, ledger and prescription change together or not at all.</summary>
-    public async Task<Sale> CreateAsync(SaleKind kind, long? patientId, long? prescriptionId, IReadOnlyList<SaleLineInput> lines, IReadOnlyList<CustomLineInput> customLines, CancellationToken ct)
+    public async Task<Sale> CreateAsync(SaleKind kind, long? patientId, long? prescriptionId, IReadOnlyList<SaleLineInput> lines, IReadOnlyList<CustomLineInput> customLines, CancellationToken ct, bool isComplimentary = false)
     {
         if (lines.Count == 0 && customLines.Count == 0)
         {
@@ -225,6 +226,10 @@ public sealed class SaleService(AppDbContext db, NumberService numbers, StockSer
 
                 unitPrice = decimal.Round(agreed, 2, MidpointRounding.AwayFromZero);
             }
+            if (isComplimentary)
+            {
+                unitPrice = 0;
+            }
 
             var parts = kind == SaleKind.Pharmacy
                 ? await stock.ReserveAsync(product.Id, locationId, line.Quantity, ct)
@@ -248,7 +253,8 @@ public sealed class SaleService(AppDbContext db, NumberService numbers, StockSer
                 throw new AppException(StatusCodes.Status400BadRequest, "invalid_amount", "مبلغ معتبر نیست.");
             }
 
-            await invoices.AddLineAsync(invoice, new ChargeLine(custom.Description.Trim(), 1, custom.Amount, revenue, null, null, null), ct);
+            await invoices.AddLineAsync(invoice, new ChargeLine(custom.Description.Trim(), 1, isComplimentary ? 0 : custom.Amount, revenue, null,
+                custom.IsNonStockLens && kind == SaleKind.Optical ? "OpticalNonStockLens" : null, null), ct);
         }
 
         if (kind == SaleKind.Optical)
@@ -454,7 +460,11 @@ public sealed class SaleService(AppDbContext db, NumberService numbers, StockSer
             line.IsVoid = true;
             // Keep the original amounts on paid or discounted invoices for the receipt history.
             if (invoice.Paid == 0 && invoice.Discount == 0) invoice.Total -= line.LineTotal;
-            await ledger.ReverseAsync("Charge", "InvoiceItem", line.Id, ct);
+            // Complimentary lines deliberately never created a zero-value Charge journal.
+            if (line.LineTotal != 0)
+            {
+                await ledger.ReverseAsync("Charge", "InvoiceItem", line.Id, ct);
+            }
         }
 
         if (refundPaidPharmacy || (invoice.Discount == 0 && invoice.Paid == 0))

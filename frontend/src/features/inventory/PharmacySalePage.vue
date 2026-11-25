@@ -168,13 +168,13 @@ onMounted(() => {
               <td>
                 <UiComboBox v-model="line.productId" :label="line.label ? `جنس برای: ${line.label}` : 'جنس'" :search="search" :selected-label="line.productName" :hide-label="!line.label" required chip placeholder="نام یا کد جنس را تایپ کنید" />
               </td>
-              <td class="line-qty" :class="{ 'line-qty--with-label': line.label }">
+              <td class="line-qty" :class="{ 'line-qty--with-label': line.label }" data-label="مقدار">
                 <input v-model.number="line.quantity" class="form-control" type="number" min="0.001" step="any" required :aria-label="`مقدار ردیف ${i + 1}`" />
                 <small v-if="known.get(line.productId ?? 0)" class="form-hint d-block">موجودی: {{ quantity(known.get(line.productId ?? 0)!.onHand) }}</small>
               </td>
-              <td class="xr-lines__money">{{ money(known.get(line.productId ?? 0)?.salePrice ?? 0) }}</td>
-              <td class="xr-lines__money">{{ money(lineTotal(line)) }}</td>
-              <td v-if="!rx"><button type="button" class="btn btn-soft-danger btn-icon" :aria-label="`حذف ردیف ${i + 1}`" title="حذف ردیف" :disabled="form.lines.length === 1" @click="form.lines.splice(i, 1)"><i class="ri-close-line" aria-hidden="true"></i></button></td>
+              <td class="xr-lines__money" data-label="قیمت واحد">{{ money(known.get(line.productId ?? 0)?.salePrice ?? 0) }}</td>
+              <td class="xr-lines__money" data-label="مبلغ">{{ money(lineTotal(line)) }}</td>
+              <td v-if="!rx" class="xr-lines__remove"><button type="button" class="btn btn-soft-danger btn-icon" :aria-label="`حذف ردیف ${i + 1}`" title="حذف ردیف" :disabled="form.lines.length === 1" @click="form.lines.splice(i, 1)"><i class="ri-close-line" aria-hidden="true"></i></button></td>
             </tr>
           </tbody>
         </table>
@@ -199,4 +199,5 @@ onMounted(() => {
 .line-money {
   width: 130px;
 }
+
 </style>

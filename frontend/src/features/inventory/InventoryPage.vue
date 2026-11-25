@@ -5,6 +5,7 @@ import { useLiveRefresh } from '@/api/realtime'
 import InventoryStockList from './InventoryStockList.vue'
 import StockActionModals from './StockActionModals.vue'
 import type { InventoryListRow } from './stockPresentation'
+import UiInactiveToggle, { useInactiveFilter } from '@/components/UiInactiveToggle.vue'
 import UiModal from '@/components/UiModal.vue'
 import UiListSkeleton from '@/components/UiListSkeleton.vue'
 import { useAuthStore } from '@/stores/auth'
@@ -82,6 +83,7 @@ const productMenu = (row: InventoryListRow) => {
   const item = productById(row.id)
   return [
     { label: 'ویرایش جنس', icon: 'ri-edit-line', onSelect: () => openProduct(item) },
+    ...(auth.can('inventory.approve') && row.quantity > 0 ? [{ label: 'ویرایش تاریخ انقضا', icon: 'ri-calendar-line', onSelect: () => actions.value?.open('expiry', row.id, row.name) }] : []),
     { label: 'حذف جنس', icon: 'ri-delete-bin-line', danger: true, onSelect: () => removeProduct(item) },
   ]
 }
@@ -136,7 +138,9 @@ async function loadStock(rows: LocationRow[]) {
   stockByProduct.value = map
 }
 
-const listRows = computed<InventoryListRow[]>(() => products.value.map(row => {
+const productFilter = useInactiveFilter(products)
+const showInactiveProducts = productFilter.showInactive
+const listRows = computed<InventoryListRow[]>(() => productFilter.shown.value.map(row => {
   const stock = stockByProduct.value.get(row.id)
   return {
     id: row.id, name: row.name, code: row.code, kind: row.kind, category: row.category, genericName: row.genericName,
@@ -238,8 +242,10 @@ onMounted(load)
 
       <div class="xr-card__body">
         <UiListSkeleton v-if="loading" />
+        <template v-else-if="tab === 'products'">
+        <div class="mb-2"><UiInactiveToggle v-model="showInactiveProducts" :count="productFilter.inactiveCount.value" /></div>
 
-        <InventoryStockList v-else-if="tab === 'products'" :rows="listRows" :error="locationError" :menu="auth.can('inventory.edit') ? productMenu : undefined">
+        <InventoryStockList :rows="listRows" :error="locationError" :menu="auth.can('inventory.edit') ? productMenu : undefined">
           <template v-if="auth.can('inventory.edit')" #name="{ row }">
             <button type="button" class="inventory-name" @click="openProduct(productById(row.id))">{{ row.name }}</button>
           </template>
@@ -247,9 +253,11 @@ onMounted(load)
             <template v-if="row.quantity > 0">
               <button v-if="auth.can('inventory.edit')" type="button" class="btn btn-soft btn-sm" @click="actions?.open('transfer', row.id, row.name)">انتقال</button>
               <button v-if="auth.can('inventory.approve')" type="button" class="btn btn-soft btn-sm" @click="actions?.open('adjust', row.id, row.name)">تعدیل</button>
+              <button v-if="auth.can('inventory.approve')" type="button" class="btn btn-soft btn-sm" @click="actions?.open('expiry', row.id, row.name)">انقضا</button>
             </template>
           </template>
         </InventoryStockList>
+        </template>
 
         <template v-else>
           <p v-if="locations.length === 0" class="xr-state">گدامی ثبت نشده است.</p>

@@ -23,6 +23,11 @@ $project = Join-Path $repo 'backend\src\AlShifa.Api\AlShifa.Api.csproj'
 Invoke-Native $dotnet @('publish', $project, '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true', '-o', $app, '--nologo', '-v', 'q') | Out-Null
 
 Copy-Item (Join-Path $repo 'frontend\dist') (Join-Path $app 'wwwroot') -Recurse
+$version = (Get-Date).ToUniversalTime().ToString('yyyy.MM.dd.HHmm')
+# The database version of this build: the online copy must accept it before the release is offered to the hospital.
+$schema = (Get-ChildItem (Join-Path $repo 'backend\src\AlShifa.Api\Infrastructure\Migrations') -Filter '2*.cs' |
+    Where-Object { $_.Name -notlike '*.Designer.cs' } | Sort-Object Name | Select-Object -Last 1).BaseName
+[IO.File]::WriteAllText((Join-Path $app 'release.json'), (@{ version = $version; schema = $schema } | ConvertTo-Json))
 Copy-Item $PSScriptRoot (Join-Path $target 'scripts') -Recurse
 foreach ($guide in 'INSTALL-SIMPLE.md', 'PILOT-CHECKLIST.md', 'DEPLOYMENT-WINDOWS.md') { Copy-Item (Join-Path $repo $guide) $target }
 "Release ready: $target"

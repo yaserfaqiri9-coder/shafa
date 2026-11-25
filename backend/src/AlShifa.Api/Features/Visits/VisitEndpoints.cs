@@ -9,13 +9,17 @@ using Microsoft.EntityFrameworkCore;
 namespace AlShifa.Api.Features.Visits;
 
 /// <param name="TokenId">The paid token this visit uses. Only for tokens issued before the patient-first flow.</param>
-public sealed record CreateVisitRequest(long PatientId, int DepartmentId, long? DoctorStaffId, [MaxLength(300)] string? Reason, int? ServiceId = null, long? TokenId = null);
+public sealed record CreateVisitRequest(long PatientId, int DepartmentId, long? DoctorStaffId, [MaxLength(300)] string? Reason, int? ServiceId = null, long? TokenId = null, int? QueueNumber = null);
 
 public sealed record VisitRow(
-    long Id, string VisitNumber, int? QueueNumber, long PatientId, string PatientFileNumber, string PatientName,
+    long Id, string VisitNumber, int? QueueNumber, QueueShift QueueShift, int QueueRound, long PatientId, string PatientFileNumber, string PatientName,
     int DepartmentId, string DepartmentName, string? DoctorName, string Status, string? Reason, DateOnly VisitDate,
     DateTime CreatedAt, int Version, IReadOnlyList<string> NextStatuses, string PatientGender, long? DoctorStaffId = null, string FeeStatus = "None",
-    bool VisionComplete = false, int? PatientAgeYears = null);
+    bool VisionComplete = false, int? PatientAgeYears = null, int? PatientAgeMonths = null,
+    /// <summary>Doctor's worklist only: when the patient last became ready for the doctor, so waiting is not counted from the morning desk.</summary>
+    DateTime? ReadySince = null,
+    /// <summary>Doctor's seen list only: back from refraction or a test with the result in, and the file not opened since.</summary>
+    bool ResultReady = false);
 
 public sealed record ChangeVisitStatusRequest(VisitStatus Status, int Version);
 
@@ -31,11 +35,11 @@ public sealed record AppointmentRow(long Id, long PatientId, string PatientFileN
 
 public sealed record LookupItem(long Id, string Name);
 
-public sealed class VisitService(AppDbContext db, DbContextOptions<AppDbContext> options, NumberService numbers, CurrentUser user, AuditService audit, Outbox outbox, InvoiceService invoices, VisitFeeService visitFees)
+public sealed class VisitService(AppDbContext db, DbContextOptions<AppDbContext> options, NumberService numbers, QueueNumberService queueNumbers, CurrentUser user, AuditService audit, Outbox outbox, InvoiceService invoices, VisitFeeService visitFees)
 {
     public static readonly string[] EventGroups = [Groups.Reception, Groups.Triage, Groups.Doctor, Groups.Management];
 
-    /// <summary>One sequence per day across all departments: a number announced over the speaker must mean exactly one patient.</summary>
+    /// <summary>One sequence per shift across all departments: a number announced over the speaker must mean exactly one patient.</summary>
     public const string QueueNumberScope = "queue";
 
     /// <summary>
@@ -52,6 +56,8 @@ public sealed class VisitService(AppDbContext db, DbContextOptions<AppDbContext>
     /// </summary>
     public async Task<Visit> AdmitAsync(CreateAdmissionRequest request, CancellationToken ct)
     {
+        var shift = QueueShifts.Current;
+        var card = await queueNumbers.ReserveAsync(KabulClock.Today, shift, request.QueueNumber, ct);
         await LockPatientAndValidateAsync(request.PatientId, request.DepartmentId, request.DoctorStaffId, ct);
         await EnsureNoActiveVisitAsync(request.PatientId, ct);
 
@@ -70,7 +76,9 @@ public sealed class VisitService(AppDbContext db, DbContextOptions<AppDbContext>
         await db.SaveChangesAsync(ct);
 
         var token = await visitFees.CreateTokenAsync(visit.DepartmentId, visit.DoctorStaffId, visit.PatientId, ct, visit.Id);
-        visit.QueueNumber = token.QueueNumber = (int)await numbers.NextAsync(QueueNumberScope, visit.VisitDate.ToString("yyyyMMdd"), ct);
+        visit.QueueShift = token.QueueShift = shift;
+        visit.QueueNumber = token.QueueNumber = card;
+        visit.QueueRound = token.QueueRound = 1;
         audit.Add("QueueNumberIssued", "VisitToken", token.Id.ToString(), token.QueueNumber.ToString());
         db.VisitStatusHistory.Add(new VisitStatusHistory { VisitId = visit.Id, ToStatus = visit.Status, ChangedByUserId = user.Id });
         audit.Add("VisitCreated", "Visit", visit.Id.ToString());
@@ -159,6 +167,10 @@ public sealed class VisitService(AppDbContext db, DbContextOptions<AppDbContext>
 
         // The number on the patient's slip stays theirs for the whole visit, even in another department, unless the token is from another day.
         var keepsNumber = token.TokenDate == today && token.QueueNumber is not null;
+        var queueShift = keepsNumber ? token.QueueShift : QueueShifts.Current;
+        var number = keepsNumber ? token.QueueNumber!.Value : await queueNumbers.ReserveAsync(today, queueShift, request.QueueNumber, ct);
+        if (keepsNumber && request.QueueNumber is { } supplied && supplied != number)
+            throw new AppException(StatusCodes.Status409Conflict, "queue_number_fixed", "شماره کارت این مراجعه تغییر نمی‌کند.");
 
         var visit = new Visit
         {
@@ -167,14 +179,20 @@ public sealed class VisitService(AppDbContext db, DbContextOptions<AppDbContext>
             DoctorStaffId = request.DoctorStaffId ?? token.DoctorStaffId,
             Reason = string.IsNullOrWhiteSpace(request.Reason) ? null : request.Reason.Trim(),
             VisitDate = today,
+            QueueShift = queueShift,
+            QueueRound = keepsNumber ? token.QueueRound : 1,
             VisitNumber = await numbers.NextNumberAsync("visit", ct),
-            QueueNumber = keepsNumber ? token.QueueNumber : (int)await numbers.NextAsync(QueueNumberScope, today.ToString("yyyyMMdd"), ct),
+            QueueNumber = number,
             CreatedByUserId = user.Id,
         };
         db.Visits.Add(visit);
         await db.SaveChangesAsync(ct);
 
         token.VisitId = visit.Id;
+        token.TokenDate = today;
+        token.QueueShift = queueShift;
+        token.QueueRound = visit.QueueRound;
+        token.QueueNumber = visit.QueueNumber;
         feeInvoice.PatientId = visit.PatientId;
         feeInvoice.VisitId = visit.Id;
 
@@ -195,7 +213,7 @@ public sealed class VisitService(AppDbContext db, DbContextOptions<AppDbContext>
         ?? throw AppException.NotFound();
 
     public static IQueryable<VisitProjection> QueryRows(AppDbContext db, IQueryable<Visit> visits) => visits.Select(v => new VisitProjection(
-        v.Id, v.VisitNumber, v.QueueNumber, v.PatientId, v.Patient!.FileNumber, v.Patient.FirstName, v.Patient.LastName,
+        v.Id, v.VisitNumber, v.QueueNumber, v.QueueShift, v.QueueRound, v.PatientId, v.Patient!.FileNumber, v.Patient.FirstName, v.Patient.LastName,
         v.DepartmentId, v.Department!.Name, v.Doctor != null ? v.Doctor.FullName : null, v.Status, v.Reason, v.VisitDate, v.CreatedAt, v.Version, v.Patient.Gender, v.DoctorStaffId,
         db.PreExaminations.Any(p => p.VisitId == v.Id && p.CompletedAt != null),
         db.VisitTokens.Where(t => t.VisitId == v.Id).Select(t => t.Invoice!.Status == InvoiceStatus.Void ? "Unpaid"
@@ -205,14 +223,14 @@ public sealed class VisitService(AppDbContext db, DbContextOptions<AppDbContext>
         v.Patient.BirthDate, v.Patient.EstimatedBirthYear));
 
     public static VisitRow ToRow(VisitProjection v) => new(
-        v.Id, v.VisitNumber, v.QueueNumber, v.PatientId, v.FileNumber, $"{v.FirstName} {v.LastName}".Trim(),
+        v.Id, v.VisitNumber, v.QueueNumber, v.QueueShift, v.QueueRound, v.PatientId, v.FileNumber, $"{v.FirstName} {v.LastName}".Trim(),
         v.DepartmentId, v.DepartmentName, v.DoctorName, v.Status.ToString(), v.Reason, v.VisitDate, v.CreatedAt, v.Version,
         VisitWorkflow.NextOf(v.Status, v.VisionComplete).Select(s => s.ToString()).ToList(), v.Gender.ToString(), v.DoctorStaffId, v.FeeStatus ?? "None",
-        v.VisionComplete, Patients.PatientEndpoints.AgeOf(v.BirthDate, v.EstimatedBirthYear));
+        v.VisionComplete, Patients.PatientEndpoints.AgeOf(v.BirthDate, v.EstimatedBirthYear), Patients.PatientEndpoints.MonthsOf(v.BirthDate));
 }
 
 public sealed record VisitProjection(
-    long Id, string VisitNumber, int? QueueNumber, long PatientId, string FileNumber, string FirstName, string? LastName,
+    long Id, string VisitNumber, int? QueueNumber, QueueShift QueueShift, int QueueRound, long PatientId, string FileNumber, string FirstName, string? LastName,
     int DepartmentId, string DepartmentName, string? DoctorName, VisitStatus Status, string? Reason, DateOnly VisitDate, DateTime CreatedAt, int Version, Patients.Gender Gender, long? DoctorStaffId, bool VisionComplete, string? FeeStatus,
     DateOnly? BirthDate = null, int? EstimatedBirthYear = null);
 
@@ -244,7 +262,7 @@ public static class VisitEndpoints
             }
 
             var total = await query.CountAsync(ct);
-            var ordered = patientId is null ? query.OrderBy(v => v.DepartmentId).ThenBy(v => v.QueueNumber) : query.OrderByDescending(v => v.Id);
+            var ordered = patientId is null ? query.OrderBy(v => v.DepartmentId).ThenBy(v => v.QueueShift == QueueShift.Afternoon).ThenBy(v => v.QueueNumber) : query.OrderByDescending(v => v.Id);
             var rows = await VisitService.QueryRows(db, ordered.Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
             return Results.Ok(new PagedResult<VisitRow>(rows.Select(VisitService.ToRow).ToList(), total, page, pageSize));
         }).RequirePermission("visits.view");
@@ -495,7 +513,7 @@ public static class VisitEndpoints
                     throw new AppException(StatusCodes.Status409Conflict, "invalid_transition", "برای این وقت ملاقات قبلاً پذیرش انجام شده یا لغو شده است.");
                 }
 
-                var visit = await service.AdmitAsync(new CreateAdmissionRequest(appointment.PatientId, request.DepartmentId, appointment.DoctorStaffId, appointment.Note), ct);
+                var visit = await service.AdmitAsync(new CreateAdmissionRequest(appointment.PatientId, request.DepartmentId, appointment.DoctorStaffId, appointment.Note, QueueNumber: request.QueueNumber), ct);
                 appointment.Status = AppointmentStatus.CheckedIn;
                 appointment.VisitId = visit.Id;
                 audit.Add("AppointmentCheckedIn", "Appointment", appointment.Id.ToString(), $"Visit {visit.Id}");
@@ -513,4 +531,4 @@ public static class VisitEndpoints
     }
 }
 
-public sealed record CheckInRequest(int DepartmentId, int Version);
+public sealed record CheckInRequest(int DepartmentId, int Version, [property: Required, Range(1, 100)] int? QueueNumber = null);

@@ -208,7 +208,7 @@ async function logout() {
     <div v-if="auth.user" class="header__user">
       <UiAvatar :seed="auth.user.fullName" :size="38" plain />
       <div class="header__identity">
-        <div class="header__name">{{ auth.user.fullName }}</div>
+        <div class="header__name" :title="auth.user.fullName">{{ auth.user.fullName }}</div>
         <div class="header__role" :title="roles">{{ roles }}</div>
       </div>
     </div>
@@ -271,9 +271,10 @@ async function logout() {
 
 .header__search {
   position: relative;
-  flex: none;
+  /* Shrinks before the user's name is pushed off a narrow laptop screen. */
+  flex: 0 1 350px;
   width: 350px;
-  min-width: 0;
+  min-width: 180px;
   margin-inline: 15px;
 }
 
@@ -352,7 +353,8 @@ async function logout() {
 
 .header__user {
   display: flex;
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
   align-items: center;
   padding-inline: 15px 20px;
 }
@@ -363,7 +365,9 @@ async function logout() {
 }
 
 .header__name {
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--xr-text);
   font-size: 15px;
   font-weight: 500;
@@ -395,6 +399,7 @@ async function logout() {
   .header__search {
     flex: 1;
     width: auto;
+    min-width: 0;
     margin-inline: 0;
   }
 

@@ -52,7 +52,7 @@ test('a user changes their password from the header, and the admin can reset it 
 
   await page.goto('/users')
   await page.getByRole('searchbox', { name: 'جستجو', exact: true }).fill(userName)
-  await page.getByRole('button', { name: 'جستجو', exact: true }).click()
+  // The list filters while typing; there is no search button to press.
   const row = page.getByRole('row', { name: new RegExp(userName) })
   await row.getByRole('button', { name: 'بازنشانی رمز' }).click()
   const resetDialog = page.getByRole('dialog')
@@ -105,8 +105,8 @@ test('lab uploads a result file, refuses a disguised one, and the doctor sees th
   await order.getByRole('button', { name: 'ثبت درخواست' }).click()
   await expect(order).toBeHidden()
 
-  await lab.getByRole('row', { name: new RegExp(testName) }).getByRole('link', { name: 'ثبت نتیجه' }).click()
-  const result = lab.locator('form.xr-card')
+  await lab.getByRole('listitem').filter({ hasText: testName }).getByRole('button', { name: 'انجام شد' }).click()
+  const result = lab.getByRole('dialog')
   const input = result.getByLabel(/بارگذاری فایل/)
 
   await input.setInputFiles({ name: 'fake.pdf', mimeType: 'application/pdf', buffer: Buffer.from('<script>alert(1)</script>') })

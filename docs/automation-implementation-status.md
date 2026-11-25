@@ -1,0 +1,93 @@
+# Automation implementation and acceptance status — 2026-11-21
+
+This is an implementation record, not a production acceptance certificate. Work was done in `F:\eye-main`. Existing unrelated changes were preserved. No production database, installed hospital service, router, DNS zone or Contabo release was changed. No new migration was introduced by this work.
+
+## Existing-install upgrade delivery — 2026-11-21 17:35 Kabul
+
+`AlShifa-Final-Release/Install-AlShifa.exe` is now an **upgrade-only** edition: it derives the installed root from the Windows service and offers neither fresh installation nor uninstall/rollback of a stale unfinished-install marker. The previous artifact was retained under `.tools`. The EXE preserves the validated current application/frontend payload.
+
+The user has no real hospital backup available. No real database was tested or changed. In the elevated synthetic Windows lab `.tools/windows-service-lab-62e11d52897b43e6baf81dbf7b81a407/result.json`, every check completed with no cleanup errors: installed-root detection; failed-backup refusal before file swap/live migration with the previous service running unchanged; complete encrypted backup/restore; candidate migrations on a second restored copy matched against the stopped source's protected-row proofs; successful update preserving patients, drugs, stock, payments, users and passwords; both failing and row-mutating candidates refused before live migration; offline upgrade retaining an online-compatibility hold; and repair of deliberately removed manual-backup event source/trigger followed by an API-triggered restore-verified backup. This is permission to attempt the guarded upgrade workflow, not hospital operational acceptance.
+
+The installer checks service/database port/data-directory ownership and conflicting environment overrides. Protected-row proofs detect fractional money changes and NULL versus empty values. Backup now also includes scripts, the actual MySQL configuration and release metadata. Visual C++ is not redistributed: when needed, the end-user installer downloads the pinned official Microsoft file and verifies SHA-256 plus Authenticode before installation. Direct download/authenticity and tampering refusal were tested; an actual runtime install was unnecessary on this workstation. Current focused backend checks passed 24/24. Browser/PWA/launcher clients of the same server need a close/reopen or refresh; independent databases require separate review and upgrade.
+
+The upgrade deliberately holds Sync/Auto Update until technical Contabo compatibility approval. Real hospital data, router/DNS, public mirror enrollment and physical-phone acceptance remain unverified.
+
+## Earlier verification and delivery — 2026-11-21, follow-up
+
+- Delivery artifact: `AlShifa-Final-Release/Install-AlShifa.exe`, with a short Dari guide and SHA-256. API and frontend were rebuilt from the current working tree. The EXE payload hash, exact API DLL/frontend entry point, repaired updater script, absence of host secrets/data, and compiled advanced-network UI were verified. Existing unrelated work was retained.
+- The 23 remaining test failures were resolved in test contracts/expectations, without changing financial or clinical policy. Queue enum deserialization and shift/round receipt labels now match the existing API. Permission subset direction, patient-specific invoice lookup, the protected migration rollback guard and existing refund/stock-return policy are checked correctly. Independent migration fixtures run in separate processes because of the provider's global advisory lock. The broad run passed 127/129, migration 1/1 and Sync 15/15; the final two corrected admission tests passed 2/2 on a fresh instance: **145 unique relevant tests passed**. Evidence: `.tools/automation-lab-6c52d93c4d2b4a06a735f770260f0b50/results/` and `.tools/automation-lab-68fb5a5e1f1740dc9e1e0316b4821562/results/`.
+- Actual elevated Windows SCM/SYSTEM lab passed manual API-triggered encrypted backup and restore, execution of the nightly task and its Kabul 02:00 boundary, signed update success, migration-failure rollback and startup/health-failure rollback. Each update preserved account/password, patient, payment and ledger fingerprints; login and health were rechecked. `.tools/windows-service-lab-05c26f0015e343ff8a94b6bb383dba71/result.json` completed with no cleanup errors. Real clock firing at 02:00 was not awaited.
+- A real updater defect was fixed: `DbConnectionStringBuilder.ConnectionString = ...` uses PowerShell's dictionary adapter instead of parsing the connection. The CLR setter is now called explicitly. Authenticity, tampering, wrong publisher, insecure transport, archive traversal, host-config exclusion and exact-version approval checks passed.
+- Fresh `install.ps1` ran against dedicated MySQL 33494 and fresh synthetic data. Actual Windows services, frontend, firewall rule, backup/update tasks and the initial restore-verified backup passed. `.tools/windows-fresh-lab-bd9da1fd15c34e659c2e267049f17935-package/result.json` completed with no cleanup errors. Only the workstation power-plan block was omitted from the test copy. The full EXE click flow on clean Windows was not tested.
+- Current frontend typecheck, two unit tests and production build passed. Lint still reports 12 existing findings in `clipPlayer.ts` and `DossierForm.vue`; these unrelated clinical/calling edits were preserved. Current Windows self-contained publish succeeded with no errors.
+- Microsoft Visual C++ Runtime is deliberately **not bundled**, per the user's explicit answer that redistribution eligibility is absent/unknown. The existing installer detects whether it is needed and can use the official signed runtime placed beside the EXE. This is a remaining dependency on a clean machine, not a fully offline dependency-complete package.
+- Contabo two-host verification **passed** in a separate loopback-only container/API with normal TLS validation through SSH: initial snapshot, online login/MFA, local work during a simulated outage, online patient and payment commands received/executed locally, replay returning the original result, single patient/payment, preserved local credentials, empty outbox and balanced ledger. The first client's missing pre-login CSRF token was corrected without weakening security. Evidence: `.tools/automation-lab-14788d4e4f9341cc8f4f453071f192f5/results/automation-1.trx`; local/remote private lab `contabo-sync-6eb2f82f9dc044eaa76c9a024352a666`. This makes **146 unique relevant backend tests passed** across the final focused runs. This is not acceptance of the production mirror on public port 443 or permission to enroll an existing populated database.
+- No real patient database, installed hospital service, production Contabo release, router or DNS was modified. Temporary services/tasks/firewall rule/certificate trust were removed; XAMPP MySQL remained running. Actual hospital backup failure, public mirror compatibility/enrollment, trusted LAN DNS/certificates, physical-phone access, publisher-feed enrollment and clean-Windows EXE acceptance remain unverified. **This artifact is not declared ready for hospital production.**
+
+The sections below record the earlier implementation pass; the follow-up results above supersede its test counts and Windows-test status.
+
+## Implemented in source
+
+### Replication controls and data protection
+
+- `PUT /api/sync/enabled` persists the operator's choice in local-only `SyncStates`, requires `settings.edit` and audits the change. Disabling transmission preserves transactional capture and the outbox. A run already in progress may finish; subsequent runs stop.
+- The worker interval is bounded to 1–5 minutes. This bounds the wait between attempts, not the duration of a large initial transfer, network timeout or outage.
+- Each installation obtains a durable host ID outside its database. The default ID is in the protected data-protection key directory; encrypted backups deliberately exclude that ID so another installation does not inherit it.
+- Protocol 2 binds an empty mirror to its initial source. Independent sources, missing identities, nonempty unbound destinations, automatic resets and divergent replication histories are refused. Transactions preserve existing destination rows when enrollment is refused.
+- Mixed old/new replication protocols are refused before sending rows. Both services must be upgraded and verified together. Existing populated mirrors require a separately reviewed enrollment/reconciliation procedure; this work does **not** provide an automatic adoption/merge procedure.
+- Existing online commands, transactional local execution, idempotency, role checks and conflict handling are reused. Remote HTTP error bodies are no longer copied into replication status or logs.
+
+**Still not implemented:** organization/device enrollment with independent cryptographic credentials, individual device revocation, satellite replication and a validated merge of independently populated databases. The host ID and source guard are safeguards for the current authoritative-source topology; they are not a completed multi-server architecture. In particular, do not configure several independent writable installations with the same shared key.
+
+### Backup
+
+- The existing manual event trigger is retained; installation/update now repairs a missing `AlShifa.Api` event source. The original hospital machine's manual-backup failure has not been diagnosed because that installed host was not available here. Repairing the source registration is a supported failure-path correction, not evidence of that machine's root cause.
+- A file lock serializes nightly, manual and updater backups, including launches outside Task Scheduler.
+- AES-256 OpenPGP encryption remains independent of Sync. Archives include the application database, attachments, session keys, certificates, TLS material, protected host secrets and essential host configuration. The archive-opening password stays outside its own archive. A separate offline copy of that password remains necessary for disaster recovery.
+- Every new archive includes a SHA-256 file manifest. The actual destination archive is decrypted and restored into a new, random `alshifa_restore_*` database. Tables, migration history, attachment hashes and ledger balance are checked before success is recorded. The restore account is restricted to scratch database names by the existing installation grants.
+- A restore drill never drops an existing operator-supplied target. It drops only the scratch database it successfully created.
+- `restoreVerifiedAt` and the verified filename accompany the last-success record. An old status with no restore proof requires attention. The UI distinguishes a request from confirmed completion and reports a request that Windows never starts.
+- Previous local and offsite archives are retained. No automatic retention deletion runs from the new backup path. Disk capacity must be monitored.
+- The nightly trigger explicitly specifies `02:00:00+04:30`, with missed-run handling retained, so the schedule is independent of the Windows host's DST.
+
+### Software updates
+
+- `auto-update.ps1` runs as a separate SYSTEM scheduled worker, checks hourly and downloads automatically after one-time publisher enrollment. A second event-triggered task installs only after an authenticated settings editor approves the exact verified version. The event is only a wake signal: a matching approval file, writable only by the API service, SYSTEM and administrators, must be fresh and is consumed before installation. An ordinary local event writer cannot authorize an update.
+- An administrator pins a public RSA key of at least 3072 bits through `configure-auto-update.ps1`. `sign-update.ps1` creates a detached SHA-256/RSA signature over the exact manifest bytes. The private key is never included in a release.
+- Transport requires trusted HTTPS, refuses redirects and embedded credentials, restricts packages to the publisher host, and bounds download size. The signed version, package length/hash, archive paths, symlinks and required contents are checked. Packages containing host production configuration are refused. Installed-version comparison refuses downgrades.
+- `build-release.ps1` writes an explicit UTC release version marker. Older installations without a trustworthy marker require technical enrollment; the updater does not guess their installed version.
+- Before changing the installed application, the updater verifies the actual service path and matches the API database endpoint to the backup endpoint. The current host configuration is preserved.
+- The application is stopped before backup. Installation requires restore proof for that exact archive. A maintenance marker blocks user/API work and the replication worker while the new service undergoes health checks, protecting rollback from intervening user writes.
+- Previous applications are retained under unique names. Migration or post-start health failure attempts database/application rollback. A failed rollback stops the service. Failure records identify the stage without persisting credentials or raw process output.
+- `Update:StatusFile` backs the settings status panel. UI approval records an audit before emitting the event that may stop the API.
+
+**Not operationally accepted:** publisher enrollment and signed release publication on Novatech; a successful and failing installation against a disposable Windows service; reboot/task/event behavior; recovery after power loss. Signature/archive checks and source compilation do not establish these outcomes. No new scheduled task was installed on this workstation or the hospital host.
+
+### Mobile/LAN
+
+The existing `prepare-trusted-lan.ps1`, certificate renewal, `test-lan-access.ps1` and PWA flow are reused. They already require the actual installed service, reserved LAN address, internal DNS and a publicly trusted DNS-01 certificate. This work does not change router/DNS settings or bypass TLS verification. A local mobile-viewport test is not proof of a physical phone reaching the hospital over trusted HTTPS.
+
+## Verification evidence
+
+- Focused backend run before the test-fixture correction: 136 tests, 99 passed, 37 failed. Private synthetic TRX: `.tools/automation-lab-446c685d063e4114871ac5b02dd479ee/results/automation.trx`.
+- Fourteen Sync failures shared one fixture setup error: `RootSqlAsync` ignored `ALSHIFA_TEST_ADMIN_DB` and read the development root password. It now honors the explicitly supplied isolated administrator connection. The affected tests were rerun on a new instance.
+- Subsequent focused Sync/automation run: 21 passed, no failures. Evidence: `.tools/automation-lab-0c08c9bd38ea46c39f7c262a1e0db013/results/automation.trx`. After adding the old-protocol rejection regression, the final focused run passed all 22 tests: `.tools/automation-lab-dfbe470ca4bf44f1b5141d2dc1667639/results/automation.trx`.
+- The updater API permission/approval test also passed on an independent instance: unauthorized role, wrong version and stale status were refused, and the exact fresh version reached only a recording trigger. Evidence: `.tools/automation-lab-bca9221498064b9083c0abacb15b7415/results/automation.trx`. Test fixtures explicitly replace both host triggers so they cannot start a real backup/update.
+- The broad run's other 23 failures remain unresolved: queue-shift JSON test contracts; prohibited queue-round down-migration; existing financial/auth expectations and a shared-fixture invoice assertion. No production-readiness claim is supported by this run.
+- Real encrypted backup/destination decryption/scratch restore passed on the first isolated lab, with limited backup/restore accounts and synthetic data only. Result is in that lab's private `host/logs/backup-status.json`. No port 3308 database was accessed.
+- `test-update-safety.ps1` passed authentic signature, modified manifest, wrong publisher, HTTP rejection, ZIP traversal, archive completeness, host-configuration exclusion, publisher packaging with a matching signed archive hash, Kabul schedule and protected-approval checks (missing, wrong version, expired and valid). It deliberately does not execute a Windows service update.
+- Frontend typecheck and the existing two unit tests passed. Full lint reports 12 findings in existing `clipPlayer.ts` and `DossierForm.vue`. Lint of the three changed settings components passed.
+- Headless Edge logged into a new synthetic browser database and checked the settings at 390×844 and 1366×900. The unprovisioned Sync checkbox was refused and reverted correctly; no JavaScript errors or horizontal overflow occurred. Private screenshots: `.tools/automation-lab-0c08c9bd38ea46c39f7c262a1e0db013/browser/`.
+- Fourteen changed/new PowerShell automation files passed syntax parsing; the scoped whitespace check passed.
+- Final backend/test-project compilation succeeded with zero errors and six existing warnings. All temporary browser/API/MySQL processes were stopped after verification.
+- Live, read-only Contabo inspection: `alshifa-api.service` active; current release `/opt/alshifa/releases/20261120T151239Z`; online mode configured; loopback `/health` returned `200 Healthy`. A public `/health` request from that server returned 403. Neither that route's external accessibility nor hospital-to-online freshness was established. No deployment was performed.
+
+## Outstanding acceptance work
+
+1. Implement and test the missing organization/device enrollment, revocation and satellite/merge architecture. Do not turn off the source guard to simulate multi-server support.
+2. Resolve the broader integration failures without overwriting unrelated queue, accounting or permission work. Run the relevant migration and financial acceptance tests successfully.
+3. On a disposable Windows host, test the exact signed installer/update success and failure paths, event-triggered manual backup, nightly firing, power interruption and rollback.
+4. Pin the approved publisher key and publish a signed Windows feed under an administrator-approved Novatech endpoint. Do not manufacture trust from a key delivered with the same untrusted feed.
+5. Inspect the actual hospital service, backup failure/status, DNS/DHCP/router and certificate renewal. Verify an unmodified phone, personal user roles, internet interruption and fresh post-sync data before enabling new features on real records.
+
+Until those items pass, the result is source implementation with isolated evidence and explicit missing features, **not** the fully operational one-checkbox multi-server system requested.

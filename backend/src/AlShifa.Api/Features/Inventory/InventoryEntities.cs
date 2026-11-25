@@ -119,6 +119,19 @@ public class StockMovement
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }
 
+/// <summary>A counted-stock document.  The movement changes stock; this preserves the before/after count and who approved it.</summary>
+public class StockAdjustment
+{
+    public long Id { get; set; }
+    public long BatchId { get; set; }
+    public StockBatch? Batch { get; set; }
+    public decimal PreviousQuantity { get; set; }
+    public decimal NewQuantity { get; set; }
+    [MaxLength(300)] public string Reason { get; set; } = "";
+    public long ApprovedByUserId { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
+
 public class Supplier
 {
     public int Id { get; set; }
@@ -289,6 +302,22 @@ public class OpticalOrder
     public long CreatedByUserId { get; set; }
 
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+    /// <summary>A complimentary order takes stock but never creates receivable or optical revenue.</summary>
+    public bool IsComplimentary { get; set; }
+
+    [MaxLength(300)]
+    public string? ComplimentaryReason { get; set; }
+
+    [MaxLength(150)]
+    public string? ComplimentaryApprovedBy { get; set; }
+
+    /// <summary>A sale without a prescription has no patient: the name and phone let the customer be found when they come back.</summary>
+    [MaxLength(150)]
+    public string? CustomerName { get; set; }
+
+    [MaxLength(30)]
+    public string? CustomerPhone { get; set; }
 
     public int Version { get; set; }
 }

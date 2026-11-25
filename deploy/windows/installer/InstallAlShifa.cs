@@ -1,4 +1,4 @@
-// The double-click installer for the hospital host: asks only what it must, then runs the scripts in deploy\windows.
+﻿// The double-click installer for the hospital host: asks only what it must, then runs the scripts in deploy\windows.
 // The whole package is appended to this exe, so one file on a USB stick is enough and no internet is needed.
 // Built by build-installer.ps1 with the C# compiler that ships in Windows, so it needs nothing beyond .NET Framework 4.7.2.
 using System;
@@ -38,7 +38,7 @@ namespace AlShifa.Setup
 
     internal static class Host
     {
-        public const string Root = @"C:\AlShifa";
+        public static readonly string Root = FindInstalledRoot();
         public static readonly string SetupDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "AlShifaSetup");
         public static readonly string WorkDir = Path.Combine(SetupDir, "work");
         // Written by setup.ps1 just before its first change, removed on success. Only this marker allows a rollback.
@@ -47,11 +47,32 @@ namespace AlShifa.Setup
         public static HostState Detect()
         {
             if (File.Exists(Marker)) return HostState.Unfinished;
-            bool services = ServiceController.GetServices().Any(s => s.ServiceName == "AlShifaApi" || s.ServiceName == "AlShifaMySQL");
-            if (services && File.Exists(Path.Combine(Root, @"app\appsettings.Production.json"))) return HostState.Installed;
+            var all = ServiceController.GetServices();
+            bool api = all.Any(s => s.ServiceName == "AlShifaApi"), mysql = all.Any(s => s.ServiceName == "AlShifaMySQL");
+            bool services = api || mysql;
+            if (api && mysql && File.Exists(Path.Combine(Root, @"app\appsettings.Production.json"))) return HostState.Installed;
             if (services) return HostState.Occupied;
             if (Directory.Exists(Root) && Directory.EnumerateFileSystemEntries(Root).Any()) return HostState.Occupied;
             return HostState.Fresh;
+        }
+
+        internal static string RootFromServicePath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return null;
+            path = path.Trim().Trim('"');
+            if (!Path.IsPathRooted(path) || !path.EndsWith(@"\app\AlShifa.Api.exe", StringComparison.OrdinalIgnoreCase)) return null;
+            return Path.GetDirectoryName(Path.GetDirectoryName(path));
+        }
+
+        private static string FindInstalledRoot()
+        {
+            using (var query = new ManagementObjectSearcher("SELECT PathName FROM Win32_Service WHERE Name='AlShifaApi'"))
+                foreach (ManagementObject service in query.Get())
+                {
+                    var root = RootFromServicePath(service["PathName"] as string);
+                    if (root != null) return root;
+                }
+            return @"C:\AlShifa";
         }
 
         /// <summary>Addresses staff could reach, most likely first: a real adapter with a gateway, cable before Wi-Fi.</summary>
@@ -245,6 +266,7 @@ namespace AlShifa.Setup
         private static readonly string[] UpdateSteps =
         {
             "متوقف‌کردن برنامه",
+            "بررسی سلامت دیتابیس",
             "بکاپ تازه و آزمایش بازیابی آن",
             "جایگزینی فایل‌های برنامه",
             "اعمال Migration",
@@ -254,10 +276,11 @@ namespace AlShifa.Setup
         private static readonly Dictionary<string, int> UpdateMarks = new Dictionary<string, int>
         {
             { "== Stop the application", 0 },
-            { "== Backup before changing anything", 1 },
-            { "== Swap the application files", 2 },
-            { "== Migrate", 3 },
-            { "##STEP health", 4 },
+            { "== Database integrity check", 1 },
+            { "== Backup before changing anything", 2 },
+            { "== Swap the application files", 3 },
+            { "== Migrate", 4 },
+            { "##STEP health", 5 },
         };
 
         // Preflight reports in English for the technical log. These explain each line to the person at the laptop.
@@ -344,9 +367,23 @@ namespace AlShifa.Setup
 
             switch (state)
             {
-                case HostState.Fresh: ShowSettings(); break;
+                case HostState.Fresh:
+#if UPGRADE_ONLY
+                    var page = NewPage("نصب قبلی شناسایی نشد");
+                    AddText(page, "این فایل فقط برای ارتقای سرور موجود شفاخانه است. نصب تازه یا دیتابیس خالی ایجاد نمی‌شود. فایل را روی سرور اصلی اجرا کنید؛ هیچ اطلاعاتی تغییر نکرده است.");
+                    AddButton("بستن", "btnClose", delegate { Close(); });
+#else
+                    ShowSettings();
+#endif
+                    break;
                 case HostState.Installed: ShowUpdateOffer(); break;
-                case HostState.Unfinished: ShowUnfinished(); break;
+                case HostState.Unfinished:
+#if UPGRADE_ONLY
+                    ShowFailure("نصب قبلی به بررسی نیاز دارد.", "نشانگر نصب ناتمام وجود دارد. این نسخه اجازهٔ حذف یا برگشت نصب قبلی را نمی‌دهد؛ برای حفظ اطلاعات، ارتقا متوقف شد.", false);
+#else
+                    ShowUnfinished();
+#endif
+                    break;
                 default: ShowOccupied(); break;
             }
         }
@@ -379,7 +416,7 @@ namespace AlShifa.Setup
         private void ShowSettings()
         {
             var page = NewPage("نصب سیستم الشفا");
-            AddText(page, "این کمپیوتر میزبان سیستم می‌شود. فقط برای صدور و تمدید گواهی معتبر، انترنت سرور لازم است؛ کار داخل شبکه به انترنت وابسته نیست.");
+            AddText(page, "این کمپیوتر میزبان سیستم می‌شود. حالت خودکار محلی به تنظیم روتر، DNS یا انترنت خارجی نیاز ندارد؛ کار داخل شبکه به انترنت وابسته نیست.");
 
             AddText(page, "نام کاربری مدیر سیستم: admin");
             AddText(page, "رمز مدیر سیستم:");
@@ -389,28 +426,33 @@ namespace AlShifa.Setup
             passwordAgainBox = new TextBox { Width = FieldWidth, UseSystemPasswordChar = true, Name = "txtPasswordAgain", RightToLeft = RightToLeft.No };
             page.Controls.Add(passwordAgainBox);
 
-            AddText(page, "آدرس این لپ‌تاپ در شبکه شفاخانه:").Margin = new Padding(0, 12, 0, 4);
-            addressBox = new ComboBox { Width = FieldWidth, DropDownStyle = ComboBoxStyle.DropDown, Name = "cmbAddress", RightToLeft = RightToLeft.No };
+            var networkPage = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, Visible = false, Margin = new Padding(0), Name = "advancedNetwork" };
+            AddButton("تنظیمات پیشرفتهٔ شبکه (مدیر فنی)", "btnAdvancedNetwork", delegate { networkPage.Visible = !networkPage.Visible; });
+            page.Controls.Add(networkPage);
+            AddText(networkPage, "آدرس شبکه به‌صورت خودکار انتخاب می‌شود:").Margin = new Padding(0, 12, 0, 4);
+            addressBox = new ComboBox { Width = FieldWidth, DropDownStyle = ComboBoxStyle.DropDownList, Name = "cmbAddress", RightToLeft = RightToLeft.No };
             foreach (var address in Host.DetectAddresses()) addressBox.Items.Add(address);
             if (addressBox.Items.Count > 0) addressBox.SelectedIndex = 0;
-            page.Controls.Add(addressBox);
-            AddText(page, "این IP را برای MAC همین سرور در روتر رزرو کنید و آدرس داخلی زیر را در DNS شبکه به همین IP وصل کنید.", Color.DimGray);
-            trustedLanBox = new CheckBox { Text = "اتصال با لینک امن؛ بدون نصب فایل یا گواهی روی کارمندان", Checked = true, AutoSize = true, Name = "chkTrustedLan" };
-            page.Controls.Add(trustedLanBox);
-            AddText(page, "آدرس داخلی (جدا از آدرس آنلاین):");
+            networkPage.Controls.Add(addressBox);
+            AddText(networkPage, "اولین IP فعال دارای gateway انتخاب می‌شود؛ نصب‌کننده روتر و DNS را تغییر نمی‌دهد.", Color.DimGray);
+            trustedLanBox = new CheckBox { Text = "لینک عمومی امن با lan-shafa.novatechsoft.com (اختیاری؛ نیازمند DNS و Cloudflare آماده)", Checked = false, AutoSize = true, Name = "chkTrustedLan" };
+            networkPage.Controls.Add(trustedLanBox);
+            AddText(networkPage, "آدرس داخلی (جدا از آدرس آنلاین):");
             trustedHostBox = new TextBox { Width = FieldWidth, Text = "lan-shafa.novatechsoft.com", RightToLeft = RightToLeft.No, Name = "txtTrustedHost" };
-            page.Controls.Add(trustedHostBox);
-            AddText(page, "ایمیل مسئول گواهی:");
+            networkPage.Controls.Add(trustedHostBox);
+            AddText(networkPage, "ایمیل مسئول گواهی:");
             certificateEmailBox = new TextBox { Width = FieldWidth, RightToLeft = RightToLeft.No, Name = "txtCertificateEmail" };
-            page.Controls.Add(certificateEmailBox);
-            AddText(page, "Cloudflare API Token فقط برای DNS همین دامنه؛ روی سرور رمزگذاری می‌شود:");
+            networkPage.Controls.Add(certificateEmailBox);
+            AddText(networkPage, "Cloudflare API Token فقط برای DNS همین دامنه؛ روی سرور رمزگذاری می‌شود:");
             cloudflareTokenBox = new TextBox { Width = FieldWidth, UseSystemPasswordChar = true, RightToLeft = RightToLeft.No, Name = "txtCloudflareToken" };
-            page.Controls.Add(cloudflareTokenBox);
+            networkPage.Controls.Add(cloudflareTokenBox);
             acmeTermsBox = new CheckBox { Text = "شرایط صدور گواهی Let's Encrypt را خوانده‌ام و می‌پذیرم", AutoSize = true, Name = "chkAcmeTerms" };
-            page.Controls.Add(acmeTermsBox);
+            networkPage.Controls.Add(acmeTermsBox);
             var termsLink = new LinkLabel { Text = "https://letsencrypt.org/repository/", AutoSize = true, RightToLeft = RightToLeft.No };
             termsLink.LinkClicked += delegate { OpenInUserBrowser("https://letsencrypt.org/repository/"); };
-            page.Controls.Add(termsLink);
+            networkPage.Controls.Add(termsLink);
+            trustedLanBox.CheckedChanged += delegate { SetTrustedLanFieldsEnabled(trustedLanBox.Checked); };
+            SetTrustedLanFieldsEnabled(false);
 
             AddText(page, "محل بکاپ:").Margin = new Padding(0, 8, 0, 4);
             driveBox = new ComboBox { Width = FieldWidth, DropDownStyle = ComboBoxStyle.DropDownList, Name = "cmbDrive" };
@@ -427,7 +469,7 @@ namespace AlShifa.Setup
 
             errorLabel = AddText(page, "", Color.Firebrick, "lblError");
 
-            AddButton("شروع نصب", "btnInstall", delegate { StartInstall(); });
+            AddButton("نصب و راه‌اندازی خودکار", "btnInstall", delegate { StartInstall(); });
             AddButton("به‌روزکردن فهرست هارد", "btnRefresh", delegate { RefreshDrives(); });
             AddButton("انصراف", "btnClose", delegate { Close(); });
         }
@@ -438,6 +480,14 @@ namespace AlShifa.Setup
             foreach (var drive in Host.DetectBackupDrives()) driveBox.Items.Add(drive);
             driveBox.Items.Add(new BackupDrive { Letter = null, Label = "روی همین کمپیوتر، بدون هارد جداگانه (C:\\AlShifaBackups)" });
             driveBox.SelectedIndex = 0;
+        }
+
+        private void SetTrustedLanFieldsEnabled(bool enabled)
+        {
+            if (trustedHostBox != null) trustedHostBox.Enabled = enabled;
+            if (certificateEmailBox != null) certificateEmailBox.Enabled = enabled;
+            if (cloudflareTokenBox != null) cloudflareTokenBox.Enabled = enabled;
+            if (acmeTermsBox != null) acmeTermsBox.Enabled = enabled;
         }
 
         private void StartInstall()
@@ -578,6 +628,7 @@ namespace AlShifa.Setup
             var key = line.Trim();
             if (key.StartsWith("##WARN ")) outcome.Warnings.Add(key.Substring(7));
             if (key == "##VOICE pending") outcome.VoicePending = true;
+            if (key == "##SYNC pending") outcome.SyncPending = true;
             if (key == "##HEALTH attention") outcome.HealthAttention = true;
             if (key.StartsWith("RESULT: backup restored and verified")) outcome.BackupVerified = true;
             if (key.StartsWith("##URL ")) outcome.Url = key.Substring(6);
@@ -617,17 +668,17 @@ namespace AlShifa.Setup
         {
             if (outcome.ExitCode != 0)
             {
-                ShowFailure("نصب کامل نشد.", Explain(outcome), File.Exists(Host.Marker));
+                ShowFailure("ناموفق: نصب کامل نشد.", Explain(outcome), File.Exists(Host.Marker));
                 return;
             }
 
-            var page = NewPage(outcome.HealthAttention ? "نصب شد، ولی یک مورد نیاز به توجه دارد" : "نصب با موفقیت انجام شد");
+            var page = NewPage(outcome.HealthAttention ? "نیازمند اقدام: نصب انجام شد" : "موفق: نصب و آزمایش انجام شد");
             AddText(page, "آدرس سیستم: " + outcome.Url + "     نام کاربری: admin");
             if (new Uri(outcome.Url).Port != 443) AddText(page, "درگاه 443 روی این کمپیوتر در اختیار برنامه دیگری است یا ممکن است باشد. آن برنامه دست نخورد و سیستم الشفا روی درگاه " + new Uri(outcome.Url).Port + " نصب شد. این درگاه ثابت می‌ماند.");
             AddText(page, outcome.BackupVerified
                 ? "بکاپ رمزگذاری‌شده گرفته شد و بازیابی آزمایشی آن تأیید شد."
                 : "بکاپ و بازیابی تأیید نشد. پیش از استفاده واقعی این مورد باید رفع شود.", outcome.BackupVerified ? Color.DarkGreen : Color.Firebrick);
-            if (outcome.HealthAttention) AddText(page, "بررسی سلامت موردی را گزارش کرد. پیش از شروع کار با مریض، گزارش نصب را به مسئول فنی نشان دهید.", Color.Firebrick);
+            if (outcome.HealthAttention) AddText(page, "بررسی سلامت یک مورد را نیازمند اقدام گزارش کرد. پیش از شروع کار با مریض، گزارش نصب را به مسئول فنی نشان دهید.", Color.Firebrick);
             foreach (var warning in outcome.Warnings) AddText(page, warning, Color.DarkGoldenrod);
             if (backupOnSameDisk) AddText(page, "هشدار: بکاپ فقط روی همین کمپیوتر است (C:\\AlShifaBackups). اگر دیسک خراب یا لپ‌تاپ دزدیده شود، بکاپ هم از دست می‌رود. پیش از کار با مریض واقعی هارد جداگانه وصل کنید.", Color.Firebrick);
             if (outcome.VoicePending) AddText(page, "بستهٔ صوتی کامل تأیید نشد. بقیه سیستم کار می‌کند؛ گزارش نصب را بررسی کنید و بستهٔ کامل همین نسخه را دوباره نصب کنید. برای شروع پخش، در نمایشگر فراخوان صدا را فعال کنید.", Color.DarkGoldenrod);
@@ -674,6 +725,7 @@ namespace AlShifa.Setup
             AddText(page, "اطلاعات قبلی حفظ شد و بکاپ پیش از به‌روزرسانی روی هارد بکاپ است.");
             if (outcome.HealthAttention) AddText(page, "بررسی سلامت موردی را گزارش کرد. گزارش را به مسئول فنی نشان دهید.", Color.Firebrick);
             if (outcome.VoicePending) AddText(page, "فراخوان صوتی: در انتظار فعال‌سازی.", Color.DarkGoldenrod);
+            if (outcome.SyncPending) AddText(page, "همگام‌سازی آنلاین در انتظار تطبیق امن سرور اصلی است. کار محلی ادامه دارد؛ Sync هنوز تأیید نشده است.", Color.DarkGoldenrod);
             AddButton("پایان و باز کردن سیستم", "btnFinish", delegate
             {
                 Cleanup();
@@ -725,6 +777,14 @@ namespace AlShifa.Setup
             if (lines.Contains("##ERROR vc-runtime-missing"))
             {
                 return "این لپ‌تاپ Microsoft Visual C++ Redistributable ندارد و MySQL بدون آن اجرا نمی‌شود. هیچ تغییری انجام نشد.\r\n\r\nفایل vc_redist.x64.exe را از سایت Microsoft بگیرید، کنار Install-AlShifa.exe بگذارید و نصب را دوباره اجرا کنید.";
+            }
+            if (lines.Any(l => l.StartsWith("DAMAGE: ")))
+            {
+                result.AppendLine("دیتابیس فعلی نشانه خرابی دارد، بنابراین ارتقا انجام نشد و هیچ اطلاعاتی تغییر نکرد. نسخه قبلی دوباره روشن شد.");
+                result.AppendLine("ابتدا Rebuild-Database.bat را از کنار همین فایل نصب اجرا کنید (فایل‌های دیتابیس را از معلومات فعلی بازسازی می‌کند و نسخه خراب را حذف نمی‌کند)، سپس نصب را دوباره اجرا کنید.");
+                result.AppendLine();
+                foreach (var line in lines.Where(l => l.StartsWith("DAMAGE: ")).Take(8)) result.AppendLine(line);
+                return result.ToString();
             }
             foreach (var line in lines.Where(l => l.StartsWith("FAIL ")))
             {
@@ -785,6 +845,7 @@ namespace AlShifa.Setup
         public int ExitCode;
         public string Fatal;
         public bool VoicePending;
+        public bool SyncPending;
         public bool HealthAttention;
         public bool BackupVerified;
         public string Url;

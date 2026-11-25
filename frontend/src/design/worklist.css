@@ -1,0 +1,101 @@
+/* Shared look of every work list (clinical desks, pharmacy, optical, cashier, reception): one frame, one switch, one row layout. */
+.dq-page { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; padding: 18px; border: 1px solid var(--xr-border, #e5e7eb); border-radius: 12px; background: var(--xr-surface, #fff); }
+.dq-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.dq-title { margin: 0; font-size: 20px; font-weight: 800; overflow-wrap: anywhere; }
+.dq-head__actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.dq-tabs { justify-self: start; }
+
+/* Search, and for the seen list its day and shift: one row. */
+.dq-filters { display: flex; align-items: center; gap: 10px; }
+.dq-search { position: relative; display: flex; align-items: center; flex: 1 1 auto; margin: 0; }
+.dq-search > i { position: absolute; inset-inline-start: 14px; font-size: 18px; color: #9ca3af; pointer-events: none; }
+.dq-search input { width: 100%; min-width: 0; min-height: 46px; padding-block: 8px; padding-inline: 42px 40px; border: 1px solid var(--xr-field-border); border-radius: var(--xr-radius-control); background: #fff; font-size: 15px; }
+.dq-search input:focus { outline: none; border-color: var(--xr-primary); box-shadow: 0 0 0 3px rgba(8, 155, 171, .15); }
+.dq-search input::-webkit-search-cancel-button { display: none; }
+.dq-search__clear { position: absolute; inset-inline-end: 8px; display: grid; place-items: center; width: 30px; height: 30px; border: 0; border-radius: 50%; background: transparent; color: #6b7280; }
+.dq-search__clear:hover { background: var(--xr-switch-bg); }
+.dq-date { flex: 0 0 200px; }
+.dq-select { flex: 0 0 auto; width: auto; min-width: 190px; min-height: 46px; }
+.dq-date .form-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.dq-date .form-control { min-height: 46px; }
+.dq-filters .xr-tabs .xr-tab { min-height: 38px; }
+
+/* One row layout everywhere: number, who, state in words, actions. */
+.dq { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.dq__row { display: grid; grid-template-columns: 64px minmax(0, 1fr) minmax(120px, max-content) auto; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--xr-border, #e5e7eb); border-radius: 10px; background: var(--xr-surface, #fff); }
+/* Column titles above a list: same grid as its rows, quiet so the rows stay in front. */
+.dq-cols { display: grid; grid-template-columns: 64px minmax(0, 1fr) minmax(120px, max-content) auto; gap: 12px; margin-bottom: -6px; padding: 0 15px 6px; border-bottom: 1px solid var(--xr-border, #e5e7eb); font-size: 12px; font-weight: 600; color: var(--xr-text-muted, #6b7280); letter-spacing: .01em; }
+.dq-cols > :first-child { text-align: center; }
+.dq-cols > :last-child { text-align: end; }
+.dq__num { display: flex; flex-direction: column; align-items: center; line-height: 1.1; }
+.dq__num strong { font-size: 26px; font-weight: 800; color: var(--xr-text, #1f2937); }
+.dq__shift { margin-top: 3px; padding: 0 7px; border-radius: 999px; background: var(--xr-switch-bg); color: var(--xr-switch-text); white-space: nowrap; font-size: 11px; font-weight: 700; }
+/* A morning patient still waiting in the afternoon: numbers restart at 1, so this one must stand out. */
+.dq__shift--left { background: var(--xr-tone-orange-bg); color: var(--xr-tone-orange-text); }
+/* Long names and details wrap inside the row instead of pushing the state and buttons out of it. */
+.dq__who { min-width: 0; }
+.dq__name { font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }
+.dq__detail { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 13px; color: var(--xr-text-muted, #6b7280); }
+/* A code in the number column (bill, invoice) instead of a queue number. */
+.dq__num .dq__code { font-size: 14px; font-weight: 700; }
+/* The patient a search settled on, on one line above their records. */
+.dq-chosen { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 10px 14px; border-radius: 10px; background: var(--xr-switch-bg, #f1f5f9); font-size: 14px; }
+.dq-chosen strong { font-size: 16px; }
+.dq__warn { color: var(--xr-tone-orange-text); font-weight: 600; }
+.dq__state { min-width: 0; font-size: 13px; color: var(--xr-text-muted, #6b7280); }
+/* A status badge in a list may be long ("منتظر رفرکشن یا عکس‌برداری"): it wraps inside its column, never past the row's edge. */
+.dq__state .xr-badge, .dq__detail .xr-badge { max-width: 100%; white-space: normal; overflow-wrap: anywhere; line-height: 1.45; text-align: center; border-radius: 12px; }
+.dq__actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.dq__actions .btn, .dq__actions .form-select { min-height: 40px; white-space: nowrap; }
+.dq__actions .form-select { width: auto; }
+.dq__absent { color: var(--xr-tone-red-text); text-decoration: none; padding-inline: 6px; }
+
+/* In the room or called: green edge. Next: blue edge. Not here: faded. Left open: orange edge. */
+.dq__row--with, .dq__row--called { border-inline-start: 5px solid var(--xr-status-green); background: #f3fbf6; }
+.dq__row--with .dq__state, .dq__row--called .dq__state { color: var(--xr-tone-green-text); font-weight: 700; }
+.dq__row--next { border-inline-start: 5px solid var(--xr-primary, #087f8c); }
+.dq__row--next .dq__state { color: var(--xr-primary, #087f8c); font-weight: 700; }
+.dq__row--away, .dq__row--absent, .dq__row--blocked { opacity: .6; }
+.dq__row--absent .dq__state { color: var(--xr-tone-red-text); }
+.dq__row--blocked .dq__state { color: var(--xr-tone-orange-text); font-weight: 700; }
+.dq__row--open { border-inline-start: 5px solid var(--xr-status-orange); }
+.dq__row--open .dq__state { color: var(--xr-tone-orange-text); font-weight: 700; }
+.dq__row--ready { border-inline-start: 5px solid var(--xr-status-green); }
+.dq__ready { display: inline-flex; align-items: center; gap: 4px; color: var(--xr-tone-green-text); font-weight: 700; white-space: nowrap; }
+
+.dq-more { padding: 12px 16px; border: 1px solid var(--xr-border, #e5e7eb); border-radius: 10px; background: var(--xr-surface, #fff); }
+.dq-more summary { cursor: pointer; font-weight: 600; }
+.dq-more ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; font-size: 14px; }
+.dq-more li { display: flex; flex-wrap: wrap; gap: 12px; }
+
+/* Phones and tablets: the list switch becomes an even grid, so its parts never wrap into a ragged second line. */
+@media (max-width: 991.98px) {
+  .dq-tabs { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); justify-self: stretch; }
+  .dq-tabs .xr-tab { justify-content: center; padding-inline: 8px; }
+}
+
+/* Tablets and narrow laptops: the state moves under the name, so the actions keep their room. */
+@media (max-width: 1199.98px) {
+  .dq__row { grid-template-columns: 64px minmax(0, 1fr) auto; }
+  .dq-cols { grid-template-columns: 64px minmax(0, 1fr) auto; }
+  .dq-cols > :nth-child(3) { display: none; }
+  .dq__state { grid-column: 2; grid-row: 2; }
+  .dq__num { grid-row: span 2; }
+  .dq__actions { grid-column: 3; grid-row: 1 / span 2; }
+}
+
+@media (max-width: 767.98px) {
+  .dq-page { padding: 14px; }
+  .dq-select { flex: 1 1 100%; min-width: 0; }
+  .dq-filters { flex-wrap: wrap; }
+  .dq-search { flex-basis: 100%; }
+  .dq-date { flex: 1 1 150px; }
+  .dq__row { grid-template-columns: 52px minmax(0, 1fr); padding: 12px; }
+  .dq-cols { display: none; }
+  .dq__num { grid-row: auto; }
+  .dq__state { grid-column: 2; grid-row: auto; }
+  .dq__actions { grid-column: 1 / -1; grid-row: auto; justify-content: stretch; }
+  .dq__actions .btn { white-space: normal; }
+  .dq__actions .btn { flex: 1 1 auto; min-height: 44px; }
+}

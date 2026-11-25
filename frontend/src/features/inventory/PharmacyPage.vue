@@ -4,18 +4,18 @@ import { useRouter } from 'vue-router'
 import { api, errorMessage } from '@/api/http'
 import { usePagedList } from '@/api/paged'
 import { useLiveRefresh } from '@/api/realtime'
-import UiCard from '@/components/UiCard.vue'
 import UiModal from '@/components/UiModal.vue'
 import UiPager from '@/components/UiPager.vue'
 import UiListSkeleton from '@/components/UiListSkeleton.vue'
-import CallControls from '@/features/calls/CallControls.vue'
+import QueueCallActions from '@/features/clinical/queue/QueueCallActions.vue'
+import { callStateOf } from '@/features/clinical/queue/queueState'
 import CallNotice from '@/features/calls/CallNotice.vue'
 import { useCallDesk } from '@/features/calls/useCallDesk'
 import { rxStageLabels } from '@/features/clinical/types'
 import { useAuthStore } from '@/stores/auth'
 import { formatDate, formatDateTime } from '@/utils/date'
-import { money } from '@/utils/money'
-import { stageTone, type PharmacyPatient, type PharmacyPatientHit, type PharmacyQueueBill, type PharmacyQueues, type PharmacyRxRow } from './pharmacy'
+import { money, quantity } from '@/utils/money'
+import { type PharmacyPatient, type PharmacyPatientHit, type PharmacyQueueBill, type PharmacyQueues, type PharmacyRxRow } from './pharmacy'
 
 interface SaleRow {
   id: number
@@ -109,7 +109,8 @@ watch(q, () => {
 })
 
 // Work lists.
-type TabKey = 'new' | 'awaitingPayment' | 'readyToDeliver' | 'partial' | 'needsDoctor' | 'sales'
+// Four lists: new prescriptions, money and handing over, prescriptions that wait on something, and history.
+type TabKey = 'new' | 'bills' | 'followUp' | 'sales'
 const tab = ref<TabKey>('new')
 const queues = ref<PharmacyQueues | null>(null)
 // The sales history is read a page at a time, so older sales stay reachable for a return or a reprint.
@@ -119,15 +120,18 @@ const loading = ref(true)
 
 const tabs = computed(() => [
   { key: 'new' as const, label: 'نسخه‌های جدید', count: queues.value?.new.length },
-  { key: 'awaitingPayment' as const, label: 'منتظر پرداخت', count: queues.value?.awaitingPayment.length },
-  { key: 'readyToDeliver' as const, label: 'آماده تحویل', count: queues.value?.readyToDeliver.length },
-  { key: 'partial' as const, label: 'خرید قسمتی', count: queues.value?.partial.length },
-  { key: 'needsDoctor' as const, label: 'نیازمند تأیید داکتر', count: queues.value?.needsDoctor.length },
+  { key: 'bills' as const, label: 'پرداخت و تحویل', count: (queues.value?.readyToDeliver.length ?? 0) + (queues.value?.awaitingPayment.length ?? 0) },
+  { key: 'followUp' as const, label: 'نسخه‌های در انتظار', count: (queues.value?.partial.length ?? 0) + (queues.value?.needsDoctor.length ?? 0) },
   { key: 'sales' as const, label: 'سوابق فروش', count: undefined },
 ])
 
-const rxRows = computed(() => (tab.value === 'new' || tab.value === 'partial' || tab.value === 'needsDoctor' ? queues.value?.[tab.value] ?? [] : []))
-const billRows = computed(() => (tab.value === 'awaitingPayment' || tab.value === 'readyToDeliver' ? queues.value?.[tab.value] ?? [] : []))
+const rxRows = computed(() => (tab.value === 'new' ? queues.value?.new ?? [] : tab.value === 'followUp' ? [...(queues.value?.needsDoctor ?? []), ...(queues.value?.partial ?? [])] : []))
+/** Ready to hand over first: the patient has paid and is standing at the counter. */
+const billRows = computed(() => (tab.value === 'bills'
+  ? [...(queues.value?.readyToDeliver ?? []).map((b) => ({ ...b, ready: true })), ...(queues.value?.awaitingPayment ?? []).map((b) => ({ ...b, ready: false }))]
+  : []))
+/** Called patient first, then the next one, then the rest; prescriptions keep the server's order otherwise. */
+const rxKind = (rx: PharmacyRxRow) => (tab.value === 'new' ? callStateOf(calls, rx.visitId) ?? 'waiting' : 'waiting')
 
 async function load() {
   error.value = ''
@@ -183,149 +187,151 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="d-grid gap-4">
+  <div class="d-grid gap-3">
     <div v-if="error" class="alert alert-danger mb-0" role="alert">{{ error }}</div>
     <div v-if="notice" class="alert alert-success mb-0" role="status">{{ notice }}</div>
-    <div v-if="calls.error.value || !calls.stationOnline.value"><CallNotice :desks="[calls]" /></div>
 
-    <UiCard title="جستجوی مریض و نسخه">
-      <template #actions>
-        <RouterLink v-if="auth.can('pharmacy.create')" :to="{ name: 'pharmacy-sale' }" class="btn btn-soft text-nowrap">فروش مستقل</RouterLink>
-      </template>
-      <input v-model="q" type="search" class="form-control form-control-lg" placeholder="نام، نام پدر، شماره تماس، شماره پرونده، نسخه یا مراجعه" aria-label="جستجوی مریض و نسخه" autofocus @keydown.enter.prevent="searchEnter" />
-
-      <p v-if="searching" class="xr-state" role="status">در حال جستجو...</p>
-      <p v-else-if="hits && hits.length === 0" class="xr-state">مریضی پیدا نشد.</p>
-      <div v-else-if="hits && !chosen" class="xr-table-wrap mt-3">
-        <table class="xr-table">
-          <thead><tr><th>مریض</th><th>نام پدر</th><th>شماره پرونده</th><th>شماره تماس</th><th>سن</th><th>نسخه‌ها</th><th>آخرین نسخه</th><th></th></tr></thead>
-          <tbody>
-            <tr v-for="p in hits" :key="p.id" class="row-link" @click="choose(p.id)">
-              <td><span class="xr-person__name">{{ p.name }}</span></td>
-              <td>{{ p.fatherName ?? '—' }}</td>
-              <td><span class="ltr-num">{{ p.fileNumber }}</span></td>
-              <td><span class="ltr-num">{{ p.phone ?? '—' }}</span></td>
-              <td>{{ p.age ?? '—' }}</td>
-              <td>{{ p.prescriptionCount }}</td>
-              <td>{{ p.lastPrescriptionAt ? formatDate(p.lastPrescriptionAt) : '—' }}</td>
-              <td><button type="button" class="btn btn-soft btn-sm" @click.stop="choose(p.id)">انتخاب</button></td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <section v-if="chosen" class="mt-3">
-        <dl class="xr-facts">
-          <div><dt>مریض</dt><dd>{{ chosen.patient.name }}</dd></div>
-          <div><dt>نام پدر</dt><dd>{{ chosen.patient.fatherName ?? '—' }}</dd></div>
-          <div><dt>شماره پرونده</dt><dd><span class="ltr-num">{{ chosen.patient.fileNumber }}</span></dd></div>
-          <div><dt>شماره تماس</dt><dd><span class="ltr-num">{{ chosen.patient.phone ?? '—' }}</span></dd></div>
-          <div><dt>سن</dt><dd>{{ chosen.patient.age ?? '—' }}</dd></div>
-        </dl>
-        <button v-if="hits && hits.length > 1" type="button" class="btn btn-soft btn-sm mb-2" @click="chosen = null">بازگشت به نتایج</button>
-        <p v-if="chosen.prescriptions.length === 0" class="xr-state">برای این مریض نسخه‌ای ثبت نشده است.</p>
-        <div v-else class="xr-table-wrap">
-          <table class="xr-table">
-            <thead><tr><th>نسخه</th><th>تاریخ</th><th>داکتر</th><th>وضعیت</th><th></th></tr></thead>
-            <tbody>
-              <tr v-for="rx in chosen.prescriptions" :key="rx.id" class="row-link" @click="openRx(rx.id)">
-                <td><span class="ltr-num">{{ rx.rxNumber }}</span></td>
-                <td>{{ formatDateTime(rx.createdAt) }}</td>
-                <td>{{ rx.doctorName ?? '—' }}</td>
-                <td><span class="xr-badge" :class="`xr-badge--${stageTone[rx.stage] ?? 'primary'}`">{{ rxStageLabels[rx.stage] ?? rx.stage }}</span></td>
-                <td><RouterLink :to="{ name: 'pharmacy-rx', params: { id: rx.id } }" class="btn btn-soft btn-sm">باز کردن</RouterLink></td>
-              </tr>
-            </tbody>
-          </table>
+    <section class="dq-page">
+      <div class="dq-head">
+        <h1 class="dq-title">دواخانه</h1>
+        <div class="dq-head__actions">
+          <RouterLink v-if="auth.can('pharmacy.create')" :to="{ name: 'pharmacy-sale' }" class="btn btn-soft"><i class="ri-add-line" aria-hidden="true"></i> فروش مستقل</RouterLink>
         </div>
-      </section>
-    </UiCard>
-
-    <section class="xr-card">
-      <div class="xr-card__header">
-        <nav class="xr-tabs" role="tablist" aria-label="کارهای دواخانه">
-          <button v-for="t in tabs" :key="t.key" type="button" role="tab" class="xr-tab" :class="{ 'xr-tab--active': tab === t.key }" :aria-selected="tab === t.key" @click="tab = t.key">
-            {{ t.label }}<span v-if="t.count" class="ms-1">({{ t.count }})</span>
-          </button>
-        </nav>
       </div>
-      <div class="xr-card__body">
+
+      <!-- One field finds any patient or prescription, old or new; while it has text, its results replace the lists. -->
+      <div class="dq-filters">
+        <label class="dq-search">
+          <i class="ri-search-line" aria-hidden="true"></i>
+          <input v-model="q" type="search" placeholder="جستجو: نام، نام پدر، شماره تماس، پرونده، نسخه یا مراجعه" aria-label="جستجوی مریض و نسخه" autofocus @keydown.enter.prevent="searchEnter" />
+          <button v-if="q" type="button" class="dq-search__clear" aria-label="پاک کردن جستجو" @click="q = ''"><i class="ri-close-line" aria-hidden="true"></i></button>
+        </label>
+      </div>
+
+      <template v-if="q.trim()">
+        <div v-if="searching" class="xr-state" role="status">در حال جستجو...</div>
+        <div v-else-if="hits && hits.length === 0" class="xr-state">مریضی پیدا نشد.</div>
+        <ol v-else-if="hits && !chosen" class="dq" aria-label="نتیجه جستجو">
+          <li v-for="p in hits" :key="p.id" class="dq__row">
+            <div class="dq__num"><strong>{{ quantity(p.prescriptionCount) }}</strong><small class="dq__shift">نسخه</small></div>
+            <div class="dq__who">
+              <div class="dq__name">{{ p.name }}</div>
+              <div class="dq__detail">
+                <span v-if="p.fatherName">ولد {{ p.fatherName }}</span>
+                <span class="ltr-num">{{ p.fileNumber }}</span>
+                <span v-if="p.phone" class="ltr-num">{{ p.phone }}</span>
+                <span v-if="p.age">{{ p.age }} ساله</span>
+              </div>
+            </div>
+            <div class="dq__state">{{ p.lastPrescriptionAt ? formatDate(p.lastPrescriptionAt) : '—' }}</div>
+            <div class="dq__actions"><button type="button" class="btn btn-soft" @click="choose(p.id)">انتخاب</button></div>
+          </li>
+        </ol>
+        <template v-if="chosen">
+          <div class="dq-chosen">
+            <strong>{{ chosen.patient.name }}</strong>
+            <span v-if="chosen.patient.fatherName">ولد {{ chosen.patient.fatherName }}</span>
+            <span class="ltr-num">{{ chosen.patient.fileNumber }}</span>
+            <span v-if="chosen.patient.phone" class="ltr-num">{{ chosen.patient.phone }}</span>
+            <button v-if="hits && hits.length > 1" type="button" class="btn btn-quiet btn-sm" @click="chosen = null">بازگشت به نتایج</button>
+          </div>
+          <div v-if="chosen.prescriptions.length === 0" class="xr-state">برای این مریض نسخه‌ای ثبت نشده است.</div>
+          <ol v-else class="dq" aria-label="نسخه‌های مریض">
+            <li v-for="rx in chosen.prescriptions" :key="rx.id" class="dq__row">
+              <div class="dq__num"><strong>{{ rx.queueNumber ? quantity(rx.queueNumber) : '—' }}</strong></div>
+              <div class="dq__who">
+                <div class="dq__name ltr-num">{{ rx.rxNumber }}</div>
+                <div class="dq__detail"><span>{{ formatDateTime(rx.createdAt) }}</span><span v-if="rx.doctorName">{{ rx.doctorName }}</span></div>
+              </div>
+              <div class="dq__state">{{ rxStageLabels[rx.stage] ?? rx.stage }}</div>
+              <div class="dq__actions"><RouterLink :to="{ name: 'pharmacy-rx', params: { id: rx.id } }" class="btn btn-soft">باز کردن</RouterLink></div>
+            </li>
+          </ol>
+        </template>
+      </template>
+
+      <template v-else>
+        <div class="xr-tabs dq-tabs" role="tablist" aria-label="کارهای دواخانه">
+          <button v-for="t in tabs" :key="t.key" type="button" role="tab" class="xr-tab" :class="{ 'xr-tab--active': tab === t.key }" :aria-selected="tab === t.key" @click="tab = t.key">
+            {{ t.label }}<span v-if="t.count" class="xr-tab__count">{{ quantity(t.count) }}</span>
+          </button>
+        </div>
+
+        <CallNotice v-if="tab === 'new'" :desks="[calls]" :numbers="false" />
         <UiListSkeleton v-if="loading" />
 
-        <template v-else-if="tab === 'new' || tab === 'partial' || tab === 'needsDoctor'">
-          <p v-if="rxRows.length === 0" class="xr-state">{{ tab === 'new' ? 'نسخه تازه‌ای در هفت روز گذشته نیست. نسخه‌های قدیمی را جستجو کنید.' : 'موردی نیست.' }}</p>
-          <div v-else class="xr-table-wrap">
-            <table class="xr-table">
-              <thead><tr><th>نسخه</th><th>مریض</th><th>نام پدر</th><th>داکتر</th><th>تاریخ</th><th>وضعیت</th><th v-if="tab === 'new'">فراخوان</th><th></th></tr></thead>
-              <tbody>
-                <tr v-for="rx in rxRows" :key="rx.id" class="row-link" @click="openRx(rx.id)">
-                  <td><span class="ltr-num">{{ rx.rxNumber }}</span></td>
-                  <td><span class="xr-person__name">{{ rx.patientName }}</span> <span class="ltr-num small">{{ rx.fileNumber }}</span></td>
-                  <td>{{ rx.fatherName ?? '—' }}</td>
-                  <td>{{ rx.doctorName ?? '—' }}</td>
-                  <td>{{ formatDateTime(rx.createdAt) }}</td>
-                  <td><span class="xr-badge" :class="`xr-badge--${stageTone[rx.stage] ?? 'primary'}`">{{ rxStageLabels[rx.stage] ?? rx.stage }}</span></td>
-                  <td v-if="tab === 'new'" @click.stop><CallControls :desk="calls" :visit-id="rx.visitId" /></td>
-                  <td><RouterLink :to="{ name: 'pharmacy-rx', params: { id: rx.id } }" class="btn btn-soft btn-sm">باز کردن</RouterLink></td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+        <template v-else-if="tab === 'new' || tab === 'followUp'">
+          <div v-if="rxRows.length === 0" class="xr-state">{{ tab === 'new' ? 'نسخه تازه‌ای در هفت روز گذشته نیست. نسخه‌های قدیمی را جستجو کنید.' : 'نسخه‌ای در انتظار نیست.' }}</div>
+          <ol v-else class="dq" aria-label="نسخه‌ها">
+            <li v-for="rx in rxRows" :key="rx.id" class="dq__row" :class="`dq__row--${rxKind(rx)}`">
+              <div class="dq__num"><strong>{{ rx.queueNumber ? quantity(rx.queueNumber) : '—' }}</strong></div>
+              <div class="dq__who">
+                <div class="dq__name">{{ rx.patientName }}</div>
+                <div class="dq__detail">
+                  <span v-if="rx.fatherName">ولد {{ rx.fatherName }}</span>
+                  <span class="ltr-num">{{ rx.fileNumber }}</span>
+                  <span v-if="rx.doctorName">{{ rx.doctorName }}</span>
+                  <span>{{ formatDateTime(rx.createdAt) }}</span>
+                </div>
+              </div>
+              <div class="dq__state">{{ rxStageLabels[rx.stage] ?? rx.stage }}</div>
+              <div class="dq__actions">
+                <RouterLink :to="{ name: 'pharmacy-rx', params: { id: rx.id } }" class="btn" :class="rxKind(rx) === 'called' ? 'btn-primary' : 'btn-soft'">باز کردن نسخه</RouterLink>
+                <QueueCallActions v-if="tab === 'new'" :desk="calls" :visit-id="rx.visitId" />
+              </div>
+            </li>
+          </ol>
         </template>
 
-        <template v-else-if="tab === 'awaitingPayment' || tab === 'readyToDeliver'">
-          <p v-if="billRows.length === 0" class="xr-state">{{ tab === 'awaitingPayment' ? 'بلی منتظر پرداخت نیست.' : 'بل پرداخت‌شده‌ای منتظر تحویل نیست.' }}</p>
-          <div v-else class="xr-table-wrap">
-            <table class="xr-table">
-              <thead><tr><th>بل</th><th>مریض</th><th>نسخه</th><th>فاکتور</th><th>مبلغ</th><th>مانده</th><th>زمان</th><th></th></tr></thead>
-              <tbody>
-                <tr v-for="b in billRows" :key="b.saleId">
-                  <td><span class="ltr-num">{{ b.saleNumber }}</span></td>
-                  <td>{{ b.patientName ?? 'فروش مستقل' }} <span v-if="b.fileNumber" class="ltr-num small">{{ b.fileNumber }}</span></td>
-                  <td><span class="ltr-num">{{ b.rxNumber ?? '—' }}</span></td>
-                  <td><span class="ltr-num">{{ b.invoiceNumber }}</span></td>
-                  <td>{{ money(b.total) }}</td>
-                  <td>{{ money(b.balance) }}</td>
-                  <td>
-                    {{ formatDateTime(b.createdAt) }}
-                    <span v-if="b.reservationExpired && tab === 'awaitingPayment'" class="xr-badge xr-badge--orange ms-1" title="موجودی دیگر برای این بل نگه داشته نمی‌شود">رزرو منقضی</span>
-                  </td>
-                  <td class="text-nowrap">
-                    <button v-if="tab === 'readyToDeliver' && auth.can('pharmacy.create')" type="button" class="btn btn-primary btn-sm" :disabled="delivering === b.saleId" @click="deliver(b)">تحویل دوا</button>
-                    <RouterLink v-if="b.prescriptionId" :to="{ name: 'pharmacy-rx', params: { id: b.prescriptionId } }" class="btn btn-soft btn-sm ms-2">نسخه</RouterLink>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+        <template v-else-if="tab === 'bills'">
+          <div v-if="billRows.length === 0" class="xr-state">بلی منتظر پرداخت یا تحویل نیست.</div>
+          <ol v-else class="dq" aria-label="بل‌های دواخانه">
+            <li v-for="b in billRows" :key="b.saleId" class="dq__row" :class="b.ready ? 'dq__row--next' : 'dq__row--blocked'">
+              <div class="dq__num"><strong>{{ b.queueNumber ? quantity(b.queueNumber) : '—' }}</strong></div>
+              <div class="dq__who">
+                <div class="dq__name">{{ b.patientName ?? 'فروش مستقل' }}</div>
+                <div class="dq__detail">
+                  <span>بل <span class="ltr-num">{{ b.saleNumber }}</span></span>
+                  <span>{{ money(b.total) }}</span>
+                  <span v-if="b.balance > 0" class="dq__warn">مانده {{ money(b.balance) }}</span>
+                  <span>{{ formatDateTime(b.createdAt) }}</span>
+                  <span v-if="b.reservationExpired && !b.ready" class="dq__warn" title="موجودی دیگر برای این بل نگه داشته نمی‌شود">رزرو منقضی</span>
+                </div>
+              </div>
+              <div class="dq__state">{{ b.ready ? 'آماده تحویل' : 'منتظر پرداخت' }}</div>
+              <div class="dq__actions">
+                <button v-if="b.ready && auth.can('pharmacy.create')" type="button" class="btn btn-primary" :disabled="delivering === b.saleId" @click="deliver(b)">تحویل دوا</button>
+                <RouterLink v-if="b.prescriptionId" :to="{ name: 'pharmacy-rx', params: { id: b.prescriptionId } }" class="btn btn-soft">نسخه</RouterLink>
+              </div>
+            </li>
+          </ol>
         </template>
 
         <template v-else>
-          <p v-if="sales.length === 0" class="xr-state">فروشی ثبت نشده است.</p>
-          <div v-else class="xr-table-wrap">
-            <table class="xr-table">
-              <thead><tr><th>شماره</th><th>مریض</th><th>فاکتور</th><th>مبلغ</th><th>مانده</th><th>وضعیت</th><th>زمان</th><th v-if="auth.can('pharmacy.cancel')">عملیات</th></tr></thead>
-              <tbody>
-                <tr v-for="row in sales" :key="row.id">
-                  <td><span class="ltr-num">{{ row.saleNumber }}</span></td>
-                  <td>{{ row.patientName ?? 'فروش مستقل' }}</td>
-                  <td><span class="ltr-num">{{ row.invoiceNumber }}</span></td>
-                  <td>{{ row.isReturned ? 'لغو / برگشت شده' : money(row.total) }}</td>
-                  <td>{{ money(row.balance) }}</td>
-                  <td>{{ row.isReturned ? 'لغو شده' : row.deliveredAt ? 'تحویل شده' : row.balance > 0 ? 'منتظر پرداخت' : 'آماده تحویل' }}</td>
-                  <td>{{ formatDateTime(row.createdAt) }}</td>
-                  <td v-if="auth.can('pharmacy.cancel')" class="text-nowrap">
-                    <button v-if="!row.isReturned" type="button" class="btn btn-soft-danger btn-sm" @click="Object.assign(returning, { row, reason: '', error: '' })">{{ row.deliveredAt ? 'برگشت' : 'لغو بل' }}</button>
-                    <RouterLink v-if="!row.isReturned && !row.deliveredAt && auth.can('pharmacy.create')" :to="{ name: 'pharmacy-sale', query: { correct: row.id } }" class="btn btn-soft btn-sm ms-2">اصلاح</RouterLink>
-                    <RouterLink v-if="auth.can('pharmacy.print')" :to="`/print/sale/${row.id}`" target="_blank" class="btn btn-soft btn-sm ms-2">فاکتور</RouterLink>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+          <div v-if="sales.length === 0" class="xr-state">فروشی ثبت نشده است.</div>
+          <ol v-else class="dq" aria-label="سوابق فروش">
+            <li v-for="row in sales" :key="row.id" class="dq__row" :class="{ 'dq__row--away': row.isReturned }">
+              <div class="dq__num"><strong class="ltr-num dq__code">{{ row.saleNumber }}</strong></div>
+              <div class="dq__who">
+                <div class="dq__name">{{ row.patientName ?? 'فروش مستقل' }}</div>
+                <div class="dq__detail">
+                  <span>{{ row.isReturned ? 'لغو / برگشت شده' : money(row.total) }}</span>
+                  <span v-if="row.balance > 0" class="dq__warn">مانده {{ money(row.balance) }}</span>
+                  <span>فاکتور <span class="ltr-num">{{ row.invoiceNumber }}</span></span>
+                  <span>{{ formatDateTime(row.createdAt) }}</span>
+                </div>
+              </div>
+              <div class="dq__state">{{ row.isReturned ? 'لغو شده' : row.deliveredAt ? 'تحویل شده' : row.balance > 0 ? 'منتظر پرداخت' : 'آماده تحویل' }}</div>
+              <div class="dq__actions">
+                <RouterLink v-if="auth.can('pharmacy.print')" :to="`/print/sale/${row.id}`" target="_blank" class="btn btn-soft">فاکتور</RouterLink>
+                <RouterLink v-if="!row.isReturned && !row.deliveredAt && auth.can('pharmacy.create')" :to="{ name: 'pharmacy-sale', query: { correct: row.id } }" class="btn btn-soft">اصلاح</RouterLink>
+                <button v-if="!row.isReturned && auth.can('pharmacy.cancel')" type="button" class="btn btn-quiet dq__absent" @click="Object.assign(returning, { row, reason: '', error: '' })">{{ row.deliveredAt ? 'برگشت' : 'لغو بل' }}</button>
+              </div>
+            </li>
+          </ol>
           <UiPager :page="saleList.page.value" :page-count="saleList.pageCount.value" @go="saleList.goTo($event).catch((cause) => (error = errorMessage(cause)))" />
         </template>
-      </div>
+      </template>
     </section>
   </div>
 
@@ -342,14 +348,3 @@ onBeforeUnmount(() => {
     </form>
   </UiModal>
 </template>
-
-<style scoped>
-/* A whole row opens what it shows; the buttons in it keep their own job. */
-.row-link {
-  cursor: pointer;
-}
-
-.row-link:hover td {
-  background: color-mix(in srgb, var(--xr-primary) 6%, transparent);
-}
-</style>

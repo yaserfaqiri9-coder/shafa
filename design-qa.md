@@ -34,3 +34,9 @@ The original small sizes, compact gaps and blue selection were revised to the ow
 - `git diff --check` passed.
 
 Exact source-photo font identity and camera pixels are not recoverable; this pass is for the owner's revised shared-sidebar design, not an identical reproduction of the navy English photograph.
+
+## Refraction prescription — 2026-11-22
+
+final result: passed
+
+The supplied prescription was implemented with real fields and nine independent checkboxes, sharing its renderer with saved-record printing and the doctor's result view. Final side-by-side reference comparison, row alignment and the A5 landscape PDF were verified with synthetic data. See [refraction visual QA](docs/refraction-design-qa.md) and [implementation and verification](docs/refraction-prescription.md). Earlier sections of this report remain unchanged.

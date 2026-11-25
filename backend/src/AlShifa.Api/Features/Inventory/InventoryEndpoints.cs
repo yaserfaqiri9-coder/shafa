@@ -41,6 +41,8 @@ public sealed record CreatePurchaseRequest([MaxLength(150)] string? SupplierName
 public sealed record OpeningStockRequest([Required, MaxLength(30)] string LocationCode, [Required, MinLength(1)] PurchaseLineInput[] Items, [MaxLength(200)] string? Note = null);
 
 public sealed record AdjustStockRequest(long BatchId, decimal Quantity, MovementKind Kind, [Required, MinLength(3), MaxLength(300)] string Reason);
+public sealed record SetStockQuantityRequest(long BatchId, [Range(0, 100000000)] decimal NewQuantity, [Required, MinLength(3), MaxLength(300)] string Reason);
+public sealed record SetBatchExpiryRequest(DateOnly? ExpiryDate, [Required, MinLength(3), MaxLength(300)] string Reason);
 
 public sealed record TransferStockRequest(long BatchId, [Required, MaxLength(30)] string ToLocationCode, [Range(0.001, 100000000)] decimal Quantity);
 
@@ -67,13 +69,13 @@ public sealed record CorrectPurchaseRequest(int? SupplierId, [Required, MaxLengt
 /// <param name="UnitPrice">What this sale charged per unit, which for an optical order may differ from the product's price.</param>
 public sealed record SaleLineRow(int ProductId, string ProductName, string Kind, string Unit, decimal SalePrice, decimal OnHand, bool IsActive, decimal Quantity, long? PrescriptionItemId, decimal UnitPrice = 0);
 
-public sealed record CustomLineRow(string Description, decimal Amount);
+public sealed record CustomLineRow(string Description, decimal Amount, bool IsNonStockLens = false);
 
 public sealed record SaleDetail(long Id, string SaleNumber, long? PatientId, string? PatientName, long? PrescriptionId, bool IsReturned, int Version, IReadOnlyList<SaleLineRow> Items, IReadOnlyList<CustomLineRow> CustomLines);
 
 public sealed record CorrectSaleRequest([Required, MinLength(1)] SaleLineInput[] Items, [Required, MinLength(3), MaxLength(300)] string Reason, int Version);
 
-public sealed record OpticalOrderDetail(long Id, string OrderNumber, string? Description, long? OpticalPrescriptionId, string Status, int Version, SaleDetail Sale);
+public sealed record OpticalOrderDetail(long Id, string OrderNumber, string? Description, long? OpticalPrescriptionId, string Status, int Version, SaleDetail Sale, bool IsComplimentary, string? ComplimentaryReason, string? ComplimentaryApprovedBy);
 
 public sealed record CorrectOpticalOrderRequest([MaxLength(500)] string? Description, SaleLineInput[]? Items, CustomLineInput[]? CustomLines, [Required, MinLength(3), MaxLength(300)] string Reason, int Version);
 
@@ -83,11 +85,16 @@ public sealed record ReturnSaleRequest(int Version, [Required, MinLength(3), Max
 
 public sealed record SaleRow(long Id, string SaleNumber, string Kind, long? PatientId, string? PatientName, long? PrescriptionId, long InvoiceId, string InvoiceNumber, decimal Total, decimal Balance, string InvoiceStatus, bool IsReturned, DateTime CreatedAt, int Version, DateTime? DeliveredAt = null);
 
-public sealed record CreateOpticalOrderRequest(long? PatientId, long? OpticalPrescriptionId, [MaxLength(500)] string? Description, SaleLineInput[]? Items, CustomLineInput[]? CustomLines);
+public sealed record CreateOpticalOrderRequest(long? PatientId, long? OpticalPrescriptionId, [MaxLength(500)] string? Description, SaleLineInput[]? Items, CustomLineInput[]? CustomLines,
+    bool IsComplimentary = false, [MaxLength(300)] string? ComplimentaryReason = null, [MaxLength(150)] string? ComplimentaryApprovedBy = null,
+    [MaxLength(150)] string? CustomerName = null, [MaxLength(30)] string? CustomerPhone = null);
 
 public sealed record ChangeOpticalStatusRequest(OpticalOrderStatus Status, int Version, [MaxLength(300)] string? Reason = null);
 
-public sealed record OpticalOrderRow(long Id, string OrderNumber, long? PatientId, string? PatientName, long? OpticalPrescriptionId, string? Description, string Status, long InvoiceId, string InvoiceNumber, decimal Total, decimal Balance, DateTime? DeliveredAt, DateTime CreatedAt, int Version, IReadOnlyList<string> NextStatuses);
+public sealed record OpticalOrderRow(long Id, string OrderNumber, long? PatientId, string? PatientName, long? OpticalPrescriptionId, string? Description, string Status, long InvoiceId, string InvoiceNumber, decimal Total, decimal Balance, DateTime? DeliveredAt, DateTime CreatedAt, int Version, IReadOnlyList<string> NextStatuses,
+    bool IsComplimentary = false, string? ComplimentaryReason = null, string? ComplimentaryApprovedBy = null, string? CustomerPhone = null);
+
+public sealed record ComplimentaryOpticalReportRow(long Id, string OrderNumber, string? PatientName, string Items, string ComplimentaryReason, string ComplimentaryApprovedBy, DateTime DeliveredAt);
 
 public static class InventoryEndpoints
 {
@@ -462,6 +469,68 @@ public static class InventoryEndpoints
                 return (StatusCodes.Status201Created, new { batch.Id, batch.Quantity });
             }, ct)).RequirePermission("inventory.approve");
 
+        // A physical count is always a document: it names the old count, the new count, the approving user and its reason.
+        // The matching append-only movement is the only operation that changes stock.
+        inventory.MapPost("/adjustments/set-quantity", async (SetStockQuantityRequest request, AppDbContext db, Idempotency idempotency, StockService stock, LedgerService ledger, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>
+            await idempotency.RunAsync(request, async () =>
+            {
+                var batch = await db.StockBatches.FromSqlInterpolated($"SELECT * FROM StockBatches WHERE Id = {request.BatchId} FOR UPDATE").SingleOrDefaultAsync(ct) ?? throw AppException.NotFound();
+                var previous = batch.Quantity;
+                var change = request.NewQuantity - previous;
+                if (change == 0)
+                {
+                    throw new AppException(StatusCodes.Status409Conflict, "no_stock_change", "موجودی جدید با موجودی فعلی یکسان است.");
+                }
+
+                // A counted quantity may not silently consume stock reserved by an unpaid pharmacy bill.
+                if (change < 0 && await stock.FreeAsync(batch, ct) + change < 0)
+                {
+                    throw new AppException(StatusCodes.Status409Conflict, "insufficient_stock", "بخشی از این موجودی برای فروش پرداخت‌نشده نگه‌داشته شده است.");
+                }
+
+                var document = new StockAdjustment
+                {
+                    BatchId = batch.Id,
+                    PreviousQuantity = previous,
+                    NewQuantity = request.NewQuantity,
+                    Reason = request.Reason.Trim(),
+                    ApprovedByUserId = user.Id,
+                };
+                db.StockAdjustments.Add(document);
+                await db.SaveChangesAsync(ct);
+
+                batch.Quantity = request.NewQuantity;
+                stock.AddMovement(batch, MovementKind.Adjustment, change, nameof(StockAdjustment), document.Id, document.Reason);
+                var value = decimal.Round(Math.Abs(change) * batch.UnitCost, 2, MidpointRounding.AwayFromZero);
+                ledger.Post("Adjustment", nameof(StockAdjustment), document.Id, document.Reason,
+                    change < 0 ? (Accounts.InventoryAdjustments, value, 0) : (Accounts.Inventory, value, 0),
+                    change < 0 ? (Accounts.Inventory, 0, value) : (Accounts.InventoryAdjustments, 0, value));
+                audit.Add("StockCountAdjusted", nameof(StockAdjustment), document.Id.ToString(), $"{previous:0.###} => {request.NewQuantity:0.###}: {document.Reason}");
+                outbox.Add("InventoryChanged", new { batchId = batch.Id, adjustmentId = document.Id }, Groups.Pharmacy, Groups.Optical, Groups.Inventory);
+                await db.SaveChangesAsync(ct);
+                return (StatusCodes.Status201Created, new { document.Id, document.BatchId, document.PreviousQuantity, document.NewQuantity, document.CreatedAt });
+            }, ct)).RequirePermission("inventory.approve");
+
+        // Expiry belongs to a batch, not the product. Correcting it changes no quantity or value, so it is audited but not posted.
+        inventory.MapPut("/batches/{id:long}/expiry", async (long id, SetBatchExpiryRequest request, AppDbContext db, AuditService audit, Outbox outbox, CancellationToken ct) =>
+        {
+            await using var transaction = await db.Database.BeginTransactionAsync(ct);
+            var batch = await db.StockBatches.FromSqlInterpolated($"SELECT * FROM StockBatches WHERE Id = {id} FOR UPDATE").SingleOrDefaultAsync(ct) ?? throw AppException.NotFound();
+            if (batch.ExpiryDate == request.ExpiryDate)
+            {
+                throw new AppException(StatusCodes.Status409Conflict, "no_expiry_change", "تاریخ انقضای جدید با تاریخ فعلی یکسان است.");
+            }
+
+            var previous = batch.ExpiryDate;
+            batch.ExpiryDate = request.ExpiryDate;
+            audit.Add("BatchExpiryChanged", nameof(StockBatch), batch.Id.ToString(),
+                $"{previous?.ToString("yyyy-MM-dd") ?? "—"} => {request.ExpiryDate?.ToString("yyyy-MM-dd") ?? "—"}: {request.Reason.Trim()}");
+            outbox.Add("InventoryChanged", new { batchId = batch.Id }, Groups.Pharmacy, Groups.Optical, Groups.Inventory);
+            await db.SaveChangesAsync(ct);
+            await transaction.CommitAsync(ct);
+            return Results.Ok(new { batch.Id, batch.ExpiryDate });
+        }).RequirePermission("inventory.approve");
+
         inventory.MapPost("/transfers", async (TransferStockRequest request, AppDbContext db, Idempotency idempotency, StockService stock, AuditService audit, Outbox outbox, CancellationToken ct) =>
             await idempotency.RunAsync(request, async () =>
             {
@@ -537,7 +606,7 @@ public static class InventoryEndpoints
 
         var optical = app.MapGroup("/api/optical").WithTags("Optical");
 
-        optical.MapGet("/orders", async (AppDbContext db, OpticalOrderStatus? status, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
+        optical.MapGet("/orders", async (AppDbContext db, OpticalOrderStatus? status, string? q, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
         {
             pageSize = Math.Clamp(pageSize, 1, 100);
             page = Math.Max(page, 1);
@@ -547,10 +616,51 @@ public static class InventoryEndpoints
                 query = query.Where(o => o.Status == s);
             }
 
+            // A customer back days later is found by name or phone across all orders, not only the page on screen.
+            if (Text.Clean(q) is { } term)
+            {
+                query = query.Where(o => o.OrderNumber.Contains(term) || o.Sale!.Invoice!.InvoiceNumber.Contains(term)
+                    || (o.CustomerName != null && o.CustomerName.Contains(term)) || (o.CustomerPhone != null && o.CustomerPhone.Contains(term))
+                    || (o.Patient != null && (o.Patient.FirstName.Contains(term) || (o.Patient.LastName != null && o.Patient.LastName.Contains(term))
+                        || (o.Patient.FirstName + " " + o.Patient.LastName).Contains(term) || o.Patient.FileNumber.Contains(term))));
+            }
+
             var total = await query.CountAsync(ct);
             var rows = await ProjectOrders(query.OrderByDescending(o => o.Id).Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
             return Results.Ok(new PagedResult<OpticalOrderRow>(rows.Select(ToRow).ToList(), total, page, pageSize));
         }).RequirePermission("optical.view");
+
+        // The cashier sees the physical order number as well as the invoice, then uses the usual locked payment path.
+        optical.MapGet("/orders/unpaid", async (AppDbContext db, CancellationToken ct) =>
+        {
+            var orders = await ProjectOrders(db.OpticalOrders.AsNoTracking()
+                    .Where(o => !o.IsComplimentary && o.Status != OpticalOrderStatus.Cancelled && o.Sale!.Invoice!.Status != InvoiceStatus.Void
+                        && o.Sale.Invoice.Total - o.Sale.Invoice.Discount > o.Sale.Invoice.Paid - o.Sale.Invoice.Refunded)
+                    .OrderByDescending(o => o.Id))
+                .ToListAsync(ct);
+            return Results.Ok(orders.Select(ToRow).ToList());
+        }).RequirePermission("payments.create");
+
+        // A separate report keeps complimentary delivered goods visible without mixing them into receivables or revenue reports.
+        optical.MapGet("/reports/complimentary", async (AppDbContext db, CancellationToken ct) =>
+        {
+            var rows = await ProjectOrders(db.OpticalOrders.AsNoTracking()
+                .Where(o => o.IsComplimentary && o.Status == OpticalOrderStatus.Delivered)
+                .OrderByDescending(o => o.Id)).ToListAsync(ct);
+            var invoiceIds = rows.Select(row => row.InvoiceId).ToArray();
+            var items = await db.InvoiceItems.AsNoTracking()
+                .Where(item => invoiceIds.Contains(item.InvoiceId) && !item.IsVoid)
+                .Select(item => new { item.InvoiceId, item.Description, item.Quantity })
+                .ToListAsync(ct);
+            return Results.Ok(rows.Select(row => new ComplimentaryOpticalReportRow(
+                row.Id,
+                row.OrderNumber,
+                row.PatientName,
+                string.Join("، ", items.Where(item => item.InvoiceId == row.InvoiceId).Select(item => $"{item.Description} × {item.Quantity:0.###}")),
+                row.ComplimentaryReason!,
+                row.ComplimentaryApprovedBy!,
+                row.DeliveredAt!.Value)).ToList());
+        }).RequirePermission("reports.view");
 
         optical.MapPost("/orders", async (CreateOpticalOrderRequest request, AppDbContext db, Idempotency idempotency, SaleService sales, NumberService numbers, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>
             await idempotency.RunAsync(request, async () =>
@@ -564,7 +674,14 @@ public static class InventoryEndpoints
                     }
                 }
 
-                var sale = await sales.CreateAsync(SaleKind.Optical, request.PatientId, null, request.Items ?? [], request.CustomLines ?? [], ct);
+                var complimentaryReason = Text.Clean(request.ComplimentaryReason);
+                var complimentaryApprovedBy = Text.Clean(request.ComplimentaryApprovedBy);
+                if (request.IsComplimentary && (complimentaryReason is null || complimentaryApprovedBy is null))
+                {
+                    throw new AppException(StatusCodes.Status400BadRequest, "complimentary_approval_required", "برای تحویل رایگان، دلیل و شخص تأییدکننده الزامی است.");
+                }
+
+                var sale = await sales.CreateAsync(SaleKind.Optical, request.PatientId, null, request.Items ?? [], request.CustomLines ?? [], ct, request.IsComplimentary);
                 var order = new OpticalOrder
                 {
                     OrderNumber = await numbers.NextNumberAsync("optical-order", ct),
@@ -573,6 +690,11 @@ public static class InventoryEndpoints
                     Description = Text.Clean(request.Description),
                     SaleId = sale.Id,
                     CreatedByUserId = user.Id,
+                    IsComplimentary = request.IsComplimentary,
+                    ComplimentaryReason = request.IsComplimentary ? complimentaryReason : null,
+                    ComplimentaryApprovedBy = request.IsComplimentary ? complimentaryApprovedBy : null,
+                    CustomerName = request.PatientId is null ? Text.Clean(request.CustomerName) : null,
+                    CustomerPhone = request.PatientId is null ? Text.Clean(request.CustomerPhone) : null,
                 };
                 db.OpticalOrders.Add(order);
                 await db.SaveChangesAsync(ct);
@@ -617,7 +739,7 @@ public static class InventoryEndpoints
         optical.MapGet("/orders/{id:long}", async (long id, AppDbContext db, CancellationToken ct) =>
         {
             var order = await db.OpticalOrders.AsNoTracking().SingleOrDefaultAsync(o => o.Id == id, ct) ?? throw AppException.NotFound();
-            return Results.Ok(new OpticalOrderDetail(order.Id, order.OrderNumber, order.Description, order.OpticalPrescriptionId, order.Status.ToString(), order.Version, await LoadSaleAsync(db, order.SaleId, SaleKind.Optical, ct)));
+            return Results.Ok(new OpticalOrderDetail(order.Id, order.OrderNumber, order.Description, order.OpticalPrescriptionId, order.Status.ToString(), order.Version, await LoadSaleAsync(db, order.SaleId, SaleKind.Optical, ct), order.IsComplimentary, order.ComplimentaryReason, order.ComplimentaryApprovedBy));
         }).RequirePermission("optical.view");
 
         // Cancels the mistaken order with its sale and records the right one together.
@@ -638,7 +760,7 @@ public static class InventoryEndpoints
             order.Status = OpticalOrderStatus.Cancelled;
             await db.SaveChangesAsync(ct);
 
-            var sale = await sales.CreateAsync(SaleKind.Optical, order.PatientId, null, request.Items ?? [], request.CustomLines ?? [], ct);
+            var sale = await sales.CreateAsync(SaleKind.Optical, order.PatientId, null, request.Items ?? [], request.CustomLines ?? [], ct, order.IsComplimentary);
             var replacement = new OpticalOrder
             {
                 OrderNumber = await numbers.NextNumberAsync("optical-order", ct),
@@ -647,6 +769,11 @@ public static class InventoryEndpoints
                 Description = Text.Clean(request.Description),
                 SaleId = sale.Id,
                 CreatedByUserId = user.Id,
+                IsComplimentary = order.IsComplimentary,
+                ComplimentaryReason = order.ComplimentaryReason,
+                ComplimentaryApprovedBy = order.ComplimentaryApprovedBy,
+                CustomerName = order.CustomerName,
+                CustomerPhone = order.CustomerPhone,
             };
             db.OpticalOrders.Add(replacement);
             await db.SaveChangesAsync(ct);
@@ -755,8 +882,8 @@ public static class InventoryEndpoints
         var items = parts.GroupBy(p => new { p.ProductId, p.PrescriptionItemId })
             .Select(g => new SaleLineRow(g.Key.ProductId, g.First().Name, g.First().Kind.ToString(), g.First().Unit, g.First().SalePrice, g.First().OnHand, g.First().IsActive, g.Sum(p => p.Quantity), g.Key.PrescriptionItemId, g.First().UnitPrice))
             .ToList();
-        var custom = await db.InvoiceItems.AsNoTracking().Where(i => i.InvoiceId == sale.InvoiceId && !i.IsVoid && i.SourceType == null)
-            .OrderBy(i => i.Id).Select(i => new CustomLineRow(i.Description, i.LineTotal)).ToListAsync(ct);
+        var custom = await db.InvoiceItems.AsNoTracking().Where(i => i.InvoiceId == sale.InvoiceId && !i.IsVoid && (i.SourceType == null || i.SourceType == "OpticalNonStockLens"))
+            .OrderBy(i => i.Id).Select(i => new CustomLineRow(i.Description, i.LineTotal, i.SourceType == "OpticalNonStockLens")).ToListAsync(ct);
         return new SaleDetail(sale.Id, sale.SaleNumber, sale.PatientId, sale.PatientName, sale.PrescriptionId, sale.IsReturned, sale.Version, items, custom);
     }
 
@@ -860,13 +987,14 @@ public static class InventoryEndpoints
         s.Id, s.SaleNumber, s.Kind.ToString(), s.PatientId, s.Patient != null ? (s.Patient.FirstName + " " + (s.Patient.LastName ?? "")).Trim() : null, s.PrescriptionId,
         s.InvoiceId, s.Invoice!.InvoiceNumber, s.Invoice.Total, s.Invoice.Status == InvoiceStatus.Void ? 0 : s.Invoice.Total - s.Invoice.Discount - s.Invoice.Paid, s.Invoice.Status.ToString(), s.IsReturned, s.CreatedAt, s.Version, s.DeliveredAt));
 
-    private sealed record OrderProjection(long Id, string OrderNumber, long? PatientId, string? PatientName, long? OpticalPrescriptionId, string? Description, OpticalOrderStatus Status, long InvoiceId, string InvoiceNumber, decimal Total, decimal Balance, DateTime? DeliveredAt, DateTime CreatedAt, int Version);
+    private sealed record OrderProjection(long Id, string OrderNumber, long? PatientId, string? PatientName, long? OpticalPrescriptionId, string? Description, OpticalOrderStatus Status, long InvoiceId, string InvoiceNumber, decimal Total, decimal Balance, DateTime? DeliveredAt, DateTime CreatedAt, int Version, bool IsComplimentary, string? ComplimentaryReason, string? ComplimentaryApprovedBy, string? CustomerPhone);
 
     private static IQueryable<OrderProjection> ProjectOrders(IQueryable<OpticalOrder> orders) => orders.Select(o => new OrderProjection(
-        o.Id, o.OrderNumber, o.PatientId, o.Patient != null ? (o.Patient.FirstName + " " + (o.Patient.LastName ?? "")).Trim() : null, o.OpticalPrescriptionId, o.Description, o.Status,
-        o.Sale!.InvoiceId, o.Sale.Invoice!.InvoiceNumber, o.Sale.Invoice.Total, o.Sale.Invoice.Total - o.Sale.Invoice.Discount - o.Sale.Invoice.Paid, o.DeliveredAt, o.CreatedAt, o.Version));
+        o.Id, o.OrderNumber, o.PatientId, o.Patient != null ? (o.Patient.FirstName + " " + (o.Patient.LastName ?? "")).Trim() : o.CustomerName, o.OpticalPrescriptionId, o.Description, o.Status,
+        o.Sale!.InvoiceId, o.Sale.Invoice!.InvoiceNumber, o.Sale.Invoice.Total, o.Sale.Invoice.Total - o.Sale.Invoice.Discount - o.Sale.Invoice.Paid, o.DeliveredAt, o.CreatedAt, o.Version,
+        o.IsComplimentary, o.ComplimentaryReason, o.ComplimentaryApprovedBy, o.CustomerPhone));
 
     private static OpticalOrderRow ToRow(OrderProjection o) => new(
         o.Id, o.OrderNumber, o.PatientId, o.PatientName, o.OpticalPrescriptionId, o.Description, o.Status.ToString(), o.InvoiceId, o.InvoiceNumber, o.Total, o.Balance, o.DeliveredAt, o.CreatedAt, o.Version,
-        OpticalFlow[o.Status].Select(s => s.ToString()).ToList());
+        OpticalFlow[o.Status].Select(s => s.ToString()).ToList(), o.IsComplimentary, o.ComplimentaryReason, o.ComplimentaryApprovedBy, o.CustomerPhone);
 }

@@ -93,8 +93,8 @@ test('pharmacy search: a slow answer for an older term never replaces the newer 
   await box.fill(`فارم${tag}`)
 
   // Only the search results: the work lists below also name patients from other tests' prescriptions.
-  const results = page.locator('section', { has: page.getByRole('heading', { name: 'جستجوی مریض و نسخه' }) })
-  const names = results.locator('table.xr-table tbody tr .xr-person__name')
+  const results = page.getByRole('list', { name: 'نتیجه جستجو' })
+  const names = results.locator('.dq__name')
   await expect(names).toHaveCount(2)
   await sleep(2000) // longer than the delayed older answer
   await expect(names).toHaveCount(2)

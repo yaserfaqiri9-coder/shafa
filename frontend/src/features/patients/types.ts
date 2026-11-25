@@ -6,6 +6,7 @@ export interface PatientListItem {
   fatherName: string | null
   gender: string
   ageYears: number | null
+  ageMonths?: number | null
   phone: string | null
 }
 
@@ -22,4 +23,10 @@ export const genderLabels: Record<string, string> = { Male: 'مرد', Female: '�
 
 export function patientName(p: { firstName: string; lastName: string | null }) {
   return [p.firstName, p.lastName].filter(Boolean).join(' ')
+}
+
+export function patientAge(p: { ageYears?: number | null; ageMonths?: number | null }) {
+  return p.ageMonths != null && p.ageMonths < 12
+    ? `${p.ageMonths.toLocaleString('fa-AF')} ماهه`
+    : p.ageYears != null ? `${p.ageYears.toLocaleString('fa-AF')} ساله` : ''
 }

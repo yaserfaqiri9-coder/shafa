@@ -51,6 +51,9 @@ if ($LanIp) {
         # The firewall rule covers every network type, so another router needs nothing. Public only means Windows trusts the network less.
         Check ($category -ne 'Public') 'Network profile' "$category (Private is better for the hospital network)" 'WARN'
         Check ($address.InterfaceAlias -notmatch 'Wi-?Fi|Wireless') 'Connection type' "$($address.InterfaceAlias) (a cable is more reliable for the host)" 'WARN'
+        $configuration = Get-NetIPConfiguration -InterfaceIndex $address.InterfaceIndex -ErrorAction SilentlyContinue
+        $gateway = @($configuration.IPv4DefaultGateway | Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' })
+        Check ($gateway.Count -gt 0) 'LAN gateway' $(if ($gateway) { $gateway[0].NextHop } else { 'No IPv4 gateway detected; other computers may need a manually verified LAN route.' }) 'WARN'
     }
 } else {
     Report 'SKIP' 'LAN address' 'pass -LanIp'

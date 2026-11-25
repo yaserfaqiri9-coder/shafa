@@ -70,7 +70,7 @@ public class NumberSequence
     [MaxLength(40)]
     public string Scope { get; set; } = "";
 
-    [MaxLength(10)]
+    [MaxLength(20)]
     public string Period { get; set; } = "";
 
     public long Value { get; set; }

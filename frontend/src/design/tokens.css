@@ -6,6 +6,16 @@
   --xr-primary: #089bab;
   --xr-primary-end: #0db5c8;
   --xr-primary-light: #ceebee;
+  /* The palette's deep teal: a filled choice (active tab, pressed toggle) whose white text still reads at 4.7 to 1. */
+  --xr-primary-strong: #087f8c;
+  --xr-primary-strong-hover: #0a8c9a;
+  /* List switches (tabs) and toggle groups: one look on every page, tinted toward the teal palette. */
+  --xr-switch-bg: #eef5f6;
+  --xr-switch-border: #dbe8ea;
+  --xr-switch-text: #45545a;
+  --xr-switch-hover: #e1eef0;
+  --xr-switch-on: var(--xr-primary-strong);
+  --xr-switch-on-shadow: 0 2px 6px rgba(8, 127, 140, 0.28);
   --xr-orange: #ffb177;
   --xr-orange-light: #fae9dd;
   --xr-red: #e64141;
@@ -34,7 +44,7 @@
   --xr-gradient-cyan: linear-gradient(to right, #02d1ff 0%, #61e2fc 100%);
   --xr-gradient-grey: linear-gradient(to right, #787d76 0%, #ababab 100%);
   --xr-gradient-light: linear-gradient(to right, #e9eef4 0%, #eef5fd 100%);
-  --xr-gradient-dark: linear-gradient(to right, #374949 0%, #455d5d 100%);
+  --xr-gradient-dark: linear-gradient(to right, #076f7a 0%, #087f8c 100%);
 
   /* Fields as measured on the template's form-layout and form-validation pages. */
   --xr-field-bg: #ffffff;

@@ -7,6 +7,7 @@ namespace AlShifa.Api.Features.Calls;
 public enum CallDesk
 {
     Reception,
+    Cashier,
     Vision,
     Doctor,
     Refraction,
@@ -14,6 +15,7 @@ public enum CallDesk
     Lab,
     Pharmacy,
     Optical,
+    Surgery,
 }
 
 public enum CallStatus
@@ -52,6 +54,10 @@ public class PatientCall
 
     public int QueueNumber { get; set; }
 
+    public QueueShift QueueShift { get; set; } = global::AlShifa.Api.Features.Visits.QueueShift.Morning;
+
+    public int QueueRound { get; set; } = 1;
+
     /// <summary>A section name or room-NN, resolved from settings when the call was made.</summary>
     [MaxLength(30)]
     public string Destination { get; set; } = "";
@@ -87,10 +93,10 @@ public class PatientCall
 public static class VoicePack
 {
     // Content-addressed directory: new recordings cannot reuse the old browser cache.
-    public const string RecordedVersion = "recorded-c98dd13ed170";
-    public const int RecordedMaxNumber = 50;
+    public const string RecordedVersion = "recorded-queue-20261120";
+    public const int RecordedMaxNumber = 100;
     public const string RecordedBase = "/audio/" + RecordedVersion + "/WAV/";
-    public static readonly string[] RecordedDestinations = ["doctor", "refraction", "imaging", "pharmacy", "optical", "initial_exam", "reception", "cashier", "surgery"];
+    public static readonly string[] RecordedDestinations = ["doctor", "refraction", "imaging", "pharmacy", "optical", "initial_exam", "reception", "lab", "cashier", "surgery"];
 
     /// <summary>Use stored machine identifiers, including the original desk for numbered rooms. Never infer a destination from display text.</summary>
     public static string? RecordedDestination(string destination, CallDesk? desk = null)
@@ -99,9 +105,9 @@ public static class VoicePack
         {
             return desk switch
             {
-                CallDesk.Doctor => "doctor", CallDesk.Vision => "initial_exam", CallDesk.Reception => "reception",
+                CallDesk.Doctor => "doctor", CallDesk.Vision => "initial_exam", CallDesk.Reception => "reception", CallDesk.Cashier => "cashier",
                 CallDesk.Refraction => "refraction", CallDesk.Imaging => "imaging", CallDesk.Pharmacy => "pharmacy",
-                CallDesk.Optical => "optical", _ => null,
+                CallDesk.Optical => "optical", CallDesk.Surgery => "surgery", _ => null,
             };
         }
         return destination == "vision" ? "initial_exam" : RecordedDestinations.Contains(destination) ? destination : null;
@@ -109,10 +115,10 @@ public static class VoicePack
 
     public static string[] RecordedClips(int number, string destination, CallDesk? desk = null) =>
         number is >= 1 and <= RecordedMaxNumber && RecordedDestination(destination, desk) is { } key
-            ? [$"{RecordedBase}numbers/number_{number:D3}.wav", $"{RecordedBase}destinations/destination_{key}.wav"] : [];
+            ? [$"{RecordedBase}numbers/number_{number:D3}.mp3", $"{RecordedBase}destinations/destination_{key}.wav"] : [];
 
     public static IEnumerable<string> RecordedFiles() =>
-        Enumerable.Range(1, RecordedMaxNumber).Select(n => $"numbers/number_{n:D3}.wav")
+        Enumerable.Range(1, RecordedMaxNumber).Select(n => $"numbers/number_{n:D3}.mp3")
             .Concat(RecordedDestinations.Select(d => $"destinations/destination_{d}.wav"));
 
     public static string RecordedRoot(IHostEnvironment env)
@@ -130,12 +136,14 @@ public static class VoicePack
     public static readonly IReadOnlyDictionary<CallDesk, (string Clip, string Label)> Sections = new Dictionary<CallDesk, (string, string)>
     {
         [CallDesk.Reception] = ("reception", "بخش پذیرش"),
+        [CallDesk.Cashier] = ("cashier", "بخش صندوق"),
         [CallDesk.Vision] = ("vision", "بخش ویژن"),
         [CallDesk.Refraction] = ("refraction", "بخش رفرکشن"),
         [CallDesk.Imaging] = ("imaging", "بخش عکس‌برداری چشم"),
         [CallDesk.Lab] = ("lab", "بخش آزمایشگاه"),
         [CallDesk.Pharmacy] = ("pharmacy", "بخش دواخانه"),
         [CallDesk.Optical] = ("optical", "بخش عینک"),
+        [CallDesk.Surgery] = ("surgery", "بخش عملیات"),
     };
 
     public static string Room(int room) => $"room-{room:D2}";
@@ -158,6 +166,22 @@ public static class VoicePack
         }
 
         return Sections.Values.FirstOrDefault(s => s.Clip == destination).Label ?? destination;
+    }
+
+    /// <summary>Department label for the passive TV; audio may route to a configured room.</summary>
+    public static string DepartmentLabel(CallDesk desk)
+    {
+        return desk == CallDesk.Doctor
+            ? "بخش داکتر"
+            : Sections.TryGetValue(desk, out var value) ? value.Label : desk.ToString();
+    }
+
+    /// <summary>Combined department and audio destination label for contexts that need both.</summary>
+    public static string DisplayLabel(CallDesk desk, string destination)
+    {
+        var section = DepartmentLabel(desk);
+        var destinationLabel = Label(destination);
+        return destinationLabel == section ? section : $"{section} — {destinationLabel}";
     }
 
     public static string Root(IConfiguration config, IHostEnvironment env) =>

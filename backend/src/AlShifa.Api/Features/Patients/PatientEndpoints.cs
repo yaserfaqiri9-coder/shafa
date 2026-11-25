@@ -10,7 +10,7 @@ public sealed record PatientListItem(long Id, string FileNumber, string FirstNam
 public sealed record PatientDto(
     long Id, string FileNumber, string FirstName, string? LastName, string? FatherName, string Gender,
     DateOnly? BirthDate, int? EstimatedBirthYear, int? AgeYears, string? Phone, string? Address, DateTime CreatedAt, int Version,
-    string? Occupation = null);
+    string? Occupation = null, int? AgeMonths = null);
 
 public sealed record SavePatientRequest(
     [Required, MaxLength(100)] string FirstName,
@@ -23,7 +23,7 @@ public sealed record SavePatientRequest(
     [MaxLength(300)] string? Address,
     bool ConfirmNotDuplicate = false,
     int? Version = null,
-    [MaxLength(100)] string? Occupation = null);
+    [MaxLength(100)] string? Occupation = null, [Range(0, 11)] int? EstimatedAgeMonths = null);
 
 public sealed record PatientChangeDto(string Field, string? OldValue, string? NewValue, DateTime ChangedAt, string? ChangedBy);
 
@@ -183,12 +183,14 @@ public static class PatientEndpoints
             throw new AppException(StatusCodes.Status400BadRequest, "invalid_birth_date", "تاریخ تولد نمی‌تواند در آینده باشد.");
         }
 
+        if (r.EstimatedAge is < 0 or > 130 || r.EstimatedAgeMonths is < 0 or > 11)
+            throw new AppException(400, "invalid_age", "سال باید بین صفر و ۱۳۰ و ماه بین صفر و ۱۱ باشد.");
         patient.FirstName = r.FirstName.Trim();
         patient.LastName = Clean(r.LastName);
         patient.FatherName = Clean(r.FatherName);
         patient.Gender = r.Gender;
-        patient.BirthDate = r.BirthDate;
-        patient.EstimatedBirthYear = r.BirthDate is null && r.EstimatedAge is { } age ? KabulClock.Today.Year - age : r.BirthDate is null ? patient.EstimatedBirthYear : null;
+        patient.BirthDate = r.BirthDate ?? (r.EstimatedAgeMonths is { } months ? KabulClock.Today.AddYears(-(r.EstimatedAge ?? 0)).AddMonths(-months) : null);
+        patient.EstimatedBirthYear = patient.BirthDate is null && r.EstimatedAge is { } age ? KabulClock.Today.Year - age : patient.BirthDate is null ? patient.EstimatedBirthYear : null;
         patient.Phone = Clean(r.Phone);
         patient.Address = Clean(r.Address);
         patient.Occupation = Clean(r.Occupation);
@@ -221,9 +223,18 @@ public static class PatientEndpoints
         return estimatedYear is { } year ? today.Year - year : null;
     }
 
+    internal static int? MonthsOf(DateOnly? birth)
+    {
+        if (birth is not { } b) return null;
+        var today = KabulClock.Today;
+        var months = (today.Year - b.Year) * 12 + today.Month - b.Month;
+        if (b.AddMonths(months) > today) months--;
+        return months;
+    }
+
     private static PatientDto ToDto(Patient p) => new(
         p.Id, p.FileNumber, p.FirstName, p.LastName, p.FatherName, p.Gender.ToString(), p.BirthDate, p.EstimatedBirthYear,
-        AgeOf(p.BirthDate, p.EstimatedBirthYear), p.Phone, p.Address, p.CreatedAt, p.Version, p.Occupation);
+        AgeOf(p.BirthDate, p.EstimatedBirthYear), p.Phone, p.Address, p.CreatedAt, p.Version, p.Occupation, MonthsOf(p.BirthDate));
 }
 
 public sealed class PossibleDuplicateException(IReadOnlyList<PatientListItem> matches)

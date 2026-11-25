@@ -19,6 +19,7 @@ const form = reactive({
   gender: 'Male',
   birthDate: null as string | null,
   estimatedAge: null as number | null,
+  estimatedAgeMonths: null as number | null,
   phone: '',
   address: '',
   occupation: '',
@@ -70,7 +71,8 @@ async function save(confirmNotDuplicate = false) {
   error.value = ''
   const body = {
     ...form,
-    estimatedAge: form.birthDate ? null : form.estimatedAge || null,
+    estimatedAge: form.birthDate ? null : Number.isInteger(form.estimatedAge) ? form.estimatedAge : null,
+    estimatedAgeMonths: form.birthDate || !Number.isInteger(form.estimatedAgeMonths) ? null : form.estimatedAgeMonths,
     confirmNotDuplicate,
     version: patient.value?.version,
   }
@@ -99,7 +101,7 @@ async function save(confirmNotDuplicate = false) {
 async function useToken(patientId: number, tokenId: string) {
   try {
     const token = await api<{ id: number; departmentId: number; doctorStaffId: number | null }>(`/visit-tokens/${tokenId}`)
-    await api('/visits', { method: 'POST', idempotencyKey: newIdempotencyKey(), body: { patientId, departmentId: token.departmentId, doctorStaffId: token.doctorStaffId, tokenId: token.id } })
+    await api('/visits', { method: 'POST', idempotencyKey: newIdempotencyKey(), body: { patientId, departmentId: token.departmentId, doctorStaffId: token.doctorStaffId, tokenId: token.id, queueNumber: route.query.card ? Number(route.query.card) : null } })
   } catch (cause) {
     error.value = `مریض ثبت شد، ولی مراجعه ساخته نشد: ${errorMessage(cause)} مراجعه را از همان نوبت در صفحه پذیرش تکمیل کنید.`
     return
@@ -168,8 +170,13 @@ onMounted(load)
             <ShamsiDateInput v-model="form.birthDate" label="تاریخ تولد (اختیاری)" :max="today" />
           </div>
           <div class="col-md-3 col-sm-6">
-            <label class="form-label" for="p-age">یا سن تخمینی</label>
+            <label class="form-label" for="p-age">یا سن تخمینی (سال)</label>
             <input id="p-age" v-model.number="form.estimatedAge" class="form-control" type="number" min="0" max="130" :disabled="!!form.birthDate" />
+          </div>
+          <div class="col-md-3 col-sm-6">
+            <label class="form-label" for="p-age-months">ماه (برای نوزاد)</label>
+            <input id="p-age-months" v-model.number="form.estimatedAgeMonths" class="form-control" type="number" min="0" max="11" :disabled="!!form.birthDate" />
+            <small class="text-muted">برای نوزاد ۵ ماهه، سال را صفر و ماه را ۵ وارد کنید.</small>
           </div>
         </div>
       </div>

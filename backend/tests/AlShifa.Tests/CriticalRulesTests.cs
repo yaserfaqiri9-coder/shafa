@@ -18,7 +18,7 @@ namespace AlShifa.Tests;
 [Collection("api")]
 public sealed class CriticalRulesTests(ApiFixture api)
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } };
 
     private static string Name(string prefix) => $"{prefix}_{Guid.NewGuid():N}"[..20];
 

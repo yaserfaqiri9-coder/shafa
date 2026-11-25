@@ -1,4 +1,6 @@
 using AlShifa.Api.Infrastructure;
+using AlShifa.Api.Features.Clinical;
+using AlShifa.Api.Features.Inventory;
 using Microsoft.EntityFrameworkCore;
 
 namespace AlShifa.Api.Features.Finance;
@@ -97,7 +99,7 @@ public static class Money
 
 public sealed record ChargeLine(string Description, decimal Quantity, decimal UnitPrice, string RevenueAccount, int? ServiceId, string? SourceType, long? SourceId);
 
-public sealed class InvoiceService(AppDbContext db, NumberService numbers, LedgerService ledger, CurrentUser user, AuditService audit, Outbox outbox)
+public sealed class InvoiceService(AppDbContext db, NumberService numbers, LedgerService ledger, CurrentUser user, AuditService audit, Outbox outbox, StockService stock)
 {
     /// <summary>Row lock serialises concurrent payments and charges on one invoice.</summary>
     public async Task<Invoice> LockAsync(long id, CancellationToken ct) =>
@@ -163,9 +165,13 @@ public sealed class InvoiceService(AppDbContext db, NumberService numbers, Ledge
         UpdateStatus(invoice);
         await db.SaveChangesAsync(ct);
 
-        ledger.Post("Charge", "InvoiceItem", item.Id, item.Description,
-            (Accounts.Receivable, item.LineTotal, 0),
-            (item.RevenueAccount, 0, item.LineTotal));
+        // Complimentary goods keep a zero-priced line for their receipt, but never create a zero-value revenue/receivable journal.
+        if (item.LineTotal != 0)
+        {
+            ledger.Post("Charge", "InvoiceItem", item.Id, item.Description,
+                (Accounts.Receivable, item.LineTotal, 0),
+                (item.RevenueAccount, 0, item.LineTotal));
+        }
         outbox.Add("InvoiceIssued", new { invoiceId = invoice.Id }, Groups.Cashier, Groups.Finance, Groups.Reception);
         await db.SaveChangesAsync(ct);
         return item;
@@ -182,7 +188,11 @@ public sealed class InvoiceService(AppDbContext db, NumberService numbers, Ledge
         item.IsVoid = true;
         invoice.Total -= item.LineTotal;
         UpdateStatus(invoice);
-        await ledger.ReverseAsync("Charge", "InvoiceItem", item.Id, ct);
+        // Complimentary zero-priced lines intentionally have no Charge journal to reverse.
+        if (item.LineTotal != 0)
+        {
+            await ledger.ReverseAsync("Charge", "InvoiceItem", item.Id, ct);
+        }
         await db.SaveChangesAsync(ct);
     }
 
@@ -286,8 +296,9 @@ public sealed class InvoiceService(AppDbContext db, NumberService numbers, Ledge
             (Accounts.Cash, payment.Amount, 0),
             (Accounts.Receivable, 0, payment.Amount));
         audit.Add("PaymentReceived", "Payment", payment.Id.ToString());
-        outbox.Add("PaymentReceived", new { invoiceId = invoice.Id }, Groups.Cashier, Groups.Finance, Groups.Management, Groups.Reception, Groups.Triage, Groups.Lab, Groups.Pharmacy);
+        outbox.Add("PaymentReceived", new { invoiceId = invoice.Id }, Groups.Cashier, Groups.Finance, Groups.Management, Groups.Reception, Groups.Triage, Groups.Lab, Groups.Pharmacy, Groups.Optical);
         await db.SaveChangesAsync(ct);
+        await OperationCatalog.ConsumePaidAsync(invoice, db, stock, ledger, user, audit, outbox, ct);
         return payment;
     }
 

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { bootError } from '@/router'
 import { online } from '@/pwa'
+import GlobalNotifications from '@/components/GlobalNotifications.vue'
+import UiConfirmHost from '@/components/UiConfirmHost.vue'
 
 function retry() {
   window.location.reload()
@@ -8,6 +10,7 @@ function retry() {
 </script>
 
 <template>
+  <GlobalNotifications />
   <div v-if="!online" class="connection-status no-print" role="status">اتصال شبکه قطع است؛ برای مشاهده اطلاعات تازه و ثبت تغییرات، اتصال به سرور را برقرار کنید.</div>
   <div v-if="bootError" class="boot-error" role="alert">
     <i class="ri-error-warning-fill boot-error__icon" aria-hidden="true"></i>
@@ -15,6 +18,7 @@ function retry() {
     <button type="button" class="btn btn-primary" @click="retry">تلاش دوباره</button>
   </div>
   <RouterView v-else />
+  <UiConfirmHost />
 </template>
 
 <style scoped>

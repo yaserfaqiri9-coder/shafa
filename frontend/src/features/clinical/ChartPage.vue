@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { askConfirm } from '@/components/confirm'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api, ApiError, errorMessage, newIdempotencyKey } from '@/api/http'
 import { useLiveRefresh } from '@/api/realtime'
@@ -13,20 +14,19 @@ import TransferDoctorModal from '@/features/visits/TransferDoctorModal.vue'
 import type { Patient } from '@/features/patients/types'
 import type { VisitRow } from '@/features/visits/types'
 import { useAuthStore } from '@/stores/auth'
+import { useNotifications } from '@/stores/notifications'
 import { formatDate, formatDateTime, todayIso } from '@/utils/date'
 import { money } from '@/utils/money'
 import DossierForm, { type RxLine } from './DossierForm.vue'
-import { allergyMatch, paperDose, prescriptionFormOf, recentDrugs, rememberDrugs, type DrugOption } from './doctorShortcuts'
-import LensPicker from './LensPicker.vue'
-import RxGrid, { type RxRow } from './RxGrid.vue'
+import { allergyMatch, prescriptionFormOf, recentDrugs, rememberDrugs, type DrugOption } from './doctorShortcuts'
+import RefractionPrescription from './RefractionPrescription.vue'
+import { prescriptionForm } from './refractionPrescription'
+import { shamsiPaper } from '@/features/print/paper'
 import {
   parseFindings,
   parseMeasurements,
-  parseOpticalNotes,
   parsePlan,
-  parseRefractionExtras,
   serializeFindings,
-  serializeOpticalNotes,
   serializePlan,
   type EyeFindings,
 } from './examRecord'
@@ -40,10 +40,8 @@ import {
   type Consultation,
   type DiagnosticOrder,
   type HistoryItem,
-  type OpticalRx,
   type Prescription,
   type Refraction,
-  type SurgeryPackage,
   type SurgeryRow,
 } from './types'
 import { useUnsavedGuard } from './useUnsavedGuard'
@@ -55,23 +53,24 @@ const chart = ref<Chart | null>(null)
 const refraction = ref<Refraction | null>(null)
 const error = ref('')
 const notice = ref('')
+const { notify } = useNotifications()
+watch(notice, (value) => { if (value) notify.success(value) })
+watch(error, (value) => { if (value) notify.danger(value) })
 const needsEmergency = ref(false)
 
 /**
  * The page is the patient's paper file: the doctor fills it in place and saves once.
  * The few things that are not on the paper open in a window from the buttons above it.
  */
-type PanelKey = 'optical' | 'lab' | 'surgery' | 'history' | 'amend'
+type PanelKey = 'lab' | 'surgery' | 'history' | 'amend'
 const panel = ref<PanelKey | null>(null)
 const panels = computed(() => [
-  { key: 'optical' as const, label: 'نسخه عینک', icon: 'ri-glasses-2-line', count: chart.value?.opticalPrescriptions.filter((o) => !o.isCancelled).length ?? 0, ready: 0 },
   { key: 'lab' as const, label: 'درخواست تشخیصی', icon: 'ri-microscope-line', count: chart.value?.diagnosticOrders.filter((o) => o.status !== 'Cancelled').length ?? 0, ready: readyResults.value.length },
   { key: 'surgery' as const, label: 'عملیات', icon: 'ri-hospital-line', count: 0, ready: 0 },
 ])
 
 /** Opens an order with its form already showing, so the doctor fills it at once instead of first pressing "new". */
 function openPanel(key: PanelKey) {
-  if (key === 'optical' && !optical.editing) opticalFormOpen.value = auth.can('opticalrx.create')
   if (key === 'lab') orderFormOpen.value = auth.can('diagnostics.create')
   if (key === 'surgery') surgeryFormOpen.value = auth.can('surgery.create')
   panel.value = key
@@ -80,16 +79,15 @@ function openPanel(key: PanelKey) {
 /** The rarer actions of the file, kept out of the way in one menu. */
 const moreActions = computed(() => [
   { label: 'سابقه مراجعات', icon: 'ri-history-line', onSelect: () => (panel.value = 'history') },
-  // Kept off the file itself: changing a finalized exam and its record of changes are rare.
-  ...((finalized.value && canEdit.value) || chart.value?.amendments.length
-    ? [{ label: finalized.value && canEdit.value ? 'ادامه معاینه یا اصلاحیه' : 'اصلاحیه‌ها', icon: 'ri-edit-2-line', onSelect: () => (panel.value = 'amend') }]
-    : []),
+  // Read only: every later change to the file is recorded on save, with no form to fill.
+  ...(chart.value?.amendments.length ? [{ label: 'تاریخچه تغییرات', icon: 'ri-file-history-line', onSelect: () => (panel.value = 'amend') }] : []),
   ...(canEdit.value && visitOpen.value ? [{ label: 'انتقال به داکتر دیگر', icon: 'ri-user-shared-line', onSelect: () => (transferring.value = true) }] : []),
 ])
 
 const canEdit = computed(() => auth.can('consultation.edit'))
 const finalized = computed(() => !!chart.value?.consultation?.finalizedAt)
-const examEditable = computed(() => canEdit.value && !finalized.value)
+/** The doctor writes straight onto a seen patient's file too, final or not; the server keeps what it said before. */
+const examEditable = computed(() => canEdit.value)
 
 const blankFindings = (): EyeFindings => ({ values: {}, note: '' })
 
@@ -131,12 +129,7 @@ const resultTab = computed<ResultTab | null>(() =>
 const tabOrders = computed(() => (resultTab.value === 'imaging' ? imagingOrders.value : resultTab.value === 'lab' ? labOrders.value : []))
 const orderStatusLabels: Record<string, string> = { Requested: 'در انتظار', InProgress: 'در حال انجام', ResultReady: 'آماده' }
 
-/** The values the optometrist settled on: the final refraction, or the latest stage measured so far. */
-const refractionRows = computed(() => {
-  const lines = refraction.value?.lines ?? []
-  const stage = (['Final', 'Subjective', 'Auto'] as const).find((st) => lines.some((l) => l.stage === st && (l.sphere || l.cylinder || l.va)))
-  return stage ? (['OD', 'OS'] as const).map((eye) => ({ eye, line: lines.find((l) => l.stage === stage && l.eye === eye) ?? null })) : []
-})
+
 
 /** The patient's last visit before this one, to compare today's vision and pressure with. */
 const previousVisit = computed(() => history.value.find((h) => h.visitId !== Number(props.visitId) && h.visitDate <= (chart.value?.visit.visitDate ?? '')) ?? null)
@@ -160,7 +153,7 @@ const exam = reactive({
 })
 
 /** The prescription being written on this page: a new one, or the visit's own that the pharmacy has not started. */
-const rxForm = reactive({ items: [] as RxLine[], notes: '', validUntil: null as string | null, reason: '' })
+const rxForm = reactive({ items: [] as RxLine[], notes: '', validUntil: null as string | null })
 
 const { dirty, markSaved, applying } = useUnsavedGuard(reactive({ exam, rxForm }))
 const version = ref<number | null>(null)
@@ -205,12 +198,6 @@ const examSaved = ref('')
 const examChanged = computed(() => examSnapshot() !== examSaved.value)
 
 
-const finalLines = computed(() => {
-  const lines = refraction.value?.lines.filter((l) => l.stage === 'Final') ?? []
-  return lines.length ? lines : null
-})
-
-
 async function loadRefraction() {
   if (!auth.can('preexam.view')) return
   // The summary is optional: the chart stays usable if this one read fails.
@@ -234,6 +221,8 @@ async function load() {
   needsEmergency.value = false
   try {
     const sameVisit = chart.value?.visit.id === Number(props.visitId)
+    // The patient this doctor called is now with the doctor. The server ignores any other chart; nothing is announced.
+    if (!sameVisit && auth.can('consultation.edit')) await api(`/consultations/${props.visitId}/start`, { method: 'POST' }).catch(() => undefined)
     chart.value = await api<Chart>(`/consultations/${props.visitId}/chart`)
     // Reloading after an order or a prescription must never overwrite what the doctor is still typing.
     if (!sameVisit || !dirty.value) fillChart(chart.value)
@@ -243,7 +232,8 @@ async function load() {
       loadHistory(true)
       loadPatient(chart.value.visit.patientId)
     }
-    if (finalized.value) loadNext()
+    // Once the exam is saved the patient is on the seen list, so the next one waiting is offered.
+    if (chart.value.consultation) loadNext()
   } catch (cause) {
     if (cause instanceof ApiError && cause.code === 'clinical_access_required') needsEmergency.value = true
     error.value = errorMessage(cause)
@@ -335,12 +325,19 @@ async function saveAll() {
 /** Ticked when the patient will come back today, for example after an ordered test; the visit then stays open. */
 const keepVisitOpen = ref(false)
 
-/** The next patient waiting in this doctor's queue, offered once the exam is final. */
+/** The next patient waiting in this doctor's queue, offered once the exam is saved. */
 const nextVisit = ref<VisitRow | null>(null)
 
+/** The same patient the queue page shows as next: the Backend's order, skipping absent patients and those away at a test. Opening it does not call. */
 async function loadNext() {
-  const rows = await api<VisitRow[]>('/clinical/worklist?kind=doctor').catch(() => [] as VisitRow[])
-  nextVisit.value = rows.find((r) => r.id !== Number(props.visitId) && r.status !== 'InConsultation') ?? rows.find((r) => r.id !== Number(props.visitId)) ?? null
+  const current = Number(props.visitId)
+  const [rows, desk] = await Promise.all([
+    api<VisitRow[]>('/clinical/worklist?kind=doctor').catch(() => [] as VisitRow[]),
+    api<{ rows: { visitId: number | null; present?: boolean }[] }>('/calls/desk/Doctor').catch(() => null),
+  ])
+  const ready = (r: VisitRow) => r.id !== current && (r.status === 'ReadyForDoctor' || r.status === 'InConsultation')
+  const entry = desk?.rows.find((e) => e.visitId !== current && e.present !== false && rows.some((r) => r.id === e.visitId && ready(r)))
+  nextVisit.value = entry ? rows.find((r) => r.id === entry.visitId) ?? null : desk ? null : rows.find(ready) ?? null
 }
 
 /** Ctrl+S saves the page, as in any editor. */
@@ -376,40 +373,6 @@ async function finalize(closeVisit: boolean) {
 }
 
 const visitOpen = computed(() => !['Completed', 'Cancelled'].includes(chart.value?.visit.status ?? ''))
-const reopen = reactive({ reason: '', saving: false })
-
-async function submitReopen() {
-  reopen.saving = true
-  error.value = ''
-  try {
-    await api(`/consultations/${props.visitId}/reopen`, { method: 'POST', body: { reason: reopen.reason, version: chart.value!.consultation!.version } })
-    reopen.reason = ''
-    notice.value = 'معاینه باز شد. یافته‌ها و تشخیص‌های قبلی حفظ شده‌اند.'
-    panel.value = null
-    await load()
-  } catch (cause) {
-    explain(cause)
-  } finally {
-    reopen.saving = false
-  }
-}
-
-/**
- * What a doctor can amend on a final record, in the words of the dossier. History, plan and advice share one
- * stored field; each is amended on its own and the other two are kept as they are.
- */
-const amendChoices = [
-  { key: 'Plan', field: 'TreatmentPlan', part: 'plan' as const, label: 'پلان درمان' },
-  { key: 'History', field: 'TreatmentPlan', part: 'history' as const, label: 'شرح حال' },
-  { key: 'Advice', field: 'TreatmentPlan', part: 'advice' as const, label: 'توصیه (Advice)' },
-  { key: 'Note', field: 'TreatmentPlan', part: 'note' as const, label: 'یادداشت (Note)' },
-  { key: 'FindingsOd', field: 'FindingsOd', part: null, label: 'یافته‌های چشم راست (OD)' },
-  { key: 'FindingsOs', field: 'FindingsOs', part: null, label: 'یافته‌های چشم چپ (OS)' },
-  { key: 'ConfidentialNote', field: 'ConfidentialNote', part: null, label: 'یادداشت محرمانه' },
-]
-const amend = reactive({ field: 'Plan', value: '', reason: '', saving: false })
-const amendChoice = computed(() => amendChoices.find((c) => c.key === amend.field) ?? amendChoices[0])
-
 /** A stored plan shows as its three labelled parts, never with its storage tags. */
 function shownValue(field: string, value: string | null) {
   if (value == null) return '—'
@@ -419,6 +382,7 @@ function shownValue(field: string, value: string | null) {
 }
 
 const amendFields: Record<string, string> = {
+  Diagnoses: 'تشخیص',
   FindingsOd: 'یافته‌های چشم راست',
   FindingsOs: 'یافته‌های چشم چپ',
   TreatmentPlan: 'پلان درمان',
@@ -461,38 +425,6 @@ const historyFields: Record<string, string> = {
   PostOpStatus: 'وضعیت پس از عملیات',
 }
 
-const amendCurrent = computed(() => {
-  const c = chart.value?.consultation
-  if (!c) return ''
-  const choice = amendChoice.value
-  if (choice.part) return parsePlan(c.treatmentPlan)[choice.part]
-  return { FindingsOd: c.findingsOd, FindingsOs: c.findingsOs, ConfidentialNote: c.confidentialNote }[choice.field] ?? ''
-})
-
-// An amendment replaces the whole field, so it starts from the current text instead of an empty box.
-watch(amendCurrent, (value) => (amend.value = value), { immediate: true })
-
-async function submitAmend() {
-  amend.saving = true
-  error.value = ''
-  try {
-    const choice = amendChoice.value
-    const consultation = chart.value!.consultation!
-    const value = choice.part ? serializePlan({ ...parsePlan(consultation.treatmentPlan), [choice.part]: amend.value }) : amend.value
-    await api(`/consultations/${props.visitId}/amend`, {
-      method: 'POST',
-      body: { field: choice.field, value, reason: amend.reason, version: consultation.version },
-    })
-    amend.reason = ''
-    notice.value = 'اصلاحیه ثبت شد.'
-    await load()
-  } catch (cause) {
-    explain(cause)
-  } finally {
-    amend.saving = false
-  }
-}
-
 /** The prescription on the page and the server state it started from. */
 const rx = reactive({ editing: null as Prescription | null, saved: '', key: newIdempotencyKey() })
 
@@ -510,7 +442,6 @@ const rxChanged = computed(() => rxSnapshot() !== rx.saved)
 function setRx(p: Prescription | null) {
   rx.editing = p
   Object.assign(rxForm, {
-    reason: '',
     notes: p?.notes ?? '',
     validUntil: p?.validUntil ?? null,
     items: p?.items.map((i) => ({ drugName: i.drugName, dose: i.dose ?? '', route: i.route ?? '', duration: i.duration ?? '', instructions: i.instructions ?? '', quantity: i.quantity })) ?? [],
@@ -537,12 +468,9 @@ async function loadDrugForms(names: string[]) {
 /** A new prescription can always be started; an issued one can change until the pharmacy starts on it. */
 const rxEditable = computed(() => (rx.editing ? auth.can('prescriptions.edit') : auth.can('prescriptions.create')))
 
-/** Once the exam is final or the visit closed, the server asks for a reason on any change. */
-const needsAmendReason = computed(() => finalized.value || chart.value?.visit.status === 'Completed')
-
 const recent = ref(recentDrugs(auth.user?.id))
 
-function addDrug(drug: DrugOption) {
+async function addDrug(drug: DrugOption) {
   // A drug the pharmacy does not stock is written whole, as the old system wrote it: "Eye drop Ocuzol (Antazoline + Naphazoline)".
   // The pharmacy has no record of it, so the form and generic would otherwise be lost once the prescription is saved.
   const name = drug.outside
@@ -551,12 +479,11 @@ function addDrug(drug: DrugOption) {
   if (drug.form || drug.generic) drugInfo[name] = drug.outside ? { ...drug, name, generic: null } : drug
   const index = rxForm.items.findIndex((i) => i.drugName.trim().toLowerCase() === name.toLowerCase())
   const clash = index < 0 ? allergyMatch(allergy.value, name) : []
-  if (clash.length && !window.confirm(`هشدار حساسیت: مریض به «${allergy.value}» حساسیت دارد و نام این دوا «${clash.join('، ')}» را دارد.\nبا این حال دوا اضافه شود؟`)) return
+  if (clash.length && !(await askConfirm(`هشدار حساسیت: مریض به «${allergy.value}» حساسیت دارد و نام این دوا «${clash.join('، ')}» را دارد.\nبا این حال دوا اضافه شود؟`, { title: 'هشدار حساسیت', confirmLabel: 'اضافه شود', danger: true }))) return
   if (index < 0) {
     const known = recent.value.find((d) => d.name.toLowerCase() === name.toLowerCase())
-    // Duration is not on the paper's Rx, so a remembered one is not brought back into a hidden column.
-    // The doctor's own last dose first, then the pharmacy's usual dose for the drug, then the old list's.
-    rxForm.items.push({ drugName: name, dose: known?.dose || drug.defaultDose || paperDose(name), route: '', duration: '', instructions: '', quantity: known?.quantity || 1 })
+    // Every new line starts with the hospital's editable paper-form default; the doctor may replace it.
+    rxForm.items.push({ drugName: name, dose: '1x3', route: '', duration: '', instructions: '', quantity: known?.quantity || 1 })
   }
   // The cursor goes to the dose, the one thing left to write for the drug.
   const at = index < 0 ? rxForm.items.length : index + 1
@@ -568,7 +495,7 @@ async function persistRx() {
   const items = rxLines().map((i) => ({ ...i, drugName: i.drugName.trim(), quantity: i.quantity || 1 }))
   try {
     if (rx.editing) {
-      await api(`/prescriptions/${rx.editing.id}`, { method: 'PUT', body: { notes: rxForm.notes, items, version: rx.editing.version, reason: rxForm.reason || undefined, validUntil: rxForm.validUntil } })
+      await api(`/prescriptions/${rx.editing.id}`, { method: 'PUT', body: { notes: rxForm.notes, items, version: rx.editing.version, validUntil: rxForm.validUntil } })
     } else {
       if (items.length === 0) return false
       await api('/prescriptions', { method: 'POST', idempotencyKey: rx.key, body: { visitId: Number(props.visitId), notes: rxForm.notes, items, validUntil: rxForm.validUntil } })
@@ -585,8 +512,8 @@ async function persistRx() {
 }
 
 /** Moves the page to another prescription of this visit, or to a blank new one. */
-function openRx(p: Prescription | null) {
-  if (rxChanged.value && !window.confirm('تغییرات نسخه فعلی ذخیره نشده‌اند. از آن صرف نظر شود؟')) return
+async function openRx(p: Prescription | null) {
+  if (rxChanged.value && !(await askConfirm('تغییرات نسخه فعلی ذخیره نشده‌اند. از آن صرف نظر شود؟', { confirmLabel: 'صرف نظر', danger: true }))) return
   setRx(p)
   rx.key = newIdempotencyKey()
 }
@@ -614,81 +541,15 @@ async function submitReapprove() {
 const rxNeedsDoctor = (p: Prescription) =>
   ['Issued', 'PartiallyDispensed'].includes(p.status) && (p.pharmacyStatus === 'NeedsDoctorReview' || (!!p.validUntil && p.validUntil < todayIso()))
 
-const blankRow = (): RxRow => ({ sphere: '', cylinder: '', axis: '', add: '', va: '' })
-const optical = reactive({ editing: null as OpticalRx | null, reason: '', od: blankRow(), os: blankRow(), pd: '', uvaOd: '', uvaOs: '', lens: [] as string[], notes: '', key: newIdempotencyKey(), saving: false })
-const opticalFormOpen = ref(false)
-
-function editOptical(o: OpticalRx) {
-  opticalFormOpen.value = true
-  const notes = parseOpticalNotes(o.notes)
-  Object.assign(optical, {
-    editing: o,
-    reason: '',
-    od: { sphere: o.sphereOd ?? '', cylinder: o.cylinderOd ?? '', axis: o.axisOd ?? '', add: o.addOd ?? '', va: notes.vaOd },
-    os: { sphere: o.sphereOs ?? '', cylinder: o.cylinderOs ?? '', axis: o.axisOs ?? '', add: o.addOs ?? '', va: notes.vaOs },
-    pd: o.pd ?? '',
-    uvaOd: notes.uvaOd,
-    uvaOs: notes.uvaOs,
-    lens: notes.lens,
-    notes: notes.notes,
-  })
-}
-
-function clearOptical() {
-  opticalFormOpen.value = false
-  Object.assign(optical, { editing: null, reason: '', od: blankRow(), os: blankRow(), pd: '', uvaOd: '', uvaOs: '', lens: [], notes: '', key: newIdempotencyKey() })
-}
-
-/** Copies the optometrist's final values into the form for the doctor to review. Nothing is issued until they submit. */
-function copyFinalToOptical() {
-  for (const eye of ['OD', 'OS'] as const) {
-    const line = finalLines.value?.find((l) => l.eye === eye)
-    optical[eye === 'OD' ? 'od' : 'os'] = { sphere: line?.sphere ?? '', cylinder: line?.cylinder ?? '', axis: line?.axis ?? '', add: line?.add ?? '', va: line?.va ?? '' }
-  }
-  optical.pd = refraction.value?.pd ?? ''
-  optical.uvaOd = refraction.value?.unaidedVaOd ?? ''
-  optical.uvaOs = refraction.value?.unaidedVaOs ?? ''
-  optical.lens = parseRefractionExtras(refraction.value?.measurements).lens
-}
-
-async function submitOptical() {
-  optical.saving = true
-  error.value = ''
-  try {
-    const body = {
-      sphereOd: optical.od.sphere,
-      cylinderOd: optical.od.cylinder,
-      axisOd: optical.od.axis,
-      addOd: optical.od.add,
-      sphereOs: optical.os.sphere,
-      cylinderOs: optical.os.cylinder,
-      axisOs: optical.os.axis,
-      addOs: optical.os.add,
-      pd: optical.pd,
-      notes: serializeOpticalNotes({ lens: optical.lens, vaOd: optical.od.va, vaOs: optical.os.va, uvaOd: optical.uvaOd, uvaOs: optical.uvaOs, notes: optical.notes }),
-    }
-    if (optical.editing) {
-      await api(`/optical-prescriptions/${optical.editing.id}`, { method: 'PUT', body: { ...body, version: optical.editing.version, reason: optical.reason || undefined } })
-      notice.value = 'نسخه عینک ویرایش شد.'
-    } else {
-      await api('/optical-prescriptions', { method: 'POST', idempotencyKey: optical.key, body: { ...body, visitId: Number(props.visitId) } })
-      notice.value = 'نسخه عینک ثبت و برای بخش عینک ارسال شد.'
-    }
-    clearOptical()
-    await load()
-  } catch (cause) {
-    explain(cause)
-    if (cause instanceof ApiError && cause.status !== 0) optical.key = newIdempotencyKey()
-  } finally {
-    optical.saving = false
-  }
-}
-
-const tests = ref<(ComboOption & { kind: string })[]>([])
+const tests = ref<(ComboOption & { kind: string; serviceId: number | null; price: number | null })[]>([])
 const testsLoading = ref(false)
 const orderFormOpen = ref(false)
-const order = reactive({ testId: null as number | null, note: '', returnToDoctor: true, key: newIdempotencyKey(), saving: false })
-const orderKind = computed(() => tests.value.find((t) => t.value === order.testId)?.kind ?? 'Lab')
+const order = reactive({ testId: null as number | null, note: '', returnToDoctor: true, discount: 0, discountMode: 'Amount' as 'Amount' | 'Percent', key: newIdempotencyKey(), saving: false })
+const selectedTest = computed(() => tests.value.find((t) => t.value === order.testId) ?? null)
+const orderKind = computed(() => selectedTest.value?.kind ?? 'Lab')
+const orderPrice = computed(() => selectedTest.value?.price ?? 0)
+const orderDiscountAmount = computed(() => order.discount <= 0 ? 0 : order.discountMode === 'Percent' ? Math.round(orderPrice.value * order.discount) / 100 : order.discount)
+const orderFinal = computed(() => Math.max(0, orderPrice.value - orderDiscountAmount.value))
 
 async function submitOrder() {
   order.saving = true
@@ -704,10 +565,10 @@ async function submitOrder() {
     await api('/diagnostic-orders', {
       method: 'POST',
       idempotencyKey: order.key,
-      body: { patientId: chart.value!.visit.patientId, visitId: Number(props.visitId), testId: order.testId, note: order.note, returnToDoctor: order.returnToDoctor },
+      body: { patientId: chart.value!.visit.patientId, visitId: Number(props.visitId), testId: order.testId! > 0 ? order.testId : 0, serviceId: order.testId! < 0 ? -order.testId! : null, note: order.note, returnToDoctor: order.returnToDoctor, discount: order.discount > 0 ? { amount: order.discount, mode: order.discountMode } : null },
     })
     // The form stays open and empty, so a second test is ordered without another click.
-    Object.assign(order, { testId: null, note: '', returnToDoctor: true, key: newIdempotencyKey() })
+    Object.assign(order, { testId: null, note: '', returnToDoctor: true, discount: 0, discountMode: 'Amount', key: newIdempotencyKey() })
     notice.value = kind === 'Lab' ? 'درخواست برای آزمایشگاه ارسال شد.' : 'درخواست ثبت شد. پس از پرداخت کامل فیس شروع می‌شود.'
     await load()
   } catch (cause) {
@@ -749,25 +610,17 @@ async function cancelItem(path: string, body?: unknown) {
 }
 
 const cancelRx = (p: Prescription) => cancelItem(`/prescriptions/${p.id}/cancel?version=${p.version}`)
-const cancelOptical = (o: OpticalRx) => cancelItem(`/optical-prescriptions/${o.id}/cancel?version=${o.version}`)
 const cancelOrder = (o: DiagnosticOrder) => cancelItem(`/diagnostic-orders/${o.id}/cancel`, { version: o.version })
 
 const surgeries = ref<SurgeryRow[]>([])
-const services = ref<ComboOption[]>([])
-const surgery = reactive({ surgeryType: '', eye: 'OD', serviceId: null as number | null, packageId: null as number | null, key: newIdempotencyKey(), saving: false })
+const operations = ref<{ id: number; name: string; price: number | null; packages: { name: string; quantity: number }[] }[]>([])
+const operationOptions = computed<ComboOption[]>(() => operations.value.map((o) => ({ value: o.id, label: o.name, hint: money(o.price) })))
+const surgery = reactive({ surgeryType: '', eye: 'OD', operationDefinitionId: null as number | null, amount: null as number | null, discount: 0, discountMode: 'Amount' as 'Amount' | 'Percent', key: newIdempotencyKey(), saving: false })
+const selectedOperation = computed(() => operations.value.find((o) => o.id === surgery.operationDefinitionId) ?? null)
+const surgeryBasePrice = computed(() => surgery.amount ?? selectedOperation.value?.price ?? 0)
+const surgeryDiscountAmount = computed(() => surgery.discount <= 0 ? 0 : surgery.discountMode === 'Percent' ? Math.round(surgeryBasePrice.value * surgery.discount) / 100 : surgery.discount)
+const surgeryFinal = computed(() => Math.max(0, surgeryBasePrice.value - surgeryDiscountAmount.value))
 const surgeryFormOpen = ref(false)
-const packages = ref<SurgeryPackage[]>([])
-const packageOptions = computed<ComboOption[]>(() => packages.value.map((p) => ({ value: p.id, label: p.name, hint: p.price === null ? 'بدون قیمت' : money(p.price) })))
-
-/** A package brings its name and its fee, so the doctor picks one thing. */
-watch(
-  () => surgery.packageId,
-  (id) => {
-    const chosen = packages.value.find((p) => p.id === id)
-    if (chosen) Object.assign(surgery, { surgeryType: chosen.name, serviceId: chosen.serviceId })
-  },
-)
-
 async function loadSurgeries() {
   if (!auth.can('surgery.view')) return
   const page = await api<{ items: SurgeryRow[] }>('/surgeries?pageSize=100')
@@ -781,9 +634,9 @@ async function submitSurgery() {
     await api('/surgeries', {
       method: 'POST',
       idempotencyKey: surgery.key,
-      body: { visitId: Number(props.visitId), surgeryType: surgery.surgeryType, eye: surgery.eye, serviceId: surgery.packageId ? null : surgery.serviceId, packageId: surgery.packageId },
+      body: { visitId: Number(props.visitId), surgeryType: selectedOperation.value?.name, eye: surgery.eye, operationDefinitionId: surgery.operationDefinitionId, amount: surgery.amount ?? undefined, discount: surgery.discount > 0 ? { amount: surgery.discount, mode: surgery.discountMode } : null },
     })
-    Object.assign(surgery, { surgeryType: '', serviceId: null, packageId: null, key: newIdempotencyKey() })
+    Object.assign(surgery, { surgeryType: '', operationDefinitionId: null, amount: null, discount: 0, discountMode: 'Amount', key: newIdempotencyKey() })
     surgeryFormOpen.value = false
     notice.value = 'پرونده عملیات ایجاد شد.'
     await loadSurgeries()
@@ -813,19 +666,24 @@ watch(panel, (value) => {
   if (value === 'surgery') {
     loadSurgeries().catch(explain)
     if (auth.can('surgery.create')) {
-      // Prices are read fresh each time, never from a cache.
-      api<{ id: number; name: string; isActive: boolean; currentPrice: number | null }[]>('/services')
-        .then((rows) => (services.value = rows.filter((s) => s.isActive && s.currentPrice !== null).map((s) => ({ value: s.id, label: s.name, hint: money(s.currentPrice) }))))
-        .catch(explain)
-      api<SurgeryPackage[]>('/surgery-packages')
-        .then((rows) => (packages.value = rows))
-        .catch(explain)
+      api<typeof operations.value>('/operations').then((rows) => (operations.value = rows)).catch(explain)
     }
   }
   if (value === 'lab' && auth.can('diagnostics.create')) {
     testsLoading.value = true
-    testOptions()
-      .then((rows) => (tests.value = rows))
+    Promise.all([
+      testOptions(),
+      api<{ id: number; name: string; code: string; isActive: boolean; isSurgical: boolean; hasDiagnosticTest: boolean; currentPrice: number | null }[]>('/services'),
+    ])
+      .then(([rows, serviceRows]) => {
+        const linked = new Set(rows.map((t) => t.serviceId))
+        const priceFor = (serviceId: number | null) => serviceRows.find((s) => s.id === serviceId)?.currentPrice ?? null
+        tests.value = [
+          ...rows.map((t) => ({ ...t, price: priceFor(t.serviceId) })),
+          ...serviceRows.filter((s) => s.isActive && !s.isSurgical && !s.hasDiagnosticTest && !['VISIT-FEE', 'REFRACTION', 'IMAGING'].includes(s.code) && !linked.has(s.id))
+            .map((s) => ({ value: -s.id, label: s.name, kind: 'Lab', serviceId: s.id, price: s.currentPrice })),
+        ]
+      })
       .catch(explain)
       .finally(() => (testsLoading.value = false))
   }
@@ -839,7 +697,6 @@ watch(() => props.visitId, () => {
 
 <template>
   <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
-  <div v-if="notice" class="alert alert-success" role="status">{{ notice }}</div>
 
   <UiCard v-if="needsEmergency" title="دسترسی اضطراری">
     <p>این مریض به شما مربوط نیست. در حالت اضطرار می‌توانید با ثبت دلیل، برای 4 ساعت دسترسی بگیرید. این دسترسی ثبت و قابل بررسی است.</p>
@@ -864,14 +721,19 @@ watch(() => props.visitId, () => {
   <div v-if="chart" class="chart-shell">
     <!-- The patient's details sit at the head of the dossier itself, as on the paper; this strip holds only the orders. -->
     <section class="chart-header" aria-label="اقدامات پرونده">
-      <!-- One strip for everything ordered beside the dossier: a click opens that order's form, ready to fill. -->
+      <!-- Compact report-style actions beside the dossier; each item opens its existing form. -->
       <nav class="chart-orders" aria-label="درخواست‌ها">
-        <span class="chart-orders__label">درخواست:</span>
         <div class="chart-orders__group" role="group" aria-label="نوع درخواست">
-          <button v-for="item in panels" :key="item.key" type="button" class="chart-orders__item" aria-haspopup="dialog" @click="openPanel(item.key)">
-            <i :class="item.icon" aria-hidden="true"></i> {{ item.label }}
-            <span v-if="item.count" class="chart-header__count" :aria-label="`${item.count} ثبت‌شده`">{{ item.count }}</span>
-            <span v-if="item.ready" class="chart-header__count chart-header__count--ready">{{ item.ready }} نتیجه</span>
+          <button v-for="item in panels" :key="item.key" type="button" class="chart-orders__item" :class="`chart-orders__item--${item.key}`" aria-haspopup="dialog" @click="openPanel(item.key)">
+            <span class="chart-orders__icon"><i :class="item.icon" aria-hidden="true"></i></span>
+            <span class="chart-orders__copy">
+              <strong>{{ item.label }}</strong>
+            </span>
+            <span class="chart-orders__badges">
+              <span v-if="item.count" class="chart-header__count" :aria-label="`${item.count} ثبت‌شده`">{{ item.count }}</span>
+              <span v-if="item.ready" class="chart-header__count chart-header__count--ready">{{ item.ready }} نتیجه</span>
+            </span>
+            <i class="chart-orders__arrow ri-arrow-left-line" aria-hidden="true"></i>
           </button>
         </div>
         <span class="chart-orders__end">
@@ -908,26 +770,12 @@ watch(() => props.visitId, () => {
 
         <div role="tabpanel">
           <template v-if="resultTab === 'refraction'">
-            <p v-if="!refractionDone" class="results__empty">بینایی‌سنج هنوز نتیجه را ثبت نکرده است.</p>
+            <p v-if="!refraction" class="results__empty">بینایی‌سنج هنوز نتیجه را ثبت نکرده است.</p>
             <template v-else>
-              <table v-if="refractionRows.length" class="chart-brief__compare" dir="ltr">
-                <thead><tr><th></th><th>SPH</th><th>CYL</th><th>AXIS</th><th>ADD</th><th>VA</th></tr></thead>
-                <tbody>
-                  <tr v-for="r in refractionRows" :key="r.eye">
-                    <th>{{ r.eye }}</th>
-                    <td>{{ r.line?.sphere || '—' }}</td>
-                    <td>{{ r.line?.cylinder || '—' }}</td>
-                    <td>{{ r.line?.axis || '—' }}</td>
-                    <td>{{ r.line?.add || '—' }}</td>
-                    <td>{{ r.line?.va || '—' }}</td>
-                  </tr>
-                </tbody>
-              </table>
-              <p class="results__meta" dir="ltr">
-                <span v-if="refraction!.unaidedVaOd || refraction!.unaidedVaOs">UCVA {{ refraction!.unaidedVaOd || '—' }} / {{ refraction!.unaidedVaOs || '—' }}</span>
-                <span v-if="refraction!.pd">PD {{ refraction!.pd }}</span>
-              </p>
-              <p v-if="refraction!.notes" class="chart-brief__text" dir="auto">{{ refraction!.notes }}</p>
+              <div class="refraction-result-preview">
+                <RefractionPrescription :model-value="prescriptionForm(refraction)" :patient-name="chart.visit.patientName" :date="shamsiPaper(chart.visit.visitDate)" readonly />
+              </div>
+              <RouterLink :to="`/print/refraction/${visitId}`" target="_blank" class="btn btn-soft mt-2">چاپ نسخه</RouterLink>
             </template>
           </template>
 
@@ -1006,10 +854,6 @@ watch(() => props.visitId, () => {
           </span>
         </template>
         <template #rx-extra>
-          <div v-if="rx.editing && needsAmendReason && rxChanged" class="mt-2">
-            <label class="form-label" for="rx-reason">دلیل اصلاح نسخه</label>
-            <input id="rx-reason" v-model="rxForm.reason" class="form-control" minlength="3" maxlength="500" required />
-          </div>
           <div v-if="otherPrescriptions.length" class="rx-others">
             <div v-for="p in otherPrescriptions" :key="p.id" class="issued">
               <div class="issued__head">
@@ -1035,7 +879,7 @@ watch(() => props.visitId, () => {
 
       <div v-if="canEdit || rxEditable" class="xr-action-bar chart-actions">
         <button type="submit" class="btn btn-primary" :disabled="saving" title="Ctrl+S"><i class="ri-save-line" aria-hidden="true"></i> ذخیره</button>
-        <template v-if="examEditable && auth.can('consultation.approve') && (version !== null || dirty)">
+        <template v-if="examEditable && !finalized && auth.can('consultation.approve') && (version !== null || dirty)">
           <button type="button" class="btn btn-soft" :disabled="saving" @click="finalize(!keepVisitOpen)">
             <i class="ri-check-double-line" aria-hidden="true"></i> نهایی‌سازی
           </button>
@@ -1046,7 +890,7 @@ watch(() => props.visitId, () => {
         </template>
         <span v-if="finalized" class="xr-badge xr-badge--primary">معاینه نهایی شده است</span>
         <span v-if="dirty || rxChanged" class="xr-action-bar__status">تغییرات ذخیره نشده</span>
-        <template v-if="finalized">
+        <template v-if="chart.consultation">
           <RouterLink v-if="nextVisit" :to="`/chart/${nextVisit.id}`" class="btn btn-primary chart-actions__next">
             مریض بعدی: {{ nextVisit.patientName }} <i class="ri-arrow-left-line" aria-hidden="true"></i>
           </RouterLink>
@@ -1055,42 +899,8 @@ watch(() => props.visitId, () => {
       </div>
     </form>
 
-    <UiModal v-if="panel === 'amend'" title="ادامه معاینه و اصلاحیه‌ها" size="lg" @close="panel = null">
-        <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
-        <div v-if="notice" class="alert alert-success" role="status">{{ notice }}</div>
-        <!-- While the visit is open, continuing the exam is the plain way to change it: the dossier above opens again. -->
-        <form v-if="finalized && canEdit && visitOpen" class="row g-3 align-items-end mb-3" @submit.prevent="submitReopen">
-          <h3 class="h6 mb-0">تغییر معاینه نهایی‌شده</h3>
-          <p class="form-hint mb-0">با ثبت دلیل، دوسیه دوباره قابل نوشتن می‌شود و همه چیز حفظ می‌ماند.</p>
-          <div class="col-md-9">
-            <label class="form-label" for="r-reason">دلیل ادامه معاینه</label>
-            <input id="r-reason" v-model="reopen.reason" class="form-control" minlength="3" maxlength="500" required />
-          </div>
-          <div class="col-md-3"><button type="submit" class="btn btn-primary w-100 xr-control-button" :disabled="reopen.saving">ادامه معاینه</button></div>
-        </form>
-        <details v-if="finalized && canEdit" class="amend" :open="!visitOpen">
-          <summary class="h6 mb-3">{{ visitOpen ? 'یا: اصلاح یک بخش بدون باز کردن معاینه' : 'ثبت اصلاحیه' }}</summary>
-          <form @submit.prevent="submitAmend">
-            <div class="row g-3 mb-3">
-              <div class="col-md-4">
-                <label class="form-label" for="a-field">بخش</label>
-                <select id="a-field" v-model="amend.field" class="form-select">
-                  <option v-for="c in amendChoices" :key="c.key" :value="c.key">{{ c.label }}</option>
-                </select>
-              </div>
-              <div class="col-md-8">
-                <label class="form-label" for="a-reason">دلیل اصلاح</label>
-                <input id="a-reason" v-model="amend.reason" class="form-control" minlength="3" maxlength="500" required />
-              </div>
-            </div>
-            <label class="form-label" for="a-value">متن جدید</label>
-            <textarea id="a-value" v-model="amend.value" class="form-control mb-3" dir="auto" rows="4" maxlength="4000"></textarea>
-            <button type="submit" class="btn btn-primary" :disabled="amend.saving">ثبت اصلاحیه</button>
-          </form>
-        </details>
-
+    <UiModal v-if="panel === 'amend'" title="تاریخچه تغییرات" size="lg" @close="panel = null">
         <template v-if="chart.amendments.length">
-          <h3 class="h6 mt-4 mb-3">تاریخچه اصلاحیه‌ها</h3>
           <div class="xr-table-wrap">
             <table class="xr-table">
               <thead><tr><th>فیلد</th><th>قبلی</th><th>جدید</th><th>دلیل</th><th>کاربر</th><th>زمان</th></tr></thead>
@@ -1109,81 +919,7 @@ watch(() => props.visitId, () => {
         </template>
     </UiModal>
 
-      <UiModal v-if="panel === 'optical'" title="نسخه عینک" size="lg" @close="panel = null">
-        <div class="module-panel">
-          <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
-          <div v-if="notice" class="alert alert-success" role="status">{{ notice }}</div>
-        <h3 v-if="chart.opticalPrescriptions.length" class="module-panel__list-title">نسخه‌های ثبت‌شده</h3>
-        <div v-if="chart.opticalPrescriptions.length" class="xr-table-wrap">
-          <table class="xr-table">
-            <thead><tr><th>شماره</th><th>چشم</th><th>SPH</th><th>CYL</th><th>AXIS</th><th>ADD</th><th>PD</th><th></th></tr></thead>
-            <tbody>
-              <template v-for="o in chart.opticalPrescriptions" :key="o.id">
-                <tr>
-                  <td><span class="ltr-num">{{ o.rxNumber }}</span></td>
-                  <td><span class="xr-eye xr-eye--od">OD</span></td>
-                  <td><span class="ltr-num">{{ o.sphereOd ?? '—' }}</span></td>
-                  <td><span class="ltr-num">{{ o.cylinderOd ?? '—' }}</span></td>
-                  <td><span class="ltr-num">{{ o.axisOd ?? '—' }}</span></td>
-                  <td><span class="ltr-num">{{ o.addOd ?? '—' }}</span></td>
-                  <td><span class="ltr-num">{{ o.pd ?? '—' }}</span></td>
-                  <td class="text-nowrap">
-                    <RouterLink v-if="auth.can('opticalrx.print')" :to="`/print/optical/${o.id}`" target="_blank" class="btn btn-soft btn-sm">چاپ</RouterLink>
-                    <button v-if="!o.isCancelled && auth.can('opticalrx.edit')" type="button" class="btn btn-soft btn-sm ms-2" @click="editOptical(o)">ویرایش</button>
-                    <button v-if="!o.isCancelled && auth.can('opticalrx.cancel')" type="button" class="btn btn-soft-danger btn-sm ms-2" @click="cancelOptical(o)">لغو</button>
-                  </td>
-                </tr>
-                <tr>
-                  <td></td>
-                  <td><span class="xr-eye xr-eye--os">OS</span></td>
-                  <td><span class="ltr-num">{{ o.sphereOs ?? '—' }}</span></td>
-                  <td><span class="ltr-num">{{ o.cylinderOs ?? '—' }}</span></td>
-                  <td><span class="ltr-num">{{ o.axisOs ?? '—' }}</span></td>
-                  <td><span class="ltr-num">{{ o.addOs ?? '—' }}</span></td>
-                  <td></td>
-                  <td></td>
-                </tr>
-              </template>
-            </tbody>
-          </table>
-        </div>
-        <p v-else-if="!opticalFormOpen" class="xr-state">نسخه عینک ثبت نشده است.</p>
-        <button v-if="auth.can('opticalrx.create') && !opticalFormOpen && !optical.editing" type="button" class="btn btn-primary module-panel__create" @click="opticalFormOpen = true"><i class="ri-add-line" aria-hidden="true"></i> نسخه عینک جدید</button>
-        <form v-if="opticalFormOpen || optical.editing" class="module-panel__form" @submit.prevent="submitOptical">
-          <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
-            <h3 class="h6 mb-0">{{ optical.editing ? `ویرایش نسخه ${optical.editing.rxNumber}` : 'نسخه عینک جدید' }}</h3>
-            <button v-if="finalLines" type="button" class="btn btn-soft btn-sm" @click="copyFinalToOptical">انتقال از نسخه نهایی بینایی‌سنجی</button>
-          </div>
-          <RxGrid :od="optical.od" :os="optical.os" label="نسخه عینک" show-add show-va />
-          <div class="row g-3 mt-1 mb-3">
-            <div class="col-md-2 col-6">
-              <label class="form-label" for="op-pd">PD</label>
-              <input id="op-pd" v-model="optical.pd" class="form-control" dir="ltr" maxlength="10" autocomplete="off" />
-            </div>
-            <div class="col-md-2 col-6">
-              <label class="form-label" for="op-uva-od"><span class="xr-eye xr-eye--od">OD</span> دید بدون عینک</label>
-              <input id="op-uva-od" v-model="optical.uvaOd" class="form-control" dir="ltr" maxlength="30" autocomplete="off" />
-            </div>
-            <div class="col-md-2 col-6">
-              <label class="form-label" for="op-uva-os"><span class="xr-eye xr-eye--os">OS</span> دید بدون عینک</label>
-              <input id="op-uva-os" v-model="optical.uvaOs" class="form-control" dir="ltr" maxlength="30" autocomplete="off" />
-            </div>
-            <div class="col-md-6">
-              <label class="form-label" for="op-notes">توضیحات</label>
-              <input id="op-notes" v-model="optical.notes" class="form-control" maxlength="700" />
-            </div>
-            <div class="col-12"><LensPicker v-model="optical.lens" /></div>
-            <div v-if="optical.editing && needsAmendReason" class="col-12">
-              <label class="form-label" for="op-reason">دلیل اصلاح</label>
-              <input id="op-reason" v-model="optical.reason" class="form-control" minlength="3" maxlength="500" required />
-            </div>
-          </div>
-          <button type="submit" class="btn btn-primary" :disabled="optical.saving">{{ optical.editing ? 'ذخیره ویرایش' : 'ثبت نسخه عینک' }}</button>
-          <button v-if="optical.editing" type="button" class="btn btn-soft-danger ms-2" @click="clearOptical">انصراف</button>
-        </form>
-      </div></UiModal>
-
-      <UiModal v-if="panel === 'lab'" title="درخواست تشخیصی" size="lg" @close="panel = null">
+      <UiModal v-if="panel === 'lab'" title="درخواست تشخیصی" size="xl" @close="panel = null">
         <div class="module-panel">
           <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
           <div v-if="notice" class="alert alert-success" role="status">{{ notice }}</div>
@@ -1212,12 +948,20 @@ watch(() => props.visitId, () => {
         <AttachmentPanel v-if="attachmentsFor" :key="attachmentsFor" owner-type="DiagnosticOrder" :owner-id="attachmentsFor" :can-upload="false" />
         <button v-if="auth.can('diagnostics.create') && !orderFormOpen" type="button" class="btn btn-primary module-panel__create" @click="orderFormOpen = true"><i class="ri-add-line" aria-hidden="true"></i> درخواست تشخیصی جدید</button>
         <form v-if="orderFormOpen" class="row g-3 align-items-end module-panel__form" @submit.prevent="submitOrder">
-          <div class="col-md-5">
+          <div class="col-md-4">
             <UiComboBox v-model="order.testId" label="درخواست" :options="tests" :loading="testsLoading" required chip />
           </div>
-          <div class="col-md-5">
+          <div class="col-md-3">
             <label class="form-label" for="o-note">توضیح</label>
             <input id="o-note" v-model="order.note" class="form-control" maxlength="500" />
+          </div>
+          <div class="col-md-3">
+            <label class="form-label" for="o-discount">تخفیف</label>
+            <div class="input-group">
+              <input id="o-discount" v-model.number="order.discount" class="form-control" type="number" min="0" step="0.01" :max="order.discountMode === 'Percent' ? 100 : orderPrice" :disabled="!orderPrice" />
+              <select v-model="order.discountMode" class="form-select" style="max-width: 82px" :disabled="!orderPrice"><option value="Amount">AFN</option><option value="Percent">%</option></select>
+            </div>
+            <small v-if="orderPrice" class="form-text">تعرفه {{ money(orderPrice) }} · قابل پرداخت {{ money(orderFinal) }}</small>
           </div>
           <div class="col-md-2"><button type="submit" class="btn btn-primary w-100 xr-control-button" :disabled="order.saving">درخواست</button></div>
           <div v-if="orderKind === 'Imaging'" class="col-12">
@@ -1229,7 +973,7 @@ watch(() => props.visitId, () => {
         </form>
       </div></UiModal>
 
-      <UiModal v-if="panel === 'surgery'" title="ارجاع به عملیات" size="lg" @close="panel = null">
+      <UiModal v-if="panel === 'surgery'" title="ارجاع به عملیات" size="xl" @close="panel = null">
         <div class="module-panel">
           <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
           <div v-if="notice" class="alert alert-success" role="status">{{ notice }}</div>
@@ -1253,16 +997,8 @@ watch(() => props.visitId, () => {
         <p v-else-if="!surgeryFormOpen" class="xr-state">پرونده عملیاتی ثبت نشده است.</p>
         <button v-if="auth.can('surgery.create') && !surgeryFormOpen" type="button" class="btn btn-primary module-panel__create" @click="surgeryFormOpen = true"><i class="ri-add-line" aria-hidden="true"></i> ارجاع جدید به عملیات</button>
         <form v-if="surgeryFormOpen" class="row g-3 align-items-end module-panel__form" @submit.prevent="submitSurgery">
-          <div v-if="packages.length" class="col-12">
-            <UiComboBox v-model="surgery.packageId" label="پکیج عملیات" :options="packageOptions" chip placeholder="بدون پکیج — نوع و خدمت را خودتان وارد کنید" />
-            <p class="form-hint mb-0">با انتخاب پکیج، نوع عملیات و فیس آن خودکار پر می‌شود و مواد مصرفی آن پس از عملیات از گدام کسر می‌شود.</p>
-          </div>
-          <div class="col-md-4">
-            <label class="form-label" for="s-type">نوع عملیات</label>
-            <input id="s-type" v-model="surgery.surgeryType" class="form-control" maxlength="200" required />
-          </div>
           <div class="col-md-3">
-            <UiComboBox v-model="surgery.serviceId" label="خدمت قابل پرداخت" :options="services" required :disabled="surgery.packageId !== null" />
+            <UiComboBox v-model="surgery.operationDefinitionId" label="عملیات" :options="operationOptions" required chip />
           </div>
           <div class="col-md-2">
             <label class="form-label" for="s-eye">چشم</label>
@@ -1270,7 +1006,21 @@ watch(() => props.visitId, () => {
               <option v-for="(label, value) in eyeLabels" :key="value" :value="value">{{ label }}</option>
             </select>
           </div>
-          <div class="col-md-3"><button type="submit" class="btn btn-primary w-100 xr-control-button" :disabled="surgery.saving">ارجاع به عملیات</button></div>
+          <div class="col-md-2">
+            <label class="form-label" for="s-amount">مبلغ عملیات</label>
+            <input id="s-amount" v-model.number="surgery.amount" class="form-control" type="number" min="0.01" step="0.01" :placeholder="surgeryBasePrice ? String(surgeryBasePrice) : ''" />
+          </div>
+          <div class="col-md-3">
+            <label class="form-label" for="s-discount">تخفیف</label>
+            <div class="input-group">
+              <input id="s-discount" v-model.number="surgery.discount" class="form-control" type="number" min="0" step="0.01" :max="surgery.discountMode === 'Percent' ? 100 : surgeryBasePrice" />
+              <select v-model="surgery.discountMode" class="form-select" style="max-width: 82px"><option value="Amount">AFN</option><option value="Percent">%</option></select>
+            </div>
+          </div>
+          <div class="col-md-2"><button type="submit" class="btn btn-primary w-100 xr-control-button" :disabled="surgery.saving">ارجاع به عملیات</button></div>
+          <div class="col-12">
+            <p class="form-hint mb-0">تعرفه {{ money(selectedOperation?.price ?? 0) }} · مبلغ نهایی {{ money(surgeryFinal) }}. موجودی پکیج پس از تسویهٔ کامل فیس کسر می‌شود.</p>
+          </div>
         </form>
       </div></UiModal>
 
@@ -1328,6 +1078,8 @@ watch(() => props.visitId, () => {
 </template>
 
 <style scoped>
+.refraction-result-preview { overflow-x: auto; }
+.refraction-result-preview :deep(.refraction-prescription) { min-width: 900px; }
 .chart-shell {
   display: grid;
   gap: 12px;
@@ -1359,49 +1111,84 @@ watch(() => props.visitId, () => {
   min-width: 0;
 }
 
-/* Everything ordered beside the paper sits in one strip: one click opens the form for it. */
+/* Small report-style action items keep the dossier header calm and space-efficient. */
 .chart-orders {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
 
-.chart-orders__label {
-  color: var(--xr-text-muted);
-  font-size: 13px;
-  font-weight: 600;
-}
-
 .chart-orders__group {
-  display: inline-flex;
-  overflow: hidden;
-  border: 1px solid var(--xr-border);
-  border-radius: 8px;
-  background: var(--xr-surface, #fff);
+  display: flex;
+  flex: 1;
+  gap: 6px;
+  min-width: 0;
 }
 
 .chart-orders__item {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 14px;
-  border: 0;
-  border-inline-start: 1px solid var(--xr-border);
-  background: transparent;
+  flex: 1 1 0;
+  gap: 7px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 5px 9px;
+  border: 1px solid var(--xr-border);
+  border-radius: 9px;
+  background: var(--xr-surface, #fff);
   color: var(--xr-text);
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.chart-orders__item:first-child {
-  border-inline-start: 0;
+  text-align: start;
+  transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
 }
 
 .chart-orders__item:hover,
 .chart-orders__item:focus-visible {
-  background: color-mix(in srgb, var(--xr-primary) 10%, transparent);
-  color: var(--xr-primary);
+  border-color: color-mix(in srgb, var(--action-accent) 48%, var(--xr-border));
+  background: color-mix(in srgb, var(--action-accent) 6%, #fff);
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--action-accent) 12%, transparent);
+  outline: none;
+}
+
+.chart-orders__item--optical { --action-accent: #2676a8; }
+.chart-orders__item--lab { --action-accent: #258b79; }
+.chart-orders__item--surgery { --action-accent: #8a5aaa; }
+
+.chart-orders__icon {
+  display: grid;
+  flex: 0 0 29px;
+  place-items: center;
+  width: 29px;
+  height: 29px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--action-accent) 12%, #fff);
+  color: var(--action-accent);
+  font-size: 16px;
+}
+
+.chart-orders__copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.chart-orders__copy strong {
+  display: block;
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chart-orders__badges {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+.chart-orders__arrow {
+  flex: 0 0 auto;
+  color: var(--xr-text-muted);
+  font-size: 13px;
 }
 
 .chart-orders__end {
@@ -1489,8 +1276,9 @@ watch(() => props.visitId, () => {
   flex-wrap: wrap;
   gap: 2px;
   padding: 2px;
+  border: 1px solid var(--xr-switch-border);
   border-radius: 8px;
-  background: var(--xr-page-bg);
+  background: var(--xr-switch-bg);
 }
 
 .results__tab {
@@ -1506,9 +1294,9 @@ watch(() => props.visitId, () => {
 }
 
 .results__tab--active {
-  background: var(--xr-surface);
-  box-shadow: var(--xr-shadow-card);
-  color: var(--xr-text);
+  background: var(--xr-switch-on);
+  box-shadow: var(--xr-switch-on-shadow);
+  color: #fff;
   font-weight: 600;
 }
 
@@ -1520,6 +1308,7 @@ watch(() => props.visitId, () => {
 
 .results__dot--ready { background: var(--xr-status-green); }
 .results__dot--wait { background: var(--xr-status-orange); }
+.results__tab--active .results__dot { box-shadow: 0 0 0 2px #fff; }
 
 .results__item {
   display: grid;
@@ -1556,10 +1345,6 @@ watch(() => props.visitId, () => {
 
 .chart-actions__next {
   margin-inline-start: auto;
-}
-
-.amend summary {
-  cursor: pointer;
 }
 
 .chart-dossier {
@@ -1724,8 +1509,13 @@ watch(() => props.visitId, () => {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 6px 12px;
   }
-  .chart-orders__label { display: none; }
-  .chart-orders__group { flex: 1; flex-wrap: wrap; min-width: 0; }
-  .chart-orders__item { flex: 1 0 auto; min-height: 44px; justify-content: center; padding-inline: 10px; }
+  .chart-orders { flex-wrap: wrap; gap: 6px; align-items: stretch; }
+  .chart-orders__group { flex-basis: 100%; flex-wrap: wrap; gap: 4px; }
+  .chart-orders__item { flex: 1 1 150px; }
+  .chart-orders__item { min-height: 42px; padding-inline: 7px; }
+  .chart-orders__icon { flex-basis: 27px; width: 27px; height: 27px; }
+  .chart-orders__copy strong { font-size: 11.5px; }
+  .chart-orders__arrow { display: none; }
+  .chart-orders__end { margin-inline-start: auto; }
 }
 </style>

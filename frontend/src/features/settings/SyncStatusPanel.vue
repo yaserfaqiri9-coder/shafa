@@ -7,6 +7,8 @@ import { latinDigits, formatDateTime } from '@/utils/date'
 interface SyncStatus {
   mode: 'local' | 'mirror'
   enabled: boolean
+  configured: boolean
+  configurationProblem?: string | null
   lastSuccessAt: string | null
   lastAttemptAt: string | null
   lastError: string | null
@@ -19,6 +21,7 @@ const auth = useAuthStore()
 const status = ref<SyncStatus | null>(null)
 const error = ref('')
 const notice = ref('')
+const saving = ref(false)
 let timer: ReturnType<typeof setTimeout> | undefined
 
 async function load() {
@@ -37,10 +40,25 @@ async function runNow() {
   notice.value = ''
   try {
     await api('/sync/run', { method: 'POST' })
-    notice.value = 'همگام‌سازی شروع شد.'
-    setTimeout(load, 5000)
+    notice.value = 'درخواست همگام‌سازی ثبت شد؛ نتیجه پس از پایان نمایش داده می‌شود.'
+    await load()
   } catch (cause) {
     error.value = errorMessage(cause)
+  }
+}
+
+async function setEnabled(event: Event) {
+  const checked = (event.target as HTMLInputElement).checked
+  saving.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    status.value = await api<SyncStatus>('/sync/enabled', { method: 'PUT', body: { enabled: checked } })
+  } catch (cause) {
+    error.value = errorMessage(cause)
+    ;(event.target as HTMLInputElement).checked = status.value?.enabled ?? false
+  } finally {
+    saving.value = false
   }
 }
 
@@ -54,8 +72,12 @@ onBeforeUnmount(() => clearTimeout(timer))
     <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
     <div v-if="notice" class="alert alert-success" role="status">{{ notice }}</div>
     <template v-if="status && status.mode === 'local'">
+      <label v-if="auth.can('settings.edit')" class="form-check mb-3">
+        <input class="form-check-input" type="checkbox" :checked="status.enabled" :disabled="saving" @change="setEnabled" />
+        <span class="form-check-label">فعال‌سازی همگام‌سازی آنلاین</span>
+      </label>
       <div v-if="!status.enabled" class="alert alert-secondary" role="status">
-        همگام‌سازی آنلاین روی این سرور تنظیم نشده است. کار شفاخانه به آن وابسته نیست.
+        {{ status.configured ? 'همگام‌سازی خاموش است؛ تغییرات محلی محفوظ می‌مانند.' : status.configurationProblem || 'اتصال امن اولیه هنوز تأیید نشده است؛ آماده‌سازی یک‌باره توسط مدیر فنی لازم است.' }}
       </div>
       <template v-else>
         <p class="form-hint">
@@ -74,7 +96,7 @@ onBeforeUnmount(() => clearTimeout(timer))
             <strong :class="status.connected ? 'text-success' : 'text-danger'">{{ status.connected === null ? '—' : status.connected ? 'وصل' : 'قطع' }}</strong>
           </div>
         </div>
-        <button v-if="auth.can('settings.edit')" type="button" class="btn btn-outline-primary" @click="runNow">همگام‌سازی همین حالا</button>
+        <button v-if="auth.can('settings.edit')" type="button" class="btn btn-outline-primary" @click="runNow">همگام‌سازی حالا</button>
       </template>
     </template>
   </section>

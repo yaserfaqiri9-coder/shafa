@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { api, errorMessage } from '@/api/http'
+import UiInactiveToggle, { useInactiveFilter } from '@/components/UiInactiveToggle.vue'
 import UiModal from '@/components/UiModal.vue'
 import { useAuthStore } from '@/stores/auth'
 import { money, quantity } from '@/utils/money'
@@ -10,6 +11,7 @@ const auth = useAuthStore()
 const canEdit = computed(() => auth.can('surgery.approve'))
 
 const rows = ref<SurgeryPackage[]>([])
+const { showInactive, shown, inactiveCount } = useInactiveFilter(rows)
 const locations = ref<SupplyLocation[]>([])
 const loading = ref(true)
 const error = ref('')
@@ -94,13 +96,14 @@ onMounted(async () => {
       <button v-if="canEdit" type="button" class="btn btn-primary text-nowrap" @click="open(null)"><i class="ri-add-line" aria-hidden="true"></i> پکیج جدید</button>
     </div>
     <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
+    <div class="mb-2"><UiInactiveToggle v-model="showInactive" :count="inactiveCount" /></div>
     <div v-if="loading" class="xr-state" role="status">در حال بارگذاری...</div>
     <div v-else-if="rows.length === 0" class="xr-state">هنوز پکیجی ساخته نشده است.</div>
     <div v-else class="xr-table-wrap">
       <table class="xr-table">
         <thead><tr><th>پکیج</th><th>قیمت خرید</th><th>قیمت فروش</th><th>موجودی</th><th>وضعیت</th><th v-if="canEdit"><span class="visually-hidden">عملیات</span></th></tr></thead>
         <tbody>
-          <tr v-for="p in rows" :key="p.id">
+          <tr v-for="p in shown" :key="p.id">
             <td><strong>{{ p.name }}</strong><div class="xr-meta">{{ p.locationName }}</div></td>
             <td>{{ p.costPrice === null ? '—' : money(p.costPrice) }}</td>
             <td>{{ p.price === null ? '—' : money(p.price) }}</td>

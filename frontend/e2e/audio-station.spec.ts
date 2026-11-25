@@ -68,9 +68,9 @@ test('with no station online, a call plays on the computer that pressed the butt
   await expect(nurse.page.getByRole('status').filter({ hasText: 'فراخوان از بلندگوی همین رایانه پخش می‌شود' })).toBeVisible()
 
   const number = visit.queueNumber.toLocaleString('fa-AF', { useGrouping: false })
-  await nurse.page.getByRole('button', { name: `فراخوان نوبت ${number}`, exact: true }).click()
+  await nurse.page.getByRole('button', { name: `صدا زدن نوبت ${number}`, exact: true }).click()
   await expect.poll(async () => (await audio(nurse.page)).ended.length, { timeout: 30_000 }).toBe(1)
-  await expect(nurse.page.getByRole('row').filter({ hasText: number }).getByText('اعلان شد')).toBeVisible({ timeout: 15_000 })
+  await expect(nurse.page.getByRole('group', { name: `فراخوان نوبت ${number}`, exact: true }).getByText(/اعلان شد/)).toBeVisible({ timeout: 15_000 })
 
   await reception.context.close()
   await nurse.context.close()
@@ -99,8 +99,8 @@ test('calls play once, one at a time, survive a network outage without repeats, 
   await page.goto('/audio-station')
   await expect(page.getByText('غیرفعال')).toBeVisible()
   const faNumber = (visit: { queueNumber: number }) => visit.queueNumber.toLocaleString('fa-AF', { useGrouping: false })
-  const callButton = (visit: { queueNumber: number }, label = 'فراخوان') => nurse.page.getByRole('button', { name: `${label} نوبت ${faNumber(visit)}`, exact: true })
-  const nurseRow = (visit: { queueNumber: number }) => nurse.page.getByRole('row').filter({ has: nurse.page.getByRole('group', { name: `فراخوان نوبت ${faNumber(visit)}`, exact: true }) })
+  const callButton = (visit: { queueNumber: number }, label = 'صدا زدن') => nurse.page.getByRole('button', { name: `${label} نوبت ${faNumber(visit)}`, exact: true })
+  const nurseRow = (visit: { queueNumber: number }) => nurse.page.getByRole('group', { name: `فراخوان نوبت ${faNumber(visit)}`, exact: true })
 
   // The dedicated role reaches the station page and nothing about patients.
   const speaker = await staff(browser, page, 'AudioStation')
@@ -130,7 +130,7 @@ test('calls play once, one at a time, survive a network outage without repeats, 
   // Two desks pressing at nearly the same moment: each is heard whole, one after the other.
   const colleague = await staff(browser, page, 'Triage')
   await colleague.page.goto('/triage')
-  const colleagueButton = colleague.page.getByRole('button', { name: `فراخوان نوبت ${faNumber(second)}`, exact: true })
+  const colleagueButton = colleague.page.getByRole('button', { name: `صدا زدن نوبت ${faNumber(second)}`, exact: true })
   await Promise.all([callButton(first).click(), colleagueButton.click()])
   await expect.poll(async () => (await audio(page)).ended.length, { timeout: 30_000 }).toBe(2)
   const heard = await audio(page)
@@ -160,16 +160,15 @@ test('calls play once, one at a time, survive a network outage without repeats, 
   expect((await audio(page)).started).toHaveLength(1)
 
   // Recall is a person's decision: a new event repeats the same recorded announcement.
-  await callButton(first, 'فراخوان مجدد').click()
+  await callButton(first, 'صدا زدن دوباره').click()
   await expect.poll(async () => (await audio(page)).ended.length, { timeout: 30_000 }).toBe(2)
 
   // Missing-file recovery and unsupported audio are covered by the isolated recorded-audio suite.
 
-  // Attendance is recorded on the row and does not move the patient.
-  await nurse.page.getByRole('button', { name: `گزینه‌های بیشتر نوبت ${faNumber(first)}`, exact: true }).click()
-  await nurse.page.getByRole('menuitem', { name: `نوبت ${faNumber(first)} حاضر شد` }).click()
-  await expect(nurseRow(first).getByText('حاضر شد', { exact: true })).toBeVisible()
-  await expect(nurseRow(first).getByText('ثبت‌شده')).toBeVisible()
+  // Absence is recorded on the row and does not move the patient; one click brings them back.
+  await nurse.page.getByRole('button', { name: `نوبت ${faNumber(first)} نیامد`, exact: true }).click()
+  await nurse.page.getByRole('button', { name: `نوبت ${faNumber(first)} آمد`, exact: true }).click()
+  await expect(nurseRow(first)).toBeVisible()
 
   await reception.context.close()
   await nurse.context.close()

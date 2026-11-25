@@ -14,9 +14,95 @@ namespace AlShifa.Tests;
 
 /// <summary>The single flow: patient and visit at the desk, payment at the cashier, then a queue number issued by the payment itself.</summary>
 [Collection("api")]
-public sealed class AdmissionFlowTests(ApiFixture api)
+public sealed class AdmissionFlowTests(ApiFixture api) : PhysicalQueueTestScope(api)
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    [Fact]
+    public async Task Physical_card_is_required_and_same_day_duplicate_is_rejected_across_departments()
+    {
+        var desk = await api.FeeDeskAsync();
+        var first = await NewPatientAsync();
+        var other = await NewPatientAsync();
+        var department = await api.DepartmentIdAsync("triage");
+        foreach (var number in new int?[] { null, 0, -1, 101 }) {
+            var refused = await desk.SendAsync(ApiFixture.Keyed("/api/admissions", new CreateAdmissionRequest(first.Id, department, null, null, QueueNumber: number)));
+            Assert.Equal(HttpStatusCode.BadRequest, refused.StatusCode);
+        }
+        Assert.Equal(0, await InDbAsync(db => db.Invoices.CountAsync(i => i.PatientId == first.Id)));
+        var request = new CreateAdmissionRequest(first.Id, department, null, null, QueueNumber: 17);
+        var key = Guid.NewGuid().ToString("N");
+        var admitted = await Read<AdmissionRow>(await desk.SendAsync(ApiFixture.Keyed("/api/admissions", request, key)), HttpStatusCode.Created);
+        Assert.Equal(17, admitted.QueueNumber);
+        var retry = await desk.SendAsync(ApiFixture.Keyed("/api/admissions", request, key));
+        Assert.True(retry.IsSuccessStatusCode, await retry.Content.ReadAsStringAsync());
+        Assert.Equal(admitted.VisitId, (await retry.Content.ReadFromJsonAsync<AdmissionRow>(JsonOptions))!.VisitId);
+        await AssertRefused(await desk.SendAsync(ApiFixture.Keyed("/api/admissions", new CreateAdmissionRequest(other.Id, await api.DepartmentIdAsync("doctor"), null, null, QueueNumber: 17))), "queue_number_taken");
+        await AssertRefused(await desk.SendAsync(ApiFixture.Keyed("/api/visit-tokens", new CreateVisitTokenRequest(department, null, 17))), "queue_number_taken");
+        Assert.Equal(0, await InDbAsync(db => db.Invoices.CountAsync(i => i.PatientId == other.Id)));
+        var paid = await PayAsync(admitted);
+        Assert.Equal(17, paid.QueueNumber);
+        Assert.Equal(17, (await InDbAsync(db => db.Visits.SingleAsync(v => v.Id == admitted.VisitId))).QueueNumber);
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
+    public async Task Simultaneous_registration_of_one_physical_card_commits_one_visit_and_one_fee()
+    {
+        var desk = await api.FeeDeskAsync();
+        var patients = new List<PatientDto>();
+        for (var i = 0; i < 4; i++) patients.Add(await NewPatientAsync());
+        var department = await api.DepartmentIdAsync("triage");
+        var responses = await Task.WhenAll(patients.Select(p => desk.SendAsync(ApiFixture.Keyed("/api/admissions", new CreateAdmissionRequest(p.Id, department, null, null, QueueNumber: 100)))));
+        Assert.Single(responses, r => r.StatusCode == HttpStatusCode.Created);
+        Assert.All(responses.Where(r => r.StatusCode != HttpStatusCode.Created), r => Assert.Equal(HttpStatusCode.Conflict, r.StatusCode));
+        var ids = patients.Select(p => p.Id).ToList();
+        Assert.Equal(1, await InDbAsync(db => db.Visits.CountAsync(v => ids.Contains(v.PatientId))));
+        Assert.Equal(1, await InDbAsync(db => db.Invoices.CountAsync(v => v.PatientId != null && ids.Contains(v.PatientId.Value))));
+        var slot = QueueCard.Slot(await InDbAsync(db => db.Visits.Where(v => ids.Contains(v.PatientId)).Select(v => v.QueueShift).SingleAsync()), 100);
+        Assert.Equal(1, await InDbAsync(db => db.QueueCards.CountAsync(c => c.Day == KabulClock.Today && c.Number == slot)));
+    }
+
+    [Fact]
+    public async Task Card_registry_is_unique_in_the_database_and_the_same_card_is_available_next_day()
+    {
+        var date = KabulClock.Today.AddDays(100);
+        await InDbAsync(async db => {
+            await using var tx = await db.BeginWorkflowTransactionAsync(default);
+            var cards = new QueueNumberService(db);
+            Assert.Equal(3, await cards.ReserveAsync(date, QueueShift.Morning, 3, default));
+            Assert.Equal(3, await cards.ReserveAsync(date.AddDays(1), QueueShift.Morning, 3, default));
+            await tx.CommitAsync();
+            return 0;
+        });
+        using var scope = api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        db.QueueCards.Add(new QueueCard { Day = date, Number = 3 });
+        await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync());
+        Assert.Equal(2, await InDbAsync(d => d.QueueCards.CountAsync(c => c.Day >= date && c.Number == 3)));
+    }
+
+    [Fact]
+    public async Task Afternoon_cards_restart_at_one_and_stay_unique_within_the_shift()
+    {
+        var date = KabulClock.Today.AddDays(200);
+        await InDbAsync(async db => {
+            await using var tx = await db.BeginWorkflowTransactionAsync(default);
+            var cards = new QueueNumberService(db);
+            Assert.Equal(1, await cards.ReserveAsync(date, QueueShift.Morning, 1, default));
+            Assert.Equal(1, await cards.ReserveAsync(date, QueueShift.Afternoon, 1, default));
+            Assert.Equal(100, await cards.ReserveAsync(date, QueueShift.Afternoon, 100, default));
+            await tx.CommitAsync();
+            return 0;
+        });
+        await InDbAsync(async db => {
+            await using var tx = await db.BeginWorkflowTransactionAsync(default);
+            var error = await Assert.ThrowsAsync<AppException>(() => new QueueNumberService(db).ReserveAsync(date, QueueShift.Afternoon, 1, default));
+            Assert.Equal("queue_number_taken", error.Code);
+            return 0;
+        });
+        Assert.Equal([1, 101, 200], await InDbAsync(db => db.QueueCards.Where(c => c.Day == date).OrderBy(c => c.Number).Select(c => c.Number).ToListAsync()));
+    }
+
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } };
 
     private static string Name(string prefix) => $"{prefix}_{Guid.NewGuid():N}"[..20];
 
@@ -65,7 +151,7 @@ public sealed class AdmissionFlowTests(ApiFixture api)
         var desk = await api.FeeDeskAsync();
         var id = patientId ?? (await NewPatientAsync()).Id;
         return await Read<AdmissionRow>(await desk.SendAsync(ApiFixture.Keyed("/api/admissions",
-            new CreateAdmissionRequest(id, await api.DepartmentIdAsync("triage"), null, "تاری دید"))), HttpStatusCode.Created);
+            new CreateAdmissionRequest(id, await api.DepartmentIdAsync("triage"), null, "تاری دید", QueueNumber: api.NextPhysicalCard()))), HttpStatusCode.Created);
     }
 
     private static HttpRequestMessage PayRequest(AdmissionRow row, string? key = null) =>
@@ -107,7 +193,7 @@ public sealed class AdmissionFlowTests(ApiFixture api)
 
         var receipt = await cashier.GetFromJsonAsync<JsonElement>($"/api/print/receipt/{payment.Id}");
         var number = receipt.GetProperty("fields").EnumerateArray().Single(f => f.GetProperty("label").GetString() == "شماره نوبت");
-        Assert.Equal(issued.ToString(), number.GetProperty("value").GetString());
+        Assert.Equal($"{issued} ({QueueShifts.Label(row.QueueShift, row.QueueRound)})", number.GetProperty("value").GetString());
     }
 
     [Fact]
@@ -132,7 +218,10 @@ public sealed class AdmissionFlowTests(ApiFixture api)
 
         await AssertRefused(await triage.PutAsJsonAsync($"/api/pre-examinations/{row.VisitId}", new SavePreExamRequest(null, null, "6/9", "6/9", null, null, null, null, null)), "payment_required");
         var slip = await desk.GetFromJsonAsync<JsonElement>($"/api/print/visit/{row.VisitId}");
-        Assert.Contains(slip.GetProperty("totals").EnumerateArray(), f => f.GetProperty("label").GetString() == "شماره نوبت" && f.GetProperty("value").GetString() == row.QueueNumber.ToString());
+        Assert.Contains(slip.GetProperty("totals").EnumerateArray(), f => f.GetProperty("label").GetString() == $"شماره نوبت ({QueueShifts.Label(row.QueueShift, row.QueueRound)})" && f.GetProperty("value").GetString() == row.QueueNumber.ToString());
+        Assert.True(slip.GetProperty("hideNumber").GetBoolean());
+        Assert.Equal(row.QueueNumber.ToString(), slip.GetProperty("highlight").GetProperty("value").GetString());
+        Assert.DoesNotContain(slip.GetProperty("fields").EnumerateArray(), f => f.GetProperty("value").GetString() == row.VisitNumber);
         Assert.Contains(slip.GetProperty("fields").EnumerateArray(), f => f.GetProperty("label").GetString() == "قابل پرداخت در صندوق" && !string.IsNullOrEmpty(f.GetProperty("value").GetString()));
 
         var paid = await PayAsync(row);
@@ -202,7 +291,7 @@ public sealed class AdmissionFlowTests(ApiFixture api)
         var department = await api.DepartmentIdAsync("triage");
 
         var responses = await Task.WhenAll(Enumerable.Range(0, 4).Select(_ =>
-            desk.SendAsync(ApiFixture.Keyed("/api/admissions", new CreateAdmissionRequest(patient.Id, department, null, null)))));
+            desk.SendAsync(ApiFixture.Keyed("/api/admissions", new CreateAdmissionRequest(patient.Id, department, null, null, QueueNumber: api.NextPhysicalCard())))));
         Assert.Single(responses, r => r.StatusCode == HttpStatusCode.Created);
         Assert.All(responses.Where(r => r.StatusCode != HttpStatusCode.Created), r => Assert.Equal(HttpStatusCode.Conflict, r.StatusCode));
         Assert.Equal(1, await InDbAsync(db => db.Visits.CountAsync(v => v.PatientId == patient.Id)));
@@ -271,6 +360,34 @@ public sealed class AdmissionFlowTests(ApiFixture api)
     }
 
     [Fact]
+    public async Task Cashier_settlement_uses_the_discounted_fee_to_open_the_triage_queue()
+    {
+        var cashier = await UserAsync(Roles.Cashier);
+        var registerId = await InDbAsync(async db =>
+        {
+            var register = new CashRegister { Name = Name("cash") };
+            db.CashRegisters.Add(register);
+            await db.SaveChangesAsync();
+            return register.Id;
+        });
+        Assert.Equal(HttpStatusCode.Created, (await cashier.PostAsJsonAsync("/api/cash/sessions", new OpenSessionRequest(registerId, 0))).StatusCode);
+
+        var admission = await AdmitAsync();
+        var receipt = await Read<PaymentRow>(await cashier.SendAsync(ApiFixture.Keyed("/api/payments/settle",
+            new CashierSettlementRequest(admission.InvoiceId, 40, admission.InvoiceVersion, new SettlementDiscount(60, DiscountMode.Amount)))), HttpStatusCode.Created);
+        // The fixture's visit fee is 100: 60 discounted, 40 received in cash.
+        Assert.Equal(40m, receipt.Amount);
+        Assert.Equal(admission.QueueNumber, receipt.QueueNumber);
+
+        var desk = await api.FeeDeskAsync();
+        var settled = (await desk.GetFromJsonAsync<AdmissionRow>($"/api/admissions/{admission.VisitId}", JsonOptions))!;
+        Assert.Equal(60m, settled.Discount);
+        Assert.Equal(0m, settled.Balance);
+        Assert.Equal(nameof(VisitStatus.Waiting), settled.Status);
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
     public async Task A_payment_left_without_a_number_is_recovered_without_taking_money_again()
     {
         var desk = await api.FeeDeskAsync();
@@ -289,7 +406,9 @@ public sealed class AdmissionFlowTests(ApiFixture api)
         Assert.True(listed.Paid);
         Assert.Null(listed.QueueNumber);
 
-        var responses = await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => desk.PostAsync($"/api/admissions/{row.VisitId}/issue-number", null)));
+        await AssertRefused(await desk.PostAsync($"/api/admissions/{row.VisitId}/issue-number", null), "queue_number_required");
+        var card = api.NextPhysicalCard();
+        var responses = await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => desk.PostAsJsonAsync($"/api/admissions/{row.VisitId}/reserve-number", new AssignQueueNumberRequest(card))));
         var recovered = await Task.WhenAll(responses.Select(r => Read<AdmissionRow>(r)));
         Assert.Single(recovered.Select(r => r.QueueNumber).Distinct());
         Assert.NotNull(recovered[0].QueueNumber);
@@ -312,7 +431,8 @@ public sealed class AdmissionFlowTests(ApiFixture api)
             await db.VisitTokens.Where(t => t.VisitId == row.VisitId).ExecuteUpdateAsync(s => s.SetProperty(t => t.QueueNumber, (int?)null));
             return await db.Visits.Where(v => v.Id == row.VisitId).ExecuteUpdateAsync(s => s.SetProperty(v => v.QueueNumber, (int?)null));
         });
-        var responses = await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => desk.PostAsync($"/api/admissions/{row.VisitId}/reserve-number", null)));
+        var card = api.NextPhysicalCard();
+        var responses = await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => desk.PostAsJsonAsync($"/api/admissions/{row.VisitId}/reserve-number", new AssignQueueNumberRequest(card))));
         var rows = await Task.WhenAll(responses.Select(r => Read<AdmissionRow>(r)));
         Assert.NotNull(rows[0].QueueNumber);
         Assert.Single(rows.Select(r => r.QueueNumber).Distinct());
@@ -371,7 +491,9 @@ public sealed class AdmissionFlowTests(ApiFixture api)
     {
         var cashier = await api.FeeCashierAsync();
         var row = await AdmitAsync();
-        await InDbAsync(db => db.Visits.Where(v => v.Id == row.VisitId).ExecuteUpdateAsync(s => s.SetProperty(v => v.VisitDate, KabulClock.Today.AddDays(-1))));
+        // A number of its own on the earlier day: another test moving a visit back must not collide on yesterday's card.
+        await InDbAsync(db => db.Visits.Where(v => v.Id == row.VisitId).ExecuteUpdateAsync(s => s
+            .SetProperty(v => v.VisitDate, KabulClock.Today.AddDays(-1)).SetProperty(v => v.QueueNumber, (int)(100000 + row.VisitId))));
 
         await AssertRefused(await cashier.SendAsync(PayRequest(row)), "visit_expired");
         Assert.Equal(0, await InDbAsync(db => db.Payments.CountAsync(p => p.InvoiceId == row.InvoiceId)));
@@ -388,7 +510,7 @@ public sealed class AdmissionFlowTests(ApiFixture api)
         await Read<ConsultationDto>(await doctor.PutAsJsonAsync($"/api/consultations/{row.VisitId}", new SaveConsultationRequest("یافته", null, null, null, null, null)));
 
         var tests = await doctor.GetFromJsonAsync<JsonElement>("/api/diagnostic-tests");
-        var imaging = tests.EnumerateArray().First(t => t.GetProperty("kind").GetString() == "Imaging").GetProperty("id").GetInt32();
+        var imaging = tests.EnumerateArray().First(t => t.GetProperty("kind").GetString() == "Imaging" && t.GetProperty("serviceId").ValueKind == JsonValueKind.Number).GetProperty("id").GetInt32();
         var order = await Read<DiagnosticOrderDto>(await doctor.SendAsync(ApiFixture.Keyed("/api/diagnostic-orders", new CreateDiagnosticOrderRequest(row.PatientId, row.VisitId, imaging, null))), HttpStatusCode.Created);
         await AssertRefused(await lab.PostAsJsonAsync($"/api/diagnostic-orders/{order.Id}/start", new ChangeOrderStatusRequest(order.Version)), "payment_required");
 
@@ -420,7 +542,7 @@ public sealed class AdmissionFlowTests(ApiFixture api)
 
         var day = DateOnly.FromDateTime(at.AddHours(4.5));
         var appointment = (await desk.GetFromJsonAsync<List<AppointmentRow>>($"/api/appointments?date={day:yyyy-MM-dd}", JsonOptions))!.Single(a => a.PatientId == patient.Id);
-        var arrival = await Read<AdmissionRow>(await desk.SendAsync(ApiFixture.Keyed($"/api/appointments/{appointment.Id}/check-in", new CheckInRequest(await api.DepartmentIdAsync("triage"), appointment.Version))), HttpStatusCode.Created);
+        var arrival = await Read<AdmissionRow>(await desk.SendAsync(ApiFixture.Keyed($"/api/appointments/{appointment.Id}/check-in", new CheckInRequest(await api.DepartmentIdAsync("triage"), appointment.Version, api.NextPhysicalCard()))), HttpStatusCode.Created);
         Assert.NotNull(arrival.QueueNumber);
         Assert.False(arrival.Paid);
 

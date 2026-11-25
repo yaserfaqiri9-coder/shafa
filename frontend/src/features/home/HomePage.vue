@@ -53,18 +53,20 @@ const statusGroups = [
   { label: 'لغو شده', statuses: ['Cancelled'], color: 'var(--xr-status-red)' },
 ]
 
-const todayTotal = computed(() => dashboard.value?.todayByStatus.reduce((sum, row) => sum + row.count, 0) ?? 0)
+const todayRegistered = computed(() => dashboard.value?.todayByStatus.reduce((sum, row) => sum + row.count, 0) ?? 0)
+const todayTotal = computed(() => dashboard.value?.todayByStatus.filter((row) => row.name !== 'Cancelled' && row.name !== 'AwaitingPayment').reduce((sum, row) => sum + row.count, 0) ?? 0)
 
 const statusRows = computed(() =>
   statusGroups.map((group) => {
     const count = dashboard.value?.todayByStatus.filter((row) => group.statuses.includes(row.name)).reduce((sum, row) => sum + row.count, 0) ?? 0
-    return { ...group, count, percent: todayTotal.value ? Math.round((count / todayTotal.value) * 100) : 0 }
+    return { ...group, count, percent: todayRegistered.value ? Math.round((count / todayRegistered.value) * 100) : 0 }
   }),
 )
 
 /** Change against yesterday; hidden when yesterday had no visits because a percentage of zero means nothing. */
 const trend = computed(() => {
-  const yesterday = dashboard.value?.yesterdayVisits ?? 0
+  const priorDay = dashboard.value?.days.at(-2)
+  const yesterday = priorDay ? priorDay.completed + priorDay.active : dashboard.value?.yesterdayVisits ?? 0
   if (!yesterday) return null
   return Math.round(((todayTotal.value - yesterday) / yesterday) * 1000) / 10
 })
@@ -93,7 +95,7 @@ const timeline = computed(() => [...visits.value].sort((a, b) => b.createdAt.loc
     <StatCard label="اجناس کم‌موجود" :value="dashboard.lowStockProducts" icon="ri-archive-fill" tone="orange" />
     <StatCard v-if="financial" label="دریافت امروز" :value="money(financial.receipts)" icon="ri-money-dollar-circle-fill" />
     <StatCard v-if="financial" label="مصارف امروز" :value="money(financial.expenses)" icon="ri-wallet-3-fill" tone="red" />
-    <StatCard v-if="financial" label="باقی حساب‌ها" :value="money(financial.outstandingNow)" icon="ri-receipt-fill" tone="orange" />
+    <StatCard v-if="financial" label="طلبات از مریضان" :value="money(financial.outstandingNow)" icon="ri-receipt-fill" tone="orange" />
   </div>
 
   <div class="dash">

@@ -90,7 +90,13 @@ collation-server=utf8mb4_0900_ai_ci
 default-time-zone=+00:00
 innodb_buffer_pool_size=512M
 innodb_flush_log_at_trx_commit=1
+# Torn-page protection and durable commits: a power cut must never leave a half-written page.
+innodb_doublewrite=ON
+# A blocked save reports "busy" after 20 s instead of freezing the screen for 50 s.
+innodb_lock_wait_timeout=20
 max_connections=100
+# Statistics tables nobody reads here cost about 200-400 MB of memory on a small server.
+performance_schema=OFF
 # Scheduled backups are the recovery plan. Binary logs would only add disk writes on a laptop.
 disable-log-bin
 log_error=$($LogFile -replace '\\', '/')
@@ -254,11 +260,20 @@ function Get-NightlyBackupTime {
     return [TimeZoneInfo]::ConvertTimeToUtc($twoAm, $kabul).ToLocalTime()
 }
 
+function New-KabulBackupTrigger {
+    $kabul = [TimeZoneInfo]::FindSystemTimeZoneById('Afghanistan Standard Time')
+    $day = [TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $kabul).ToString('yyyy-MM-dd')
+    $trigger = New-ScheduledTaskTrigger -Daily -At (Get-NightlyBackupTime)
+    # An explicit offset enables Task Scheduler time-zone synchronization, even on hosts with DST.
+    $trigger.StartBoundary = $day + 'T02:00:00+04:30'
+    return $trigger
+}
+
 # Once a night, and soon after start-up if the laptop was off at 02:00. The "backup now" event trigger is kept.
 function Set-NightlyBackupSchedule([string]$TaskName = 'AlShifa Backup') {
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     $events = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskEventTrigger' })
-    $nightly = New-ScheduledTaskTrigger -Daily -At (Get-NightlyBackupTime)
+    $nightly = New-KabulBackupTrigger
     Set-ScheduledTask -TaskName $TaskName -Trigger (@($nightly) + $events) | Out-Null
 }
 
@@ -267,6 +282,8 @@ function Set-NightlyBackupSchedule([string]$TaskName = 'AlShifa Backup') {
 # The message is matched too, because the application's own log messages use the same event source.
 # The worst anyone able to write the event can do is cause an extra backup; the task ignores it while one is running.
 function Add-BackupRequestTrigger([string]$TaskName = 'AlShifa Backup') {
+    # Older hosts can have a task but no registered source; the unprivileged API cannot register it itself.
+    if (-not [Diagnostics.EventLog]::SourceExists('AlShifa.Api')) { [Diagnostics.EventLog]::CreateEventSource('AlShifa.Api', 'Application') }
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     $subscription = '<QueryList><Query Id="0" Path="Application"><Select Path="Application">' +
         "*[System[Provider[@Name='AlShifa.Api'] and EventID=4100]] and *[EventData[Data='AlShifa backup request']]" +
@@ -276,6 +293,26 @@ function Add-BackupRequestTrigger([string]$TaskName = 'AlShifa Backup') {
     $trigger.Enabled = $true
     $trigger.Subscription = $subscription
     Set-ScheduledTask -TaskName $TaskName -Trigger (@($task.Triggers) + $trigger) | Out-Null
+}
+
+# Downloads hourly; the separate install task runs only on a version-specific approval event.
+# The API receives no privilege to execute a program, change tasks or modify the publisher trust anchor.
+function Set-AutoUpdateTasks([string]$Root) {
+    foreach ($name in 'AlShifa Update Check', 'AlShifa Update Install') {
+        $existing = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        if ($existing -and $existing.Actions.Arguments -notlike "*`"$(Join-Path $Root 'scripts\auto-update.ps1')`"*") { throw 'An update task belongs to another installation; it was not changed.' }
+    }
+    $requests = Join-Path $Root 'requests'
+    New-Item -ItemType Directory -Force $requests | Out-Null
+    Protect-Path $requests @('NT SERVICE\AlShifaApi=M')
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $Root 'scripts\auto-update.ps1')`" -Root `"$Root`""
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+    $hourly = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Hours 1)
+    Register-ScheduledTask -TaskName 'AlShifa Update Check' -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments) -Trigger $hourly -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+    $event = New-CimInstance -CimClass (Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler) -ClientOnly
+    $event.Enabled = $true
+    $event.Subscription = '<QueryList><Query Id="0" Path="Application"><Select Path="Application">*[System[Provider[@Name=''AlShifa.Api''] and EventID=4101]]</Select></Query></QueryList>'
+    Register-ScheduledTask -TaskName 'AlShifa Update Install' -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ($arguments + ' -InstallApproved')) -Trigger $event -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
 }
 
 # The desktop shortcut of the system. With Edge it opens as its own window with the hospital icon and no address bar,

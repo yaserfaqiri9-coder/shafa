@@ -8,6 +8,8 @@ using AlShifa.Api.Features.Visits;
 using AlShifa.Api.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 
+using static AlShifa.Api.Features.Calls.DepartmentQueueService;
+
 namespace AlShifa.Api.Features.Calls;
 
 public sealed record CreateCallRequest(CallDesk Desk, long? VisitId, long? TokenId, bool Recall);
@@ -15,13 +17,14 @@ public sealed record CreateCallRequest(CallDesk Desk, long? VisitId, long? Token
 public sealed record CallOutcomeRequest(CallOutcome Outcome);
 
 /// <param name="LocalClips">Set when no station is online: the desk that made the call plays these and reports the result.</param>
-public sealed record CallRow(long Id, int QueueNumber, string Destination, bool IsRecall, string Status, string? Outcome, string? FailureReason, DateTime RequestedAt, DateTime? FinishedAt, IReadOnlyList<string>? LocalClips = null);
+public sealed record CallRow(long Id, int QueueNumber, QueueShift QueueShift, int QueueRound, string Destination, bool IsRecall, string Status, string? Outcome, string? FailureReason, DateTime RequestedAt, DateTime? FinishedAt, IReadOnlyList<string>? LocalClips = null);
 
-public sealed record CallQueueEntry(long? VisitId, long? TokenId, int QueueNumber);
+public sealed record CallQueueEntry(long? VisitId, long? TokenId, int QueueNumber, QueueShift QueueShift, int QueueRound);
 
-public sealed record CallQueueRow(long? VisitId, long? TokenId, int QueueNumber, CallRow? LastCall);
+public sealed record CallQueueRow(long? VisitId, long? TokenId, int QueueNumber, QueueShift QueueShift, int QueueRound, bool IsCurrentQueue, CallRow? LastCall, bool Present = true, bool IsServing = false, bool CanCall = true);
 
-public sealed record CallDeskView(bool StationOnline, IReadOnlyList<CallQueueRow> Rows);
+public sealed record CallDeskView(bool StationOnline, IReadOnlyList<CallQueueRow> Rows, int? CurrentNumber = null, int? NextNumber = null);
+public sealed record QueuePresenceRequest(CallDesk Desk, long? VisitId, long? TokenId, bool Present);
 
 public sealed record ClaimStationRequest([Required, MaxLength(64)] string StationId, bool TakeOver);
 
@@ -31,11 +34,11 @@ public sealed record CallResultRequest([Required, MaxLength(64)] string StationI
 
 public sealed record LocalResultRequest(bool Played, [MaxLength(200)] string? Reason);
 
-public sealed record NextCallDto(long Id, int QueueNumber, string Destination, IReadOnlyList<string> Clips);
+public sealed record NextCallDto(long Id, int QueueNumber, QueueShift QueueShift, int QueueRound, string Destination, IReadOnlyList<string> Clips);
 
-public sealed record DisplayCallDto(long Id, int QueueNumber, string Destination, string? PatientName);
+public sealed record DisplayCallDto(long Id, int QueueNumber, QueueShift QueueShift, int QueueRound, string Destination);
 
-public sealed record StationHistoryRow(long Id, string? VisitNumber, int QueueNumber, string Destination, bool IsRecall, string Status, string? Outcome, string? FailureReason, DateTime RequestedAt, DateTime? FinishedAt, string? RequestedBy);
+public sealed record StationHistoryRow(long Id, string? VisitNumber, int QueueNumber, QueueShift QueueShift, int QueueRound, string Destination, bool IsRecall, string Status, string? Outcome, string? FailureReason, DateTime RequestedAt, DateTime? FinishedAt, string? RequestedBy);
 
 public sealed record StationStatus(bool Active, bool OtherStationOnline, DateTime? LastSeenAt, int ClipsTotal, int ClipsMissing, IReadOnlyList<string> MissingSample, IReadOnlyList<string> TestClips, IReadOnlyList<StationHistoryRow> History);
 
@@ -70,6 +73,7 @@ public static partial class CallEndpoints
     private static readonly Dictionary<CallDesk, (string Permission, string Group)> Desks = new()
     {
         [CallDesk.Reception] = ("visitfees.create", Groups.Reception),
+        [CallDesk.Cashier] = ("payments.create", Groups.Cashier),
         [CallDesk.Vision] = ("preexam.edit", Groups.Triage),
         [CallDesk.Doctor] = ("consultation.edit", Groups.Doctor),
         [CallDesk.Refraction] = ("preexam.edit", Groups.Triage),
@@ -77,6 +81,7 @@ public static partial class CallEndpoints
         [CallDesk.Lab] = ("diagnostics.edit", Groups.Lab),
         [CallDesk.Pharmacy] = ("pharmacy.create", Groups.Pharmacy),
         [CallDesk.Optical] = ("optical.create", Groups.Optical),
+        [CallDesk.Surgery] = ("surgery.edit", Groups.Surgery),
     };
 
     [GeneratedRegex("^[a-z0-9-]{1,40}\\.mp3$")]
@@ -89,26 +94,53 @@ public static partial class CallEndpoints
         // A TV observes announcements without claiming the audio station or taking a call out of its queue.
         calls.MapGet("/display", async (AppDbContext db, CancellationToken ct) =>
         {
-            var cutoff = DateTime.UtcNow.AddSeconds(-25);
+            var cutoff = KabulClock.Today.ToDateTime(TimeOnly.MinValue).AddHours(-4.5);
             var call = await db.PatientCalls.AsNoTracking()
-                .Where(c => (c.Status == CallStatus.Playing && c.ClaimedAt >= cutoff)
-                    || (c.Status == CallStatus.Played && c.FinishedAt >= cutoff))
+                .Where(c => c.RequestedAt >= cutoff && (c.Status == CallStatus.Playing || c.Status == CallStatus.Played))
                 .OrderByDescending(c => c.ClaimedAt).ThenByDescending(c => c.Id)
                 .Select(c => new
                 {
-                    c.Id, c.QueueNumber, c.Destination,
-                    PatientName = c.Visit != null && c.Visit.Patient != null
-                        ? (c.Visit.Patient.FirstName + " " + (c.Visit.Patient.LastName ?? "")).Trim()
-                        : null,
+                    c.Id, c.QueueNumber, c.QueueShift, c.QueueRound, c.Destination, c.Desk,
                 }).FirstOrDefaultAsync(ct);
             return call is null ? Results.NoContent()
-                : Results.Ok(new DisplayCallDto(call.Id, call.QueueNumber, VoicePack.Label(call.Destination), call.PatientName));
+                : Results.Ok(new DisplayCallDto(call.Id, call.QueueNumber, call.QueueShift, call.QueueRound, VoicePack.DepartmentLabel(call.Desk)));
         }).RequirePermission("calls.manage");
 
-        calls.MapGet("/desk/{desk}", async (CallDesk desk, AppDbContext db, CurrentUser user, HttpContext http, CancellationToken ct) =>
+        calls.MapGet("/display/doctor-queue", async (AppDbContext db, CancellationToken ct) =>
+        {
+            var today = KabulClock.Today;
+            var awaited = DiagnosticGate.Awaited(db);
+            // Seen patients, back from refraction or still in the room after the exam was saved, are no longer in the doctor's queue.
+            var visits = await ClinicalEndpoints.NotSeenByDoctor(db, db.Visits.AsNoTracking()).Where(v => v.VisitDate == today && v.QueueNumber != null
+                && (v.Status == VisitStatus.InConsultation || (v.Status == VisitStatus.ReadyForDoctor && !awaited.Any(o => o.VisitId == v.Id))))
+                .OrderBy(v => v.QueueShift == QueueShift.Afternoon).ThenBy(v => v.QueueNumber).ThenBy(v => v.Id)
+                .Select(v => new { v.Id, v.QueueNumber, v.DoctorStaffId, v.DepartmentId, v.Status,
+                    DoctorName = v.Doctor != null ? v.Doctor.FullName : null }).ToListAsync(ct);
+            var lastCall = await db.PatientCalls.AsNoTracking().Where(c => c.Desk == CallDesk.Doctor && c.VisitId != null
+                && c.Visit!.VisitDate == today && (c.Status == CallStatus.Playing || c.Status == CallStatus.Played))
+                .OrderByDescending(c => c.Id).Select(c => new { c.VisitId, c.Visit!.DoctorStaffId, c.Visit.DepartmentId }).FirstOrDefaultAsync(ct);
+            var current = visits.FirstOrDefault(v => v.Status == VisitStatus.InConsultation
+                && (lastCall == null || (v.DoctorStaffId == lastCall.DoctorStaffId && v.DepartmentId == lastCall.DepartmentId)))
+                ?? visits.FirstOrDefault(v => v.Status == VisitStatus.InConsultation);
+            var called = lastCall is null ? null : visits.FirstOrDefault(v => v.Id == lastCall.VisitId);
+            var room = current ?? called ?? visits.FirstOrDefault();
+            var absent = await db.QueueAttendances.AsNoTracking().Where(a => a.Day == today && a.Desk == CallDesk.Doctor && !a.Present).Select(a => a.EntryKey).ToListAsync(ct);
+            // A called patient still walking to the room is already the doctor's, not the next one waiting.
+            var reserved = await db.QueueDeskLanes.AsNoTracking().Where(l => l.Day == today && l.Desk == CallDesk.Doctor && l.EntryKey != null).Select(l => l.EntryKey!).ToListAsync(ct);
+            var next = visits.FirstOrDefault(v => v.Status == VisitStatus.ReadyForDoctor && !absent.Contains("v:" + v.Id) && !reserved.Contains("v:" + v.Id)
+                && v.Id != current?.Id && v.Id != called?.Id
+                && (room == null || (v.DoctorStaffId == room.DoctorStaffId && v.DepartmentId == room.DepartmentId)));
+            return Results.Ok(new { CurrentNumber = current?.QueueNumber, NextNumber = next?.QueueNumber,
+                DoctorName = room?.DoctorName, CalledNumber = called?.QueueNumber });
+        }).RequirePermission("calls.manage");
+
+        calls.MapGet("/desk/{desk}", async (CallDesk desk, AppDbContext db, CurrentUser user, HttpContext http, bool includeSeen = false, CancellationToken ct = default) =>
         {
             EnsureDesk(http, desk);
-            var entries = await Eligible(db, desk, user.Id).Take(200).ToListAsync(ct);
+            var entries = await Eligible(db, desk, user.Id, includeSeen: includeSeen).Take(200).ToListAsync(ct);
+            var currentEntries = includeSeen
+                ? await Eligible(db, desk, user.Id).ToListAsync(ct)
+                : entries;
             var visitIds = entries.Where(e => e.VisitId != null).Select(e => e.VisitId).ToList();
             var tokenIds = entries.Where(e => e.TokenId != null).Select(e => e.TokenId).ToList();
             var history = await db.PatientCalls.AsNoTracking()
@@ -117,24 +149,29 @@ public static partial class CallEndpoints
                 .ToListAsync(ct);
 
             var now = DateTime.UtcNow;
+            var selection = await SelectAsync(db, desk, user.Id, ct);
+            var priorityKey = selection.Priority is { } priority ? Key(priority.VisitId, priority.TokenId) : null;
             var rows = entries.Select(e =>
             {
                 var last = history.LastOrDefault(c => e.VisitId != null ? c.VisitId == e.VisitId : c.VisitTokenId == e.TokenId);
-                return new CallQueueRow(e.VisitId, e.TokenId, e.QueueNumber, last is null ? null : ToRow(last, now));
-            }).ToList();
-            return Results.Ok(new CallDeskView(IsFresh(await ReadStationAsync(db, ct), now), rows));
+                var isCurrent = currentEntries.Any(current => current.VisitId == e.VisitId && current.TokenId == e.TokenId);
+                return new CallQueueRow(e.VisitId, e.TokenId, e.QueueNumber, e.QueueShift, e.QueueRound, isCurrent, last is null ? null : ToRow(last, now),
+                    !selection.Absent.Contains(Key(e.VisitId, e.TokenId)), e == selection.Current, priorityKey is null || priorityKey == Key(e.VisitId, e.TokenId));
+            }).OrderByDescending(e => e.IsServing).ThenBy(e => !e.Present).ThenBy(e => e.QueueShift == QueueShift.Afternoon).ThenBy(e => e.QueueNumber).ThenBy(e => e.VisitId).ToList();
+            return Results.Ok(new CallDeskView(IsFresh(await ReadStationAsync(db, ct), now), rows, selection.Current?.QueueNumber, selection.Next?.QueueNumber));
         }).RequireAuthorization();
 
         // No Idempotency wrapper: the visit lock must be the transaction's first step so the checks below read what the previous holder committed.
         calls.MapPost("/", async (CreateCallRequest request, AppDbContext db, ClinicalAccess access, CurrentUser user, AuditService audit, Outbox outbox, HttpContext http, CancellationToken ct) =>
         {
             var desk = EnsureDesk(http, request.Desk);
-            if ((request.Desk == CallDesk.Reception) != (request.TokenId is not null) || (request.VisitId is null) == (request.TokenId is null))
+            if ((request.VisitId is null) == (request.TokenId is null) || (request.Desk != CallDesk.Reception && request.TokenId is not null))
             {
                 throw new AppException(StatusCodes.Status400BadRequest, "invalid_call", "مریض فراخوان مشخص نیست.");
             }
 
             await using var tx = await db.BeginWorkflowTransactionAsync(ct);
+            var lane = await LockLaneAsync(db, request.Desk, user.Id, ct);
             string? visitNumber = null;
             if (request.VisitId is { } visitId)
             {
@@ -150,7 +187,7 @@ public static partial class CallEndpoints
                 _ = await db.VisitTokens.FromSqlInterpolated($"SELECT * FROM VisitTokens WHERE Id = {tokenId} FOR UPDATE").AsNoTracking().SingleOrDefaultAsync(ct) ?? throw AppException.NotFound();
             }
 
-            var entry = await Eligible(db, request.Desk, user.Id, request.VisitId, request.TokenId).SingleOrDefaultAsync(ct)
+            var entry = await Eligible(db, request.Desk, user.Id, request.VisitId, request.TokenId, request.Recall, includeSeen: request.Recall).SingleOrDefaultAsync(ct)
                 ?? throw new AppException(StatusCodes.Status409Conflict, "not_in_queue", "این مریض اکنون در صف این بخش نیست.");
 
             var now = DateTime.UtcNow;
@@ -165,9 +202,14 @@ public static partial class CallEndpoints
 
             if (request.Recall && previous is null)
             {
-                throw new AppException(StatusCodes.Status409Conflict, "no_previous_call", "این مریض هنوز فراخوان نشده است.");
+                var inActiveQueue = await Eligible(db, request.Desk, user.Id, request.VisitId, request.TokenId, false, includeSeen: false).AnyAsync(ct);
+                if (inActiveQueue)
+                {
+                    throw new AppException(StatusCodes.Status409Conflict, "no_previous_call", "این مریض هنوز فراخوان نشده است.");
+                }
             }
 
+            await EnsurePriorityAsync(db, request.Desk, user.Id, entry, lane, request.Recall, ct);
             var playLocally = !IsFresh(await ReadStationAsync(db, ct), now);
             var destination = await DestinationAsync(db, request.Desk, user.Id, ct);
             // Audio availability must never block recording a valid call. Empty clips are reported by the player,
@@ -180,6 +222,8 @@ public static partial class CallEndpoints
                 VisitTokenId = request.TokenId,
                 Desk = request.Desk,
                 QueueNumber = entry.QueueNumber,
+                QueueShift = entry.QueueShift,
+                QueueRound = entry.QueueRound,
                 Destination = destination,
                 IsRecall = request.Recall,
                 RequestedByUserId = user.Id,
@@ -195,7 +239,7 @@ public static partial class CallEndpoints
                 outbox.Add("PatientCallRequested", new { desk = request.Desk.ToString() }, Groups.Audio);
             }
 
-            outbox.Add("PatientCallChanged", new { desk = request.Desk.ToString() }, desk.Group);
+            outbox.Add("PatientCallChanged", new { desk = request.Desk.ToString() }, EventGroups);
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
             return Results.Created($"/api/calls/{call.Id}", ToRow(call, now) with { LocalClips = playLocally ? clips : null });
@@ -230,8 +274,12 @@ public static partial class CallEndpoints
                 throw new AppException(StatusCodes.Status400BadRequest, "invalid_outcome", "نتیجه فراخوان معتبر نیست.");
             }
 
-            var call = await db.PatientCalls.SingleOrDefaultAsync(c => c.Id == id, ct) ?? throw AppException.NotFound();
-            var desk = EnsureDesk(http, call.Desk);
+            var metadata = await db.PatientCalls.AsNoTracking().SingleOrDefaultAsync(c => c.Id == id, ct) ?? throw AppException.NotFound();
+            var desk = EnsureDesk(http, metadata.Desk);
+            await using var tx = await db.BeginWorkflowTransactionAsync(ct);
+            var lane = await LockLaneAsync(db, metadata.Desk, user.Id, ct);
+            if (metadata.VisitId is { } lockedVisitId) await VisitService.LockAsync(db, lockedVisitId, ct);
+            var call = await db.PatientCalls.FromSqlInterpolated($"SELECT * FROM PatientCalls WHERE Id = {id} FOR UPDATE").SingleAsync(ct);
             if (call.Desk == CallDesk.Doctor && call.VisitId is { } visitId)
             {
                 await access.EnsureResponsibleAsync(visitId, ct);
@@ -244,13 +292,36 @@ public static partial class CallEndpoints
                 call.FinishedAt = DateTime.UtcNow;
             }
 
+            await SetPresenceAsync(db, call.Desk, user.Id, call.VisitId, call.VisitTokenId, request.Outcome == CallOutcome.Attended, lane, ct);
             call.Outcome = request.Outcome;
             call.OutcomeByUserId = user.Id;
             call.OutcomeAt = DateTime.UtcNow;
             audit.Add("PatientCallOutcome", nameof(PatientCall), id.ToString(), request.Outcome.ToString());
-            outbox.Add("PatientCallChanged", new { desk = call.Desk.ToString() }, desk.Group);
+            outbox.Add("PatientCallChanged", new { desk = call.Desk.ToString() }, EventGroups);
             await db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
             return Results.Ok(ToRow(call, DateTime.UtcNow));
+        }).RequireAuthorization();
+
+        calls.MapPost("/presence", async (QueuePresenceRequest request, AppDbContext db, ClinicalAccess access, CurrentUser user, AuditService audit, Outbox outbox, HttpContext http, CancellationToken ct) =>
+        {
+            EnsureDesk(http, request.Desk);
+            if ((request.VisitId is null) == (request.TokenId is null) || (request.TokenId is not null && request.Desk != CallDesk.Reception))
+                throw new AppException(StatusCodes.Status400BadRequest, "invalid_call", "مریض مشخص نیست.");
+            await using var tx = await db.BeginWorkflowTransactionAsync(ct);
+            var lane = await LockLaneAsync(db, request.Desk, user.Id, ct);
+            if (request.VisitId is { } visitId) {
+                await VisitService.LockAsync(db, visitId, ct);
+                if (request.Desk == CallDesk.Doctor) await access.EnsureResponsibleAsync(visitId, ct);
+            }
+            if (!await Eligible(db, request.Desk, user.Id, request.VisitId, request.TokenId, includeSeen: true).AnyAsync(ct))
+                throw new AppException(StatusCodes.Status409Conflict, "not_in_queue", "مریض در صف امروز این بخش نیست.");
+            await SetPresenceAsync(db, request.Desk, user.Id, request.VisitId, request.TokenId, request.Present, lane, ct);
+            audit.Add(request.Present ? "QueuePatientPresent" : "QueuePatientAbsent", nameof(Visit), request.VisitId?.ToString());
+            outbox.Add("PatientCallChanged", new { desk = request.Desk.ToString() }, EventGroups);
+            await db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+            return Results.NoContent();
         }).RequireAuthorization();
 
         calls.MapPost("/station/claim", async (ClaimStationRequest request, AppDbContext db, AuditService audit, CancellationToken ct) =>
@@ -314,7 +385,7 @@ public static partial class CallEndpoints
             await tx.CommitAsync(ct);
             return next is null
                 ? Results.NoContent()
-                : Results.Ok(new NextCallDto(next.Id, next.QueueNumber, VoicePack.Label(next.Destination), VoicePack.RecordedClips(next.QueueNumber, next.Destination, next.Desk)));
+                : Results.Ok(new NextCallDto(next.Id, next.QueueNumber, next.QueueShift, next.QueueRound, VoicePack.Label(next.Destination), VoicePack.RecordedClips(next.QueueNumber, next.Destination, next.Desk)));
         }).RequirePermission("calls.manage");
 
         calls.MapPost("/{id:long}/result", async (long id, CallResultRequest request, AppDbContext db, Outbox outbox, CancellationToken ct) =>
@@ -364,7 +435,7 @@ public static partial class CallEndpoints
                 missing.Count,
                 missing.Take(5).ToList(),
                 VoicePack.RecordedClips(25, "vision", CallDesk.Vision),
-                history.Select(h => new StationHistoryRow(h.Call.Id, h.VisitNumber, h.Call.QueueNumber, VoicePack.Label(h.Call.Destination), h.Call.IsRecall, Effective(h.Call, now).ToString(), h.Call.Outcome?.ToString(), h.Call.FailureReason, h.Call.RequestedAt, h.Call.FinishedAt, h.RequestedBy)).ToList()));
+                history.Select(h => new StationHistoryRow(h.Call.Id, h.VisitNumber, h.Call.QueueNumber, h.Call.QueueShift, h.Call.QueueRound, VoicePack.Label(h.Call.Destination), h.Call.IsRecall, Effective(h.Call, now).ToString(), h.Call.Outcome?.ToString(), h.Call.FailureReason, h.Call.RequestedAt, h.Call.FinishedAt, h.RequestedBy)).ToList()));
         }).RequirePermission("calls.manage");
 
         // Any desk may need these when no station is online. A clip holds a number or a destination, never patient data.
@@ -437,55 +508,6 @@ public static partial class CallEndpoints
     /// Who stands in a desk's queue right now. The same rule fills the desk's call buttons and guards the call itself.
     /// A queue number is only meaningful on its own day, so nothing from earlier days can be called.
     /// </summary>
-    private static IQueryable<CallQueueEntry> Eligible(AppDbContext db, CallDesk desk, long userId, long? visitId = null, long? tokenId = null)
-    {
-        var today = KabulClock.Today;
-        if (desk == CallDesk.Reception)
-        {
-            var tokens = db.VisitTokens.AsNoTracking().Where(t => t.TokenDate == today && t.VisitId == null && t.QueueNumber != null
-                && t.Invoice!.Status != InvoiceStatus.Void && t.Invoice.Total - t.Invoice.Discount <= t.Invoice.Paid - t.Invoice.Refunded);
-            if (tokenId is { } id)
-            {
-                tokens = tokens.Where(t => t.Id == id);
-            }
-
-            return tokens.OrderBy(t => t.QueueNumber).Select(t => new CallQueueEntry(null, t.Id, t.QueueNumber!.Value));
-        }
-
-        var visits = db.Visits.AsNoTracking().Where(v => v.VisitDate == today && v.QueueNumber != null && v.Status != VisitStatus.Cancelled && v.Status != VisitStatus.AwaitingPayment);
-        if (visitId is { } oneVisit)
-        {
-            visits = visits.Where(v => v.Id == oneVisit);
-        }
-
-        var openOrders = db.DiagnosticOrders.Where(o => o.Status == DiagnosticStatus.Requested || o.Status == DiagnosticStatus.InProgress);
-        var paidOrders = openOrders.Where(o => o.Invoice != null && o.Invoice.Status != InvoiceStatus.Void && o.Invoice.Total - o.Invoice.Discount <= o.Invoice.Paid - o.Invoice.Refunded);
-        var awaited = DiagnosticGate.Awaited(db);
-
-        var queue = desk switch
-        {
-            CallDesk.Vision => ClinicalEndpoints.VisionQueue(visits),
-
-            // While the doctor is waiting on a request, the patient is at that department and comes back to this queue when it finishes.
-            CallDesk.Doctor => ClinicalEndpoints.DoctorQueue(db, visits, userId)
-                .Where(v => (v.Status == VisitStatus.ReadyForDoctor || v.Status == VisitStatus.InConsultation) && !awaited.Any(o => o.VisitId == v.Id)),
-
-            CallDesk.Refraction => visits.Where(v => paidOrders.Any(o => o.VisitId == v.Id && o.Test!.Kind == DiagnosticKind.Refraction)),
-            CallDesk.Imaging => visits.Where(v => paidOrders.Any(o => o.VisitId == v.Id && o.Test!.Kind == DiagnosticKind.Imaging)),
-
-            // A lab test may have no fee at all; one that has a fee waits for it like any other paid request.
-            CallDesk.Lab => visits.Where(v => openOrders.Any(o => o.VisitId == v.Id && o.Test!.Kind == DiagnosticKind.Lab && o.InvoiceId == null)
-                || paidOrders.Any(o => o.VisitId == v.Id && o.Test!.Kind == DiagnosticKind.Lab)),
-
-            CallDesk.Pharmacy => visits.Where(v => db.MedicalPrescriptions.Any(p => p.VisitId == v.Id && (p.Status == PrescriptionStatus.Issued || p.Status == PrescriptionStatus.PartiallyDispensed))),
-            CallDesk.Optical => visits.Where(v => db.OpticalPrescriptions.Any(p => p.VisitId == v.Id && !p.IsCancelled
-                && !db.OpticalOrders.Any(o => o.OpticalPrescriptionId == p.Id && o.Status == Inventory.OpticalOrderStatus.Delivered))),
-            _ => throw new AppException(StatusCodes.Status400BadRequest, "invalid_desk", "بخش انتخاب‌شده معتبر نیست."),
-        };
-
-        return queue.OrderBy(v => v.QueueNumber).Select(v => new CallQueueEntry(v.Id, null, v.QueueNumber!.Value));
-    }
-
     private static async Task<string> DestinationAsync(AppDbContext db, CallDesk desk, long userId, CancellationToken ct)
     {
         if (desk == CallDesk.Doctor)
@@ -537,7 +559,7 @@ public static partial class CallEndpoints
     private static CallRow ToRow(PatientCall c, DateTime now)
     {
         var status = Effective(c, now);
-        return new CallRow(c.Id, c.QueueNumber, VoicePack.Label(c.Destination), c.IsRecall, status.ToString(), c.Outcome?.ToString(),
+        return new CallRow(c.Id, c.QueueNumber, c.QueueShift, c.QueueRound, VoicePack.Label(c.Destination), c.IsRecall, status.ToString(), c.Outcome?.ToString(),
             status == CallStatus.Failed ? c.FailureReason ?? "پخش نشد." : null, c.RequestedAt, c.FinishedAt);
     }
 

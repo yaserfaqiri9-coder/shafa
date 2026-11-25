@@ -67,14 +67,35 @@ async function send(path: string, options: RequestOptions) {
   if (method !== 'GET') headers['X-XSRF-TOKEN'] = await ensureCsrfToken()
   if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey
 
-  return fetch(`/api${path}`, {
-    method,
-    headers,
-    credentials: 'same-origin',
-    signal: options.signal,
-    body: options.body === undefined ? undefined : JSON.stringify(options.body),
-  })
+  // A server or database that stops answering must not leave the screen waiting forever.
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  if (options.signal?.aborted) controller.abort()
+  options.signal?.addEventListener('abort', abort)
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, REQUEST_TIMEOUT_MS)
+  try {
+    return await fetch(`/api${path}`, {
+      method,
+      headers,
+      credentials: 'same-origin',
+      signal: controller.signal,
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    })
+  } catch (cause) {
+    // Not an AbortError: callers treat it like a dropped connection, not like a cancellation they asked for.
+    if (timedOut) throw new TypeError('request_timeout')
+    throw cause
+  } finally {
+    clearTimeout(timer)
+    options.signal?.removeEventListener('abort', abort)
+  }
 }
+
+const REQUEST_TIMEOUT_MS = 120_000
 
 async function toApiError(response: Response) {
   const problem = await response.json().catch(() => null)

@@ -28,6 +28,16 @@ public sealed class MirrorOptions
 
     /// <summary>The database account that may write. The application itself runs on ConnectionStrings:Default, which may only read.</summary>
     public string SyncConnection { get; set; } = "";
+
+    /// <summary>
+    /// Hospital schema versions (last migration names) this online copy still accepts, while the hospital waits for its upgrade.
+    /// Only versions whose later migrations add nullable columns or tables belong here: rows from them simply lack the new columns.
+    /// Empty (the default) means the hospital must run exactly this version.
+    /// </summary>
+    public string[] AcceptedSourceSchemas { get; set; } = [];
+
+    public bool Accepts(string ownSchema, string sourceSchema) =>
+        sourceSchema == ownSchema || AcceptedSourceSchemas.Contains(sourceSchema, StringComparer.Ordinal);
 }
 
 /// <summary>Prune makes the online table match these rows exactly within a key range: online rows in the range that are not here are removed.
@@ -40,15 +50,18 @@ public sealed record SyncPrune(JsonElement? After, JsonElement? Through);
 
 /// <summary>Reset empties the online copy before this batch: the first batch of a full resend after the online copy lost data
 /// or holds rows this hospital never sent (a test, or a hospital database restored from a backup).</summary>
-public sealed record SyncBatch(string Schema, long Seq, DateTime SentAt, List<SyncTableRows> Tables, bool Reset = false);
+public sealed record SyncBatch(string Schema, long Seq, DateTime SentAt, List<SyncTableRows> Tables, bool Reset = false, string? SourceId = null);
 
 public sealed record SyncApplied(int Upserted, int Deleted);
 
 /// <summary>What the online copy holds: its database version and the last batch it applied.</summary>
-public sealed record MirrorState(string Schema, long Seq);
+public sealed record MirrorState(string Schema, long Seq, string? SourceId = null, int ProtocolVersion = 1, IReadOnlyList<string>? AcceptedSchemas = null);
 
 public static class MirrorEndpoints
 {
+    /// <summary>The hospital schema version of the last applied batch.</summary>
+    public const string SourceSchemaKey = "apply.sourceSchema";
+
     public static AppException Refusal() =>
         new(StatusCodes.Status403Forbidden, "direct_online_write_refused", "تغییر اطلاعات آنلاین باید از صف درخواست و تأیید سرور محلی عبور کند.");
 
@@ -62,9 +75,10 @@ public static class MirrorEndpoints
             var batch = JsonSerializer.Deserialize<SyncBatch>(body, JsonSerializerOptions.Web)
                 ?? throw new AppException(StatusCodes.Status400BadRequest, "invalid_batch", "Empty batch.");
 
-            // Rows are copied column by column, so both sides must run the same version of the database.
+            // Rows are copied column by column, so both sides must run the same version of the database, or a hospital version
+            // explicitly listed as compatible (its rows lack only columns added since, which keep their defaults here).
             var schema = SyncSchema.SchemaVersion(db);
-            if (batch.Schema != schema)
+            if (!options.Value.Accepts(schema, batch.Schema))
             {
                 throw new AppException(StatusCodes.Status409Conflict, "schema_mismatch", $"Online database is at {schema}, hospital server at {batch.Schema}. Deploy the same version online first.");
             }
@@ -78,7 +92,14 @@ public static class MirrorEndpoints
         {
             await SyncSignature.ReadVerifiedAsync(http, options.Value.SyncKey, 0, ct);
             var seq = await db.SyncStates.AsNoTracking().Where(s => s.Key == "apply.seq").Select(s => s.Value).SingleOrDefaultAsync(ct);
-            return Results.Ok(new MirrorState(SyncSchema.SchemaVersion(db), long.TryParse(seq, NumberStyles.None, CultureInfo.InvariantCulture, out var n) ? n : 0));
+            var source = await db.SyncStates.AsNoTracking().Where(s => s.Key == "apply.sourceId").Select(s => s.Value).SingleOrDefaultAsync(ct);
+            var own = SyncSchema.SchemaVersion(db);
+            // A hospital still on an accepted older version compares this field with its own, so it is told the version it last sent.
+            // A newer hospital also reads AcceptedSchemas. Without accepted versions this is always the online copy's own version.
+            var lastSource = await db.SyncStates.AsNoTracking().Where(s => s.Key == SourceSchemaKey).Select(s => s.Value).SingleOrDefaultAsync(ct);
+            var reported = lastSource is not null && options.Value.Accepts(own, lastSource) ? lastSource : options.Value.AcceptedSourceSchemas.FirstOrDefault() ?? own;
+            return Results.Ok(new MirrorState(reported, long.TryParse(seq, NumberStyles.None, CultureInfo.InvariantCulture, out var n) ? n : 0, source, ProtocolVersion: 2,
+                AcceptedSchemas: [own, .. options.Value.AcceptedSourceSchemas]));
         });
 
         group.MapGet("/files/missing", async (HttpContext http, AppDbContext db, IOptions<MirrorOptions> options, IConfiguration config, IHostEnvironment env, CancellationToken ct) =>
@@ -190,9 +211,24 @@ public static class MirrorApply
         // One batch at a time, and never an older one after a newer: a retried request that arrives late changes nothing.
         await ExecuteAsync(connection, tx, "INSERT INTO `SyncStates` (`Key`,`Value`,`UpdatedAt`) VALUES ('apply.seq','0',UTC_TIMESTAMP(6)) ON DUPLICATE KEY UPDATE `Key`=`Key`", [], ct);
         var last = Convert.ToInt64(await ScalarAsync(connection, tx, "SELECT `Value` FROM `SyncStates` WHERE `Key`='apply.seq' FOR UPDATE", [], ct), CultureInfo.InvariantCulture);
-        // A reset is accepted whatever the number: the rows it replaces may carry numbers this hospital never used.
-        // Should an old reset arrive late, the number drops below what the hospital had confirmed, and it sends everything again.
-        if (batch.Seq < last && !batch.Reset)
+        if (batch.Reset)
+            throw new AppException(StatusCodes.Status409Conflict, "reset_requires_review", "Automatic mirror reset is prohibited. Reconcile both databases first.");
+        if (!Guid.TryParse(batch.SourceId, out var sourceId))
+            throw new AppException(StatusCodes.Status409Conflict, "source_identity_required", "Upgrade and enroll the source installation before replication.");
+        var owner = await ScalarAsync(connection, tx, "SELECT `Value` FROM `SyncStates` WHERE `Key`='apply.sourceId'", [], ct) as string;
+        if (owner is null)
+        {
+            // Existing data is never silently claimed by a new installation.
+            if (last != 0)
+                throw new AppException(StatusCodes.Status409Conflict, "source_enrollment_required", "Existing mirror requires administrator-approved source enrollment.");
+            foreach (var table in tables.Values)
+                if (Convert.ToInt64(await ScalarAsync(connection, tx, $"SELECT COUNT(*) FROM {SyncSchema.Quote(table.Name)}", [], ct), CultureInfo.InvariantCulture) != 0)
+                    throw new AppException(StatusCodes.Status409Conflict, "nonempty_mirror", "Initial replication requires an empty destination or a reviewed merge plan.");
+            await SetStateAsync(connection, tx, "apply.sourceId", sourceId.ToString("D"), ct);
+        }
+        else if (owner != sourceId.ToString("D"))
+            throw new AppException(StatusCodes.Status409Conflict, "source_conflict", "Independent databases cannot overwrite this organization's authoritative source.");
+        if (batch.Seq < last)
         {
             throw new AppException(StatusCodes.Status409Conflict, "stale_batch", "A newer batch was already applied.");
         }
@@ -203,16 +239,6 @@ public static class MirrorApply
         {
             // Rows arrive table by table, so parents may come after their children. The hospital database already enforced the links.
             await ExecuteAsync(connection, tx, "SET FOREIGN_KEY_CHECKS=0", [], ct);
-            if (batch.Reset)
-            {
-                // Accounts stay: their online password and authenticator are set here and never come from the hospital.
-                // Account rows the hospital still has are rewritten by the resend that follows.
-                foreach (var table in tables.Values.Where(t => t.Name != "AspNetUsers"))
-                {
-                    deleted += await ExecuteAsync(connection, tx, $"DELETE FROM {SyncSchema.Quote(table.Name)}", [], ct);
-                }
-            }
-
             // Rows the hospital no longer has. Their children are gone at the hospital too and are pruned with their own table.
             foreach (var rows in batch.Tables.Where(r => r.Prune is not null))
             {
@@ -245,6 +271,7 @@ public static class MirrorApply
             }
 
             await SetStateAsync(connection, tx, "apply.seq", batch.Seq.ToString(CultureInfo.InvariantCulture), ct);
+            await SetStateAsync(connection, tx, MirrorEndpoints.SourceSchemaKey, batch.Schema, ct);
             await SetStateAsync(connection, tx, "apply.lastAt", DateTime.UtcNow.ToString("o"), ct);
             await SetStateAsync(connection, tx, "apply.sourceSentAt", batch.SentAt.ToUniversalTime().ToString("o"), ct);
             await tx.CommitAsync(ct);

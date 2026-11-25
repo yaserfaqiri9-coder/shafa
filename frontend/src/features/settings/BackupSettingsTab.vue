@@ -4,6 +4,8 @@ import { api, errorMessage } from '@/api/http'
 import { useAuthStore } from '@/stores/auth'
 import { latinDigits, formatDateTime } from '@/utils/date'
 import SyncStatusPanel from './SyncStatusPanel.vue'
+import { OnlineDatabaseBackupPanel } from './OnlineDatabaseBackupPanel'
+import SoftwareUpdatePanel from './SoftwareUpdatePanel.vue'
 
 interface BackupFile {
   name: string
@@ -26,6 +28,7 @@ interface BackupStatus {
   offsiteTarget: string | null
   offsiteLastSuccessAt: string | null
   offsiteError: string | null
+  restoreVerifiedAt: string | null
 }
 
 // Fast while a backup is running or was just requested, so the result shows up without reloading the page.
@@ -61,9 +64,14 @@ async function load() {
   try {
     const previous = status.value?.lastRunAt
     status.value = await api<BackupStatus>('/settings/backup-status')
-    if (requestedAt.value !== null && status.value.lastRunAt !== previous && !status.value.runningSince) {
+    if (requestedAt.value !== null && status.value.lastRunAt !== previous && status.value.lastRunAt !== null
+      && Date.parse(status.value.lastRunAt) >= requestedAt.value && !status.value.runningSince) {
       requestedAt.value = null
-      notice.value = status.value.lastError ? '' : 'پشتیبان‌گیری انجام شد.'
+      notice.value = status.value.lastError || !status.value.restoreVerifiedAt ? '' : 'پشتیبان‌گیری و آزمایش بازیابی انجام شد.'
+    } else if (requestedAt.value !== null && Date.now() - requestedAt.value >= 3 * 60_000 && !status.value.runningSince) {
+      requestedAt.value = null
+      notice.value = ''
+      error.value = 'اجرای پشتیبان‌گیری تأیید نشد. مسئول سیستم باید سرویس پشتیبان‌گیری ویندوز را بررسی کند.'
     }
   } catch (cause) {
     error.value = errorMessage(cause)
@@ -81,7 +89,7 @@ async function runNow() {
   try {
     await api('/settings/backup/run', { method: 'POST' })
     requestedAt.value = Date.now()
-    notice.value = 'پشتیبان‌گیری شروع شد. چند دقیقه طول می‌کشد؛ کار با سیستم در این مدت ادامه دارد.'
+    notice.value = 'درخواست پشتیبان‌گیری ثبت شد؛ نتیجه پس از اجرا و آزمایش بازیابی نمایش داده می‌شود.'
     await load()
   } catch (cause) {
     error.value = errorMessage(cause)
@@ -90,12 +98,16 @@ async function runNow() {
   }
 }
 
-onMounted(load)
+onMounted(() => { if (!auth.user?.online) load() })
 onBeforeUnmount(() => clearTimeout(timer))
 </script>
 
 <template>
   <SyncStatusPanel />
+  <OnlineDatabaseBackupPanel v-if="auth.user?.online" />
+  <template v-else>
+
+  <SoftwareUpdatePanel />
   <h3 class="h6 mb-2">پشتیبان‌گیری</h3>
   <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
   <div v-if="notice" class="alert alert-success" role="status">{{ notice }}</div>
@@ -108,7 +120,7 @@ onBeforeUnmount(() => clearTimeout(timer))
   <template v-else-if="status">
     <p class="form-hint">
       سیستم هر شب ساعت 2 بامداد (وقت کابل) خودکار از کل دیتابیس، فایل‌های بارگذاری‌شده و کلیدهای ورود پشتیبان فشرده می‌گیرد. فایل پشتیبان رمزگذاری می‌شود و پس از نوشتن روی مقصد باز و بررسی می‌شود.
-      7 پشتیبان روزانه، 4 هفتگی و 3 ماهانه نگه داشته می‌شوند. اگر سرور آنلاین تنظیم شده باشد، یک نسخه رمزگذاری‌شده هم به آن فرستاده می‌شود.
+      فایل‌های پشتیبان قبلی نگه داشته می‌شوند. هر پشتیبان جدید با بازیابی در دیتابیس آزمایشی جداگانه بررسی می‌شود.
     </p>
 
     <div v-if="running" class="alert alert-info" role="status">
@@ -117,7 +129,8 @@ onBeforeUnmount(() => clearTimeout(timer))
     <div v-else-if="status.needsAttention" class="alert alert-danger" role="alert">
       پشتیبان‌گیری مشکل دارد.
       <span v-if="status.lastError" dir="auto"> خطا: {{ status.lastError }}</span>
-      <span v-else> در 24 ساعت اخیر پشتیبان موفق ثبت نشده است.</span>
+      <span v-else-if="!status.restoreVerifiedAt"> بازیابی آخرین پشتیبان هنوز تأیید نشده است.</span>
+      <span v-else> در 26 ساعت اخیر پشتیبان موفق ثبت نشده است.</span>
     </div>
     <div v-else class="alert alert-success" role="status">پشتیبان‌گیری درست کار می‌کند.</div>
 
@@ -139,9 +152,11 @@ onBeforeUnmount(() => clearTimeout(timer))
     </div>
 
     <button v-if="auth.can('settings.edit')" type="button" class="btn btn-primary mb-3" :disabled="requesting || running" @click="runNow">
-      پشتیبان‌گیری همین حالا
+      پشتیبان‌گیری حالا
     </button>
 
+    <details v-if="auth.user?.roles.includes('SuperAdmin')">
+    <summary class="mb-2">جزئیات پیشرفته پشتیبان‌ها</summary>
     <div class="xr-table-wrap">
       <table class="xr-table">
         <thead><tr><th>تاریخ</th><th>فایل</th><th>اندازه</th></tr></thead>
@@ -155,5 +170,8 @@ onBeforeUnmount(() => clearTimeout(timer))
         </tbody>
       </table>
     </div>
+    </details>
+
   </template>
+</template>
 </template>

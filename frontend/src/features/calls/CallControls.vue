@@ -5,7 +5,7 @@ import { formatTime } from '@/utils/date'
 import { quantity } from '@/utils/money'
 import type { CallDeskHandle } from './useCallDesk'
 
-const props = defineProps<{ desk: CallDeskHandle; visitId?: number | null; tokenId?: number | null }>()
+const props = defineProps<{ desk: CallDeskHandle; visitId?: number | null; tokenId?: number | null; unavailableReason?: string | null }>()
 
 const statusLabels: Record<string, { label: string; tone: string }> = {
   Queued: { label: 'در نوبت پخش', tone: 'orange' },
@@ -18,11 +18,14 @@ const statusLabels: Record<string, { label: string; tone: string }> = {
 const row = computed(() => props.desk.entry(props.visitId, props.tokenId))
 const last = computed(() => row.value?.lastCall ?? null)
 const active = computed(() => last.value?.status === 'Queued' || last.value?.status === 'Playing')
+const recall = computed(() => !!row.value && (!row.value.isCurrentQueue || !!last.value))
 const number = computed(() => quantity(row.value?.queueNumber ?? 0))
 const sending = computed(() => (row.value ? props.desk.isSending(row.value) : false))
 const attended = computed(() => last.value?.outcome === 'Attended')
 
 const state = computed(() => {
+  if (row.value?.present === false) return { label: 'غایب', tone: 'red' }
+  if (row.value?.isServing) return { label: 'مریض فعلی', tone: 'cyan' }
   if (attended.value) return { label: 'حاضر شد', tone: 'green' }
   if (last.value?.outcome === 'NoShow') return { label: 'عدم حضور', tone: 'red' }
   return last.value ? statusLabels[last.value.status] : null
@@ -30,40 +33,35 @@ const state = computed(() => {
 
 // Only the next likely step stays on the row; the rest waits in the menu until a patient has been called.
 const menu = computed(() => {
-  if (!last.value || !row.value) return []
-  const entry = row.value
+  if (!row.value) return []
   const items = []
-  if (attended.value) {
-    items.push({ label: 'فراخوان مجدد', ariaLabel: `فراخوان مجدد نوبت ${number.value}`, icon: 'ri-volume-up-line', disabled: active.value || sending.value, onSelect: () => void props.desk.call(entry, true) })
-  } else {
-    items.push({ label: 'مریض حاضر شد', ariaLabel: `نوبت ${number.value} حاضر شد`, icon: 'ri-check-line', disabled: sending.value, onSelect: () => void props.desk.mark(entry, 'Attended') })
-  }
-  if (last.value.outcome !== 'NoShow') {
-    items.push({ label: 'عدم حضور', ariaLabel: `عدم حضور نوبت ${number.value}`, icon: 'ri-close-line', danger: true, disabled: sending.value, onSelect: () => void props.desk.mark(entry, 'NoShow') })
+  if (row.value.present === false || !attended.value) items.push({ label: 'مریض حاضر شد', ariaLabel: `نوبت ${number.value} حاضر شد`, icon: 'ri-check-line', disabled: sending.value, onSelect: () => void props.desk.mark(row.value!, 'Attended') })
+  if (row.value.present !== false) {
+    items.push({ label: 'عدم حضور', ariaLabel: `عدم حضور نوبت ${number.value}`, icon: 'ri-close-line', danger: true, disabled: sending.value, onSelect: () => void props.desk.mark(row.value!, 'NoShow') })
   }
   return items
 })
 </script>
 
 <template>
-  <div v-if="row" class="call-controls" role="group" :aria-label="`فراخوان نوبت ${number}`">
+  <div v-if="row || props.unavailableReason" class="call-controls" role="group" :aria-label="row ? `فراخوان نوبت ${number}` : (props.unavailableReason ?? 'فراخوان صوتی در دسترس نیست')">
     <div class="call-controls__actions">
       <button
-        v-if="!attended"
         type="button"
         class="btn btn-quiet btn-sm text-nowrap"
-        :disabled="active || sending"
-        :aria-label="`${last ? 'فراخوان مجدد' : 'فراخوان'} نوبت ${number}`"
-        @click="desk.call(row!, !!last)"
+        :disabled="!row || active || sending || row.present === false || row.canCall === false"
+        :title="!row ? props.unavailableReason ?? undefined : undefined"
+        :aria-label="row ? `${recall ? 'فراخوان مجدد' : 'فراخوان'} نوبت ${number}` : (props.unavailableReason ?? 'فراخوان صوتی در دسترس نیست')"
+        @click="row && desk.call(row, recall)"
       >
         <i class="ri-volume-up-line" aria-hidden="true"></i>
-        {{ last ? 'فراخوان مجدد' : 'فراخوان' }}
+        {{ row ? (recall ? 'فراخوان مجدد' : 'فراخوان') + ' ' + number : 'فراخوان صوتی' }}
       </button>
       <UiRowMenu v-if="menu.length" :label="`گزینه‌های بیشتر نوبت ${number}`" :items="menu" />
     </div>
     <div v-if="state" class="xr-note text-nowrap" :class="`xr-note--${state.tone}`" :title="last?.failureReason ?? last?.destination">
       <span>{{ state.label }}</span>
-      <span class="ltr-num" title="زمان آخرین اعلان">{{ formatTime(last!.finishedAt ?? last!.requestedAt) }}</span>
+      <span v-if="last" class="ltr-num" title="زمان آخرین اعلان">{{ formatTime(last!.finishedAt ?? last!.requestedAt) }}</span>
     </div>
   </div>
 </template>

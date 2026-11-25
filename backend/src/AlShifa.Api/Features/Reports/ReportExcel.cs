@@ -19,12 +19,12 @@ public static class ReportExcel
 
     public static byte[] Build(ReportDocument document, string? hospital)
     {
-        var table = document.Tables.FirstOrDefault();
-        var columns = table?.Columns ?? [];
+        // One sheet holds every list of the report, one under another; the sheet is as wide as its widest list.
+        var columnCount = document.Tables.Count == 0 ? 0 : document.Tables.Max(t => t.Columns.Count);
         var rows = new List<string>();
         var merges = new List<string>();
-        var widths = new double[columns.Count + 1];
-        var lastColumn = Math.Max(columns.Count + 1, 2);
+        var widths = new double[columnCount + 1];
+        var lastColumn = Math.Max(columnCount + 1, 3);
         var line = 0;
 
         void Width(int column, string text) => widths[Math.Min(column, widths.Length - 1)] = Math.Max(widths[Math.Min(column, widths.Length - 1)], text.Length);
@@ -46,21 +46,31 @@ public static class ReportExcel
         line++;
 
         // The figures, one under another: the name beside its number, clear of the narrow row-number column.
-        var at = columns.Count >= 2 ? 1 : 0;
+        // A figure the system cannot know is written as a word, never as a number.
+        var at = columnCount >= 2 ? 1 : 0;
         foreach (var tile in document.Tiles)
         {
             line++;
             var label = tile.Kind == ReportKind.Money ? $"{tile.Label} (افغانی)" : tile.Label;
             Width(at, label);
-            rows.Add(RowXml(line, 22, TextXml(at, line, label, TileLabel) + NumberXml(at + 1, line, tile.Value, Whole(tile.Value) ? TileInt : TileDecimal)));
+            var value = tile.Value is { } v ? NumberXml(at + 1, line, v, Whole(v) ? TileInt : TileDecimal) : TextXml(at + 1, line, ReportText.Unknown, TileLabel);
+            var note = string.IsNullOrWhiteSpace(tile.Note) ? "" : TextXml(at + 2, line, tile.Note!, Note);
+            rows.Add(RowXml(line, 22, TextXml(at, line, label, TileLabel) + value + note));
+        }
+
+        foreach (var warning in document.Warnings ?? [])
+        {
+            rows.Add(Wide(Note, $"توجه: {warning}", Math.Max(22, Math.Ceiling(warning.Length / 95d) * 18)));
         }
 
         var headerLine = 0;
         var firstData = 0;
         var lastData = 0;
-        if (table is not null)
+        foreach (var table in document.Tables)
         {
+            var columns = table.Columns;
             line++;
+            rows.Add(Wide(Hospital, table.Title, 24));
             line++;
             headerLine = line;
             var header = new StringBuilder(TextXml(0, line, "ردیف", Header));
@@ -112,7 +122,6 @@ public static class ReportExcel
 
             if (!string.IsNullOrWhiteSpace(table.Note))
             {
-                line++;
                 rows.Add(Wide(Note, table.Note!));
             }
         }
@@ -124,6 +133,9 @@ public static class ReportExcel
             rows.Add(Wide(Note, document.Description, Math.Max(44, Math.Ceiling(document.Description.Length / 95d) * 18)));
         }
 
+        // Freezing the header and filtering only make sense on a sheet of one list.
+        var single = document.Tables.Count == 1;
+
         var cols = new StringBuilder("<cols>");
         widths[0] = Math.Max(widths[0], 5);
         for (var c = 0; c < widths.Length; c++)
@@ -133,13 +145,13 @@ public static class ReportExcel
 
         cols.Append("</cols>");
 
-        var range = headerLine > 0 ? $"$A${headerLine}:${Letter(columns.Count)}${Math.Max(lastData, headerLine)}" : null;
+        var range = single && headerLine > 0 ? $"$A${headerLine}:${Letter(columnCount)}${Math.Max(lastData, headerLine)}" : null;
         var sheet = new StringBuilder();
         sheet.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
         sheet.Append("<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">");
         sheet.Append("<sheetPr><pageSetUpPr fitToPage=\"1\"/></sheetPr>");
         sheet.Append("<sheetViews><sheetView rightToLeft=\"1\" showGridLines=\"0\" workbookViewId=\"0\">");
-        if (headerLine > 0)
+        if (single && headerLine > 0)
         {
             sheet.Append(CultureInfo.InvariantCulture, $"<pane ySplit=\"{headerLine}\" topLeftCell=\"A{headerLine + 1}\" activePane=\"bottomLeft\" state=\"frozen\"/>");
         }
@@ -166,7 +178,7 @@ public static class ReportExcel
 
         sheet.Append("<printOptions horizontalCentered=\"1\"/>");
         sheet.Append("<pageMargins left=\"0.4\" right=\"0.4\" top=\"0.5\" bottom=\"0.5\" header=\"0.3\" footer=\"0.3\"/>");
-        sheet.Append(CultureInfo.InvariantCulture, $"<pageSetup paperSize=\"9\" orientation=\"{(columns.Count > 6 ? "landscape" : "portrait")}\" fitToWidth=\"1\" fitToHeight=\"0\"/>");
+        sheet.Append(CultureInfo.InvariantCulture, $"<pageSetup paperSize=\"9\" orientation=\"{(columnCount > 6 ? "landscape" : "portrait")}\" fitToWidth=\"1\" fitToHeight=\"0\"/>");
         sheet.Append("<headerFooter><oddFooter>&amp;Cصفحه &amp;P از &amp;N</oddFooter></headerFooter>");
         sheet.Append("</worksheet>");
 

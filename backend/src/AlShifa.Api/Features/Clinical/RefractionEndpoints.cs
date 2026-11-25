@@ -1,5 +1,6 @@
 using System.ComponentModel.DataAnnotations;
 using AlShifa.Api.Features.Auth;
+using AlShifa.Api.Features.Visits;
 using AlShifa.Api.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 
@@ -76,13 +77,15 @@ public static class RefractionEndpoints
                     && (finished
                         ? o.Status == DiagnosticStatus.ResultReady
                         : o.Status == DiagnosticStatus.Requested || o.Status == DiagnosticStatus.InProgress))
-                .OrderBy(o => o.Visit!.QueueNumber)
+                .OrderBy(o => o.Visit!.QueueShift == QueueShift.Afternoon).ThenBy(o => o.Visit!.QueueNumber)
                 .Take(200)
                 .Select(o => new
                 {
                     o.Id,
                     VisitId = o.VisitId!.Value,
                     o.Visit!.QueueNumber,
+                    o.Visit.QueueShift,
+                    o.Visit.QueueRound,
                     o.Patient!.FileNumber,
                     o.Patient.FirstName,
                     o.Patient.LastName,
@@ -90,7 +93,7 @@ public static class RefractionEndpoints
                     Paid = o.Invoice != null && o.Invoice.Status != Finance.InvoiceStatus.Void && o.Invoice.Total - o.Invoice.Discount <= o.Invoice.Paid - o.Invoice.Refunded,
                 })
                 .ToListAsync(ct);
-            return Results.Ok(rows.Select(r => new { r.Id, r.VisitId, r.QueueNumber, PatientFileNumber = r.FileNumber, PatientName = $"{r.FirstName} {r.LastName}".Trim(), r.Status, r.Paid }));
+            return Results.Ok(rows.Select(r => new { r.Id, r.VisitId, r.QueueNumber, r.QueueShift, r.QueueRound, PatientFileNumber = r.FileNumber, PatientName = $"{r.FirstName} {r.LastName}".Trim(), r.Status, r.Paid }));
         }).RequirePermission("preexam.view");
 
         group.MapPut("/{visitId:long}", async (long visitId, SaveRefractionRequest request, AppDbContext db, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>

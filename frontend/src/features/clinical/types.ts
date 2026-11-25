@@ -112,6 +112,7 @@ export interface Prescription {
 }
 
 export interface OpticalRx {
+  queueNumber?: number | null
   id: number
   rxNumber: string
   patientId: number
@@ -133,9 +134,12 @@ export interface OpticalRx {
   version: number
   /** Sent by the refraction desk rather than written by the doctor. */
   fromRefraction?: boolean
+  /** Status of the newest live optical order for this prescription; null when none was ordered yet. Only in the optical list. */
+  orderStatus?: string | null
 }
 
 export interface DiagnosticOrder {
+  queueNumber?: number | null
   id: number
   orderNumber: string
   patientId: number
@@ -187,6 +191,7 @@ export interface HistoryItem {
 }
 
 export interface SurgeryRow {
+  queueNumber?: number | null
   id: number
   caseNumber: string
   patientId: number

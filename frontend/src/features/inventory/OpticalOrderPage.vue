@@ -21,9 +21,14 @@ interface OrderDetail {
   version: number
   sale: {
     items: { productId: number; productName: string; kind: string; unit: string; salePrice: number; onHand: number; isActive: boolean; quantity: number; unitPrice: number }[]
-    customLines: { description: string; amount: number }[]
+    customLines: { description: string; amount: number; isNonStockLens: boolean }[]
   }
+  isComplimentary: boolean
+  complimentaryReason: string | null
+  complimentaryApprovedBy: string | null
 }
+
+interface CreatedOrder { id: number }
 
 /** Frames and lenses have no fixed price: the seller types the agreed price; empty falls back to the product's price. */
 function blankItem() {
@@ -36,8 +41,13 @@ const correcting = ref<OrderDetail | null>(null)
 const correctId = Number(route.query.correct) || null
 const form = reactive({
   description: '',
+  customerName: '',
+  customerPhone: '',
   items: [blankItem()],
-  custom: [] as { description: string; amount: number | null }[],
+  custom: [] as { description: string; amount: number | null; isNonStockLens: boolean }[],
+  complimentary: false,
+  complimentaryReason: '',
+  complimentaryApprovedBy: '',
   reason: '',
 })
 const { dirty, markSaved, applying } = useUnsavedGuard(form)
@@ -56,7 +66,7 @@ function priceOf(item: { productId: number | null; unitPrice: number | null }) {
 }
 
 const total = computed(
-  () =>
+  () => form.complimentary ? 0 :
     form.items.reduce((sum, item) => sum + priceOf(item) * (item.quantity || 0), 0) +
     form.custom.reduce((sum, line) => sum + (line.amount || 0), 0),
 )
@@ -89,7 +99,10 @@ async function loadCorrection() {
     applying(() => {
       form.description = order.description ?? ''
       form.items = order.sale.items.length ? order.sale.items.map((i) => ({ productId: i.productId, productName: i.productName, quantity: i.quantity, unitPrice: i.unitPrice as number | null })) : [blankItem()]
-      form.custom = order.sale.customLines.map((l) => ({ description: l.description, amount: l.amount }))
+      form.custom = order.sale.customLines.map((l) => ({ description: l.description, amount: l.amount, isNonStockLens: l.isNonStockLens }))
+      form.complimentary = order.isComplimentary
+      form.complimentaryReason = order.complimentaryReason ?? ''
+      form.complimentaryApprovedBy = order.complimentaryApprovedBy ?? ''
     })
   } catch (cause) {
     error.value = errorMessage(cause)
@@ -106,7 +119,7 @@ async function submit() {
     error.value = 'حداقل یک جنس یا یک قلم با مبلغ وارد کنید.'
     return
   }
-  const unpriced = chosen.find((item) => !(priceOf(item) > 0))
+  const unpriced = !form.complimentary && chosen.find((item) => !(priceOf(item) > 0))
   if (unpriced) {
     error.value = `قیمت فروش «${unpriced.productName ?? known.get(unpriced.productId ?? 0)?.name ?? ''}» را وارد کنید.`
     return
@@ -117,11 +130,14 @@ async function submit() {
     if (correcting.value) {
       await api(`/optical/orders/${correcting.value.id}/correct`, { method: 'POST', body: { description: form.description, items, customLines, reason: form.reason, version: correcting.value.version } })
     } else {
-      await api('/optical/orders', {
+      const order = await api<CreatedOrder>('/optical/orders', {
         method: 'POST',
         idempotencyKey: key,
-        body: { patientId: rx.value?.patientId ?? null, opticalPrescriptionId: rx.value?.id ?? null, description: form.description, items, customLines },
+        body: { patientId: rx.value?.patientId ?? null, opticalPrescriptionId: rx.value?.id ?? null, description: form.description, items, customLines, isComplimentary: form.complimentary, complimentaryReason: form.complimentaryReason, complimentaryApprovedBy: form.complimentaryApprovedBy, customerName: rx.value ? null : form.customerName, customerPhone: rx.value ? null : form.customerPhone },
       })
+      markSaved()
+      await router.push({ name: 'print', params: { kind: 'optical-order', id: order.id }, query: { autoPrint: '1' } })
+      return
     }
     markSaved()
     await router.push({ name: 'optical' })
@@ -140,7 +156,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <UiFormPage :title="correctId ? `اصلاح سفارش ${correcting?.orderNumber ?? ''}` : route.query.rx ? `سفارش عینک برای ${rx?.patientName ?? ''}` : 'سفارش مستقل عینک'" :back-to="{ name: 'optical' }" back-label="بازگشت به بخش عینک" :dirty="dirty" :saving="saving" :error="error" @submit="submit">
+  <UiFormPage :title="correctId ? `اصلاح سفارش ${correcting?.orderNumber ?? ''}` : route.query.rx ? `سفارش عینک برای ${rx?.patientName ?? ''}` : 'فروش عینک بدون نسخه'" :back-to="{ name: 'optical' }" back-label="بازگشت به بخش عینک" :dirty="dirty" :saving="saving" :error="error" @submit="submit">
     <template v-if="rx" #summary>
       <section class="xr-card xr-card__body">
         <div class="xr-table-wrap">
@@ -157,23 +173,34 @@ onMounted(() => {
 
     <fieldset :disabled="loading">
       <div v-if="correcting" class="alert alert-warning" role="status">سفارش فعلی با این دلیل لغو می‌شود و سفارش تازه با قیمت‌های همین فرم ثبت می‌شود. سفارشی که پرداخت شده باشد از اینجا اصلاح نمی‌شود.</div>
+      <!-- No prescription, so no patient: the name is how the customer's order is found when they come back. -->
+      <div v-if="!route.query.rx && !correcting" class="row g-3 mb-4">
+        <div class="col-md-7">
+          <label class="form-label" for="oo-customer">نام مشتری</label>
+          <input id="oo-customer" v-model="form.customerName" class="form-control" maxlength="150" required autocomplete="off" />
+        </div>
+        <div class="col-md-5">
+          <label class="form-label" for="oo-phone">شماره تلفن <span class="form-hint">(اختیاری)</span></label>
+          <input id="oo-phone" v-model="form.customerPhone" class="form-control ltr-num" type="tel" maxlength="30" inputmode="tel" autocomplete="off" />
+        </div>
+      </div>
       <div class="mb-4">
         <label class="form-label" for="oo-desc">شرح سفارش</label>
         <input id="oo-desc" v-model="form.description" class="form-control" maxlength="500" />
       </div>
 
       <div class="xr-group">
-        <h2 class="xr-group__title">فریم و عدسی از گدام</h2>
+        <h2 class="xr-group__title">فریم و عدسی</h2>
         <div class="xr-table-wrap" role="region" aria-label="فریم و عدسی" tabindex="0">
         <table class="xr-lines">
           <thead><tr><th>جنس</th><th class="line-qty">تعداد</th><th class="line-money">قیمت فروش واحد</th><th class="line-money">مبلغ</th><th></th></tr></thead>
           <tbody>
             <tr v-for="(item, i) in form.items" :key="i">
               <td><UiComboBox v-model="item.productId" :label="`جنس ردیف ${i + 1}`" hide-label :search="search" :selected-label="item.productName" chip placeholder="نام فریم یا عدسی را تایپ کنید" /></td>
-              <td class="line-qty"><input v-model.number="item.quantity" class="form-control" type="number" min="1" step="1" :aria-label="`تعداد ردیف ${i + 1}`" /></td>
-              <td class="line-money"><input v-model.number="item.unitPrice" class="form-control" type="number" min="0" step="0.01" :placeholder="known.get(item.productId ?? 0)?.salePrice ? String(known.get(item.productId ?? 0)?.salePrice) : 'قیمت'" :aria-label="`قیمت فروش واحد ردیف ${i + 1}`" /></td>
-              <td class="xr-lines__money">{{ money(priceOf(item) * (item.quantity || 0)) }}</td>
-              <td><button type="button" class="btn btn-soft-danger btn-icon" :aria-label="`حذف ردیف ${i + 1}`" title="حذف ردیف" :disabled="form.items.length === 1" @click="form.items.splice(i, 1)"><i class="ri-close-line" aria-hidden="true"></i></button></td>
+              <td class="line-qty" data-label="تعداد"><input v-model.number="item.quantity" class="form-control" type="number" min="1" step="1" :aria-label="`تعداد ردیف ${i + 1}`" /></td>
+              <td class="line-money" data-label="قیمت فروش واحد"><input v-model.number="item.unitPrice" class="form-control" type="number" min="0" step="0.01" :disabled="form.complimentary" :placeholder="form.complimentary ? 'رایگان' : (known.get(item.productId ?? 0)?.salePrice ? String(known.get(item.productId ?? 0)?.salePrice) : 'قیمت')" :aria-label="`قیمت فروش واحد ردیف ${i + 1}`" /></td>
+              <td class="xr-lines__money" data-label="مبلغ">{{ money(priceOf(item) * (item.quantity || 0)) }}</td>
+              <td class="xr-lines__remove"><button type="button" class="btn btn-soft-danger btn-icon" :aria-label="`حذف ردیف ${i + 1}`" title="حذف ردیف" :disabled="form.items.length === 1" @click="form.items.splice(i, 1)"><i class="ri-close-line" aria-hidden="true"></i></button></td>
             </tr>
           </tbody>
         </table>
@@ -182,21 +209,28 @@ onMounted(() => {
       </div>
 
       <div class="xr-group mb-0">
-        <h2 class="xr-group__title">قلم‌های دیگر (مثلاً ساخت عدسی)</h2>
-        <p v-if="form.custom.length === 0" class="form-hint">قلمی اضافه نشده است.</p>
         <div v-for="(line, i) in form.custom" :key="i" class="row g-2 mb-2">
           <div class="col"><input v-model="line.description" class="form-control" maxlength="200" :aria-label="`شرح قلم ${i + 1}`" placeholder="شرح" /></div>
-          <div class="col-3"><input v-model.number="line.amount" class="form-control" type="number" min="0" step="0.01" :aria-label="`مبلغ قلم ${i + 1}`" placeholder="مبلغ" /></div>
+          <div class="col-3"><input v-model.number="line.amount" class="form-control" type="number" min="0" step="0.01" :disabled="form.complimentary" :aria-label="`مبلغ قلم ${i + 1}`" placeholder="مبلغ" /></div>
+          <div class="col-auto align-self-center"><label class="form-check mb-0"><input v-model="line.isNonStockLens" class="form-check-input" type="checkbox" /> <span class="form-check-label">عدسی غیرانباری</span></label></div>
           <div class="col-auto"><button type="button" class="btn btn-soft-danger btn-icon" :aria-label="`حذف قلم ${i + 1}`" title="حذف قلم" @click="form.custom.splice(i, 1)"><i class="ri-close-line" aria-hidden="true"></i></button></div>
         </div>
-        <button type="button" class="btn btn-soft btn-sm" @click="form.custom.push({ description: '', amount: null })">افزودن قلم</button>
+        <button type="button" class="btn btn-soft btn-sm" @click="form.custom.push({ description: '', amount: null, isNonStockLens: true })">افزودن عدسی سفارشی (خارج از گدام)</button>
+      </div>
+
+      <div v-if="!correcting" class="mt-3">
+        <label class="form-check form-switch mb-2"><input v-model="form.complimentary" class="form-check-input" type="checkbox" role="switch" /> <span class="form-check-label">رایگان</span></label>
+        <div v-if="form.complimentary" class="row g-3">
+          <div class="col-md-6"><label class="form-label" for="oo-free-reason">دلیل</label><input id="oo-free-reason" v-model="form.complimentaryReason" class="form-control" minlength="3" maxlength="300" required /></div>
+          <div class="col-md-6"><label class="form-label" for="oo-free-approved">تأییدکننده</label><input id="oo-free-approved" v-model="form.complimentaryApprovedBy" class="form-control" maxlength="150" required /></div>
+        </div>
       </div>
       <p class="xr-lines__total mb-0">مجموع: <strong>{{ money(total) }}</strong></p>
       <div v-if="correcting" class="mt-3"><label class="form-label" for="oo-reason">دلیل اصلاح</label><input id="oo-reason" v-model="form.reason" class="form-control" minlength="3" maxlength="300" required /></div>
     </fieldset>
 
     <template #actions>
-      <button type="submit" class="btn btn-primary" :disabled="saving || loading || (!!correctId && !correcting)">{{ correctId ? 'لغو و ثبت سفارش تازه' : 'ثبت سفارش' }}</button>
+      <button type="submit" class="btn btn-primary" :disabled="saving || loading || (!!correctId && !correcting)">{{ correctId ? 'لغو و ثبت سفارش تازه' : 'ثبت فروش و چاپ رسید' }}</button>
       <RouterLink :to="{ name: 'optical' }" class="btn btn-soft-danger">انصراف</RouterLink>
     </template>
   </UiFormPage>

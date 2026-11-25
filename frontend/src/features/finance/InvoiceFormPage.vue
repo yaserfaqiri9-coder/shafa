@@ -86,10 +86,10 @@ onMounted(async () => {
       <tbody>
         <tr v-for="(line, i) in form.lines" :key="i">
           <td><UiComboBox v-model="line.serviceId" :label="`خدمت ردیف ${i + 1}`" hide-label :options="options" :loading="loading" required chip /></td>
-          <td class="line-qty"><input v-model.number="line.quantity" class="form-control" type="number" min="1" step="1" required :aria-label="`تعداد ردیف ${i + 1}`" /></td>
-          <td class="xr-lines__money">{{ money(priceOf(line.serviceId)) }}</td>
-          <td class="xr-lines__money">{{ money(priceOf(line.serviceId) * (line.quantity || 0)) }}</td>
-          <td><button type="button" class="btn btn-soft-danger btn-icon" :aria-label="`حذف ردیف ${i + 1}`" title="حذف ردیف" :disabled="form.lines.length === 1" @click="form.lines.splice(i, 1)"><i class="ri-close-line" aria-hidden="true"></i></button></td>
+          <td class="line-qty" data-label="تعداد"><input v-model.number="line.quantity" class="form-control" type="number" min="1" step="1" required :aria-label="`تعداد ردیف ${i + 1}`" /></td>
+          <td class="xr-lines__money" data-label="قیمت واحد">{{ money(priceOf(line.serviceId)) }}</td>
+          <td class="xr-lines__money" data-label="مبلغ">{{ money(priceOf(line.serviceId) * (line.quantity || 0)) }}</td>
+          <td class="xr-lines__remove"><button type="button" class="btn btn-soft-danger btn-icon" :aria-label="`حذف ردیف ${i + 1}`" title="حذف ردیف" :disabled="form.lines.length === 1" @click="form.lines.splice(i, 1)"><i class="ri-close-line" aria-hidden="true"></i></button></td>
         </tr>
       </tbody>
     </table>

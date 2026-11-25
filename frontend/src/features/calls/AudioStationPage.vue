@@ -19,7 +19,7 @@ const statusLabels: Record<string, { label: string; tone: string }> = {
   Cancelled: { label: 'لغو شد', tone: 'orange' },
 }
 
-const { activated, needsClick, busyElsewhere, serverReachable, status, nowPlaying, volume, error, testing, preparing, prepared, retryAudio, packReady, packPending, onAir, activate, loadStatus, testSound, restoreSound } = useAudioStation()
+const { activated, needsClick, busyElsewhere, serverReachable, status, nowPlaying, volume, error, testing, playingWelcome, preparing, prepared, retryAudio, packReady, packPending, onAir, activate, loadStatus, testSound, playWelcome, restoreSound } = useAudioStation()
 
 let statusTimer: ReturnType<typeof setInterval> | undefined
 
@@ -70,7 +70,7 @@ onBeforeUnmount(() => clearInterval(statusTimer))
         </div>
       </dl>
 
-      <p v-if="nowPlaying" class="station-now" role="status">نوبت {{ quantity(nowPlaying.queueNumber) }}، {{ nowPlaying.destination }}</p>
+          <p v-if="nowPlaying" class="station-now" role="status">نوبت {{ quantity(nowPlaying.queueNumber) }}، {{ nowPlaying.destination }}</p>
 
       <div class="row g-3 align-items-end">
         <div class="col-md-5">
@@ -81,6 +81,10 @@ onBeforeUnmount(() => clearInterval(statusTimer))
           <button v-if="!activated" type="button" class="btn btn-primary" @click="activate(false)">فعال‌سازی صدا در این رایانه</button>
           <button v-if="busyElsewhere" type="button" class="btn btn-soft-danger" @click="activate(true)">این رایانه مرکز پخش شود</button>
           <button type="button" class="btn btn-soft" :disabled="testing || !status" @click="testSound">آزمایش صدا</button>
+          <button type="button" class="btn btn-soft" :disabled="playingWelcome || preparing" @click="playWelcome">
+            <i class="ri-volume-up-line me-1" aria-hidden="true"></i>
+            {{ playingWelcome ? 'در حال پخش خوشامدگویی…' : 'پخش خوشامدگویی' }}
+          </button>
           <TelevisionButton setup-link />
         </div>
       </div>

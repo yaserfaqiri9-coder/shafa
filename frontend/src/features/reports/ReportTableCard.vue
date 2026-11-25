@@ -5,7 +5,8 @@ import { quantity } from '@/utils/money'
 import { cellText, isDeduction, isNumericKind } from './reportFormat'
 import type { ReportTable, ReportValueKind } from './types'
 
-const props = defineProps<{ table: ReportTable }>()
+/** bare: the title is already shown above the card, as on a folded section. */
+const props = defineProps<{ table: ReportTable; bare?: boolean }>()
 
 /** A long list opens with its first rows; the rest are one click away, and every row is in the Excel and PDF files. */
 const SHORT_ROWS = 50
@@ -19,7 +20,7 @@ const cellClass = (kind: ReportValueKind) => ({
 </script>
 
 <template>
-  <UiCard :title="table.title">
+  <UiCard :title="bare ? undefined : table.title">
     <p v-if="table.rows.length === 0" class="report-table__empty">برای این دوره چیزی ثبت نشده است.</p>
     <div v-else class="xr-table-wrap">
       <table class="xr-table">

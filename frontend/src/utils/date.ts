@@ -14,9 +14,9 @@ const dateTimeFormat = new Intl.DateTimeFormat('fa-AF-u-ca-persian-nu-latn', {
   day: 'numeric',
   hour: '2-digit',
   minute: '2-digit',
-  hour12: false,
+  hour12: true,
 })
-const timeFormat = new Intl.DateTimeFormat('fa-AF-u-nu-latn', { timeZone: ZONE, hour: '2-digit', minute: '2-digit', hour12: false })
+const timeFormat = new Intl.DateTimeFormat('fa-AF-u-nu-latn', { timeZone: ZONE, hour: '2-digit', minute: '2-digit', hour12: true })
 const partsFormat = (timeZone: string) => new Intl.DateTimeFormat('en-u-ca-persian-nu-latn', { timeZone, year: 'numeric', month: 'numeric', day: 'numeric' })
 const kabulParts = partsFormat(ZONE)
 const utcParts = partsFormat('UTC')

@@ -44,15 +44,17 @@ public static class CommandPolicy
         "finance", "invoices", "cashier", "cash-sessions", "inventory", "pharmacy", "sales",
         "clinical", "diagnostics", "surgeries", "surgery-packages", "refractions", "prescriptions",
         "consultations", "pre-examinations", "triage", "follow-ups", "optical", "directory",
-        "services", "payments", "cash", "ledger", "expenses", "departments", "suppliers", "staff",
-        "diagnostic-tests", "diagnostic-orders", "optical-prescriptions", "visit-tokens",
+        "services", "payments", "cash", "ledger", "expenses", "departments", "suppliers", "staff", "operations",
+        "diagnostic-tests", "diagnostic-orders", "optical-prescriptions", "visit-tokens", "chat",
     };
+
+    private const string QueueResetPath = "/api/settings/queue-numbers/reset";
 
     public static bool Allowed(string method, string path) =>
         method is "POST" or "PUT" or "PATCH" or "DELETE"
         && path.StartsWith("/api/", StringComparison.Ordinal)
         && !path.Contains('%') && !path.Contains('\\') && !path.Contains("..", StringComparison.Ordinal)
-        && Roots.Contains(path[5..].Split('/')[0])
+        && (Roots.Contains(path[5..].Split('/')[0]) || method == "POST" && path == QueueResetPath)
         && !path.Contains("/attachments", StringComparison.Ordinal);
 
     public static string Hash(string method, string path, string query, string body) =>
@@ -68,7 +70,8 @@ public static class CommandPolicy
         if (command.Method == "POST" && path is "/api/patients" or "/api/appointments" or "/api/admissions"
             or "/api/visits" or "/api/visit-tokens" or "/api/invoices" or "/api/payments"
             or "/api/inventory/purchases" or "/api/pharmacy/sales" or "/api/optical/orders"
-            or "/api/cash/sessions" or "/api/expenses" or "/api/diagnostic-orders" or "/api/surgeries")
+            or "/api/cash/sessions" or "/api/expenses" or "/api/diagnostic-orders" or "/api/surgeries"
+            or "/api/chat/messages" or "/api/chat/public/messages")
             return true;
         if (command.Method == "DELETE" && Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(command.Query)
             .TryGetValue("version", out var version) && int.TryParse(version, out var number) && number >= 0)

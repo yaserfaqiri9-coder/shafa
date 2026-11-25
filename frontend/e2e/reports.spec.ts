@@ -41,7 +41,7 @@ const tabs = (page: Page) => page.getByRole('tablist', { name: 'دسته گزا�
 const tab = (page: Page, name: string) => tabs(page).getByRole('tab', { name })
 const bar = (page: Page) => page.getByRole('region', { name: 'فیلترهای گزارش‌ها' })
 const heading = (page: Page) => page.getByRole('heading', { level: 2, name: /^گزارش / })
-const tiles = (page: Page) => page.locator('.report-tiles > .rs')
+const tiles = (page: Page) => page.locator('.report-tiles .rs')
 const reportItems = (page: Page) => page.locator('.report-grid > .report-item')
 const item = (page: Page, name: string) => reportItems(page).filter({ has: page.locator('.report-item__name', { hasText: new RegExp(`^${name.replace(/[:()]/g, '.')}$`) }) })
 const reportTitle = (page: Page) => page.locator('.fbar__title')
@@ -126,6 +126,16 @@ test('an accountant reads the books and takes one report alone as Excel and PDF'
   }
   // The debt to companies cannot be known, and the page says so instead of showing a number.
   await expect(page.getByRole('note').filter({ hasText: 'بدهی شفاخانه به شرکت‌ها' })).toBeVisible()
+
+  // Each money figure opens the report behind it in one click.
+  await page.getByRole('button', { name: 'خالص دریافتی: جزئیات' }).click()
+  await expect(page).toHaveURL(/item=net/)
+  await expect(reportTitle(page)).toHaveText('محاسبه خالص دریافتی')
+  await page.goBack()
+  await page.getByRole('button', { name: 'عواید: جزئیات' }).click()
+  await expect(page).toHaveURL(/item=sections/)
+  await expect(reportTitle(page)).toHaveText('عواید هر بخش')
+  await page.goBack()
 
   await item(page, 'مصارف به تفکیک نوع').click()
   await expect(page).toHaveURL(/item=expenses/)

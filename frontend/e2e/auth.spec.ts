@@ -45,7 +45,7 @@ test('admin creates a receptionist who sees no user management, then is deactiva
   await expect(dialog).toBeHidden()
 
   await page.getByRole('searchbox', { name: 'جستجو', exact: true }).fill(userName)
-  await page.getByRole('button', { name: 'جستجو', exact: true }).click()
+  // The list filters while typing; there is no search button to press.
   const row = page.getByRole('row', { name: new RegExp(userName) })
   await expect(row).toBeVisible()
 

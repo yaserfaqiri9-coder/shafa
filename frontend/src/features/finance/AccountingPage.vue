@@ -13,6 +13,7 @@ import { formatDate, formatDateTime, todayIso } from '@/utils/date'
 import { money, quantity } from '@/utils/money'
 import type { DateRange } from '@/utils/period'
 import { invoiceStatusLabels, invoiceStatusTones, type InvoiceDetail, type InvoiceRow, type PaymentRow } from './types'
+import { createReceiptList } from './receiptList'
 
 interface LedgerBalance {
   code: string
@@ -94,8 +95,17 @@ const withDays = (path: string, days: { from: string | null; to: string | null }
   if (days.to) params.set('to', days.to)
   return params.size ? `${path}?${params}` : path
 }
-const paymentList = usePagedList<PaymentRow>(() => withDays('/payments', paymentDays))
+const paymentList = createReceiptList(() => withDays('/payments', paymentDays), () => auth.can('invoices.view'))
 const expenseList = usePagedList<ExpenseRow>(() => withDays('/expenses', expenseDays))
+function searchPayments() { paymentList.searchNow().catch((cause) => (error.value = errorMessage(cause))) }
+// Searches while typing, as every list does; a short pause keeps the server from a request per letter.
+let paymentSearchTimer: ReturnType<typeof setTimeout> | undefined
+watch(paymentList.search, () => {
+  clearTimeout(paymentSearchTimer)
+  paymentSearchTimer = setTimeout(searchPayments, 350)
+})
+onBeforeUnmount(() => clearTimeout(paymentSearchTimer))
+onBeforeUnmount(paymentList.dispose)
 watch(() => ({ ...paymentDays }), () => paymentList.first().catch((cause) => (error.value = errorMessage(cause))))
 watch(() => ({ ...expenseDays }), () => expenseList.first().catch((cause) => (error.value = errorMessage(cause))))
 
@@ -368,16 +378,16 @@ onMounted(() => {
       </template>
 
       <template v-else-if="tab === 'payments'">
-        <UiFilterBar flat :count="`${quantity(paymentList.total.value)} رسید`">
+        <UiFilterBar v-model:search="paymentList.search.value" flat search-label="جستجوی دریافت و برگشت" search-placeholder="نام مریض، شماره فاکتور یا رسید" :count="`${quantity(paymentList.total.value)} رسید`" @keydown.enter.prevent="searchPayments">
           <UiPeriodFilter v-model="paymentPeriod" allow-all />
         </UiFilterBar>
         <p v-if="payments.length === 0" class="xr-state">{{ paymentDays.from || paymentDays.to ? 'در این روزها دریافتی ثبت نشده است.' : 'دریافتی ثبت نشده است.' }}</p>
         <div v-else class="xr-table-wrap">
           <table class="xr-table">
-            <thead><tr><th>رسید</th><th>فاکتور</th><th>مبلغ</th><th>برگشت‌شده</th><th>دریافت‌کننده</th><th>زمان</th><th v-if="auth.can('payments.refund')">عملیات</th></tr></thead>
+            <thead><tr><th>نام مریض</th><th>فاکتور</th><th>مبلغ</th><th>برگشت‌شده</th><th>دریافت‌کننده</th><th>زمان</th><th v-if="auth.can('payments.refund')">عملیات</th></tr></thead>
             <tbody>
               <tr v-for="row in payments" :key="row.id">
-                <td><span class="ltr-num">{{ row.receiptNumber }}</span></td>
+                <td>{{ row.patientName ?? 'بدون مریض' }}</td>
                 <td><span class="ltr-num">{{ row.invoiceNumber }}</span></td>
                 <td>{{ money(row.amount) }}</td>
                 <td>{{ money(row.refunded) }}</td>

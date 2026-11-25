@@ -1,7 +1,16 @@
+export type QueueShift = 'Morning' | 'Afternoon'
+
+export const queueShiftLabel = (shift: QueueShift, round = 1) => {
+  const label = shift === 'Afternoon' ? 'بعدازچاشت' : 'صبح'
+  return round > 1 ? `${label} - دور ${round}` : label
+}
+
 export interface VisitRow {
   id: number
   visitNumber: string
   queueNumber: number | null
+  queueShift: QueueShift
+  queueRound: number
   patientId: number
   patientFileNumber: string
   patientName: string
@@ -19,12 +28,19 @@ export interface VisitRow {
   feeStatus: 'Paid' | 'Unpaid' | 'Refunded' | 'None'
   /** Triage has finished its part for this visit. */
   visionComplete?: boolean
+  patientAgeMonths?: number | null
   patientAgeYears?: number | null
+  /** Doctor's worklist only: when the patient last became ready for the doctor. */
+  readySince?: string | null
+  /** Doctor's seen list only: back from refraction or a test with the result in, and the file not opened since. */
+  resultReady?: boolean
 }
 
 export interface VisitToken {
   id: number
   queueNumber: number | null
+  queueShift: QueueShift
+  queueRound: number
   tokenDate: string
   departmentId: number
   departmentName: string
@@ -45,6 +61,8 @@ export interface Admission {
   visitId: number
   visitNumber: string
   queueNumber: number | null
+  queueShift: QueueShift
+  queueRound: number
   patientId: number
   patientFileNumber: string
   patientName: string

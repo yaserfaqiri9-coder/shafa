@@ -24,7 +24,8 @@ public static class ReportKind
 /// <param name="Note">One short line under the figure that says what it is, such as what it is not to be confused with.</param>
 /// <param name="Main">One of the few (at most four) figures the page shows on top of the tab. The others stay in the document for
 /// the home page and the checks that tie the tabs together, and each is also a line of one of the reports below.</param>
-public sealed record ReportTile(string Label, decimal? Value, string Kind, string? Note = null, bool Main = false);
+/// <param name="Item">Key of the report table that details this figure; the page opens it on one click.</param>
+public sealed record ReportTile(string Label, decimal? Value, string Kind, string? Note = null, bool Main = false, string? Item = null);
 
 public sealed record ReportColumn(string Label, string Kind);
 
@@ -150,7 +151,7 @@ public static class ReportDocuments
 
     private static ReportTile CountTile(string label, decimal value, string? note = null, bool main = false) => new(label, value, ReportKind.Count, note, main);
 
-    private static ReportTile MoneyTile(string label, decimal? value, string? note = null, bool main = false) => new(label, value, ReportKind.Money, note, main);
+    private static ReportTile MoneyTile(string label, decimal? value, string? note = null, bool main = false, string? item = null) => new(label, value, ReportKind.Money, note, main, item);
 
     private static object?[] Row(params object?[] cells) => cells;
 
@@ -184,10 +185,10 @@ public static class ReportDocuments
     /// <summary>The same four money figures on the overview and the money tab; the overview keeps two of them on top, beside its patients.</summary>
     private static ReportTile[] MoneyTiles(FinanceFigures f, bool allMain = true) =>
     [
-        MoneyTile("عواید", f.Receipts, $"پول دریافت‌شده · {ReportText.Number(f.ReceiptCount)} رسید", main: true),
-        MoneyTile("پول برگشت‌داده‌شده", f.RefundsPaid, "پولی که به مریضان پس داده شد", main: allMain),
-        MoneyTile("مصارف", f.Expenses, main: allMain),
-        MoneyTile("خالص دریافتی", f.NetReceived, "عواید − برگشت پول − مصارف", main: true),
+        MoneyTile("عواید", f.Receipts, $"پول دریافت‌شده · {ReportText.Number(f.ReceiptCount)} رسید", main: true, item: "sections"),
+        MoneyTile("پول برگشت‌داده‌شده", f.RefundsPaid, "پولی که به مریضان پس داده شد", main: allMain, item: "sections"),
+        MoneyTile("مصارف", f.Expenses, main: allMain, item: "expenses"),
+        MoneyTile("خالص دریافتی", f.NetReceived, "عواید − برگشت پول − مصارف", main: true, item: "net"),
     ];
 
     private static ReportTable SectionsTable(FinanceFigures f) =>
@@ -439,9 +440,9 @@ public static class ReportDocuments
         var warnings = new List<string>();
         if (sales.Count > 0)
         {
-            tiles.Add(MoneyTile("فروشات", sales.Sum(s => s.Net), "پول دریافت‌شده، پس از کسر برگشت پول", main: true));
+            tiles.Add(MoneyTile("فروشات", sales.Sum(s => s.Net), "پول دریافت‌شده، پس از کسر برگشت پول", main: true, item: "sales"));
             tiles.Add(MoneyTile("قیمت تمام‌شده", sales.Sum(s => s.Cost), "قیمت خرید اجناس تحویل‌شده"));
-            tiles.Add(MoneyTile("سود فروشات", salesProfit, ProfitNote(salesProfit), main: true));
+            tiles.Add(MoneyTile("سود فروشات", salesProfit, ProfitNote(salesProfit), main: true, item: "sales"));
             tables.Add(new ReportTable("فروشات", [Text("بخش"), Count("تعداد رسید"), Money("فروشات"), Money("قیمت تمام‌شده"), Money("سود")],
                 sales.Select(s => (IReadOnlyList<object?>)Row(s.Name, s.Count, s.Net, s.Cost, Known(s.Profit))).ToList(),
                 sales.Count > 1 ? Row("مجموع", sales.Sum(s => s.Count), sales.Sum(s => s.Net), sales.Sum(s => s.Cost), Known(salesProfit)) : null, Key: "sales"));

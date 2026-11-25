@@ -139,15 +139,15 @@ test('full clinical journey crosses departments without re-entering data', async
   // Triage lands on their queue, records values, sends to doctor.
   const triage = await staffPage(browser, `tri_${stamp}`, errors)
   await expect(triage).toHaveURL(/\/triage$/)
-  await triage.getByRole('row', { name: new RegExp(firstName) }).getByRole('link', { name: 'ثبت معاینه' }).click()
+  await triage.getByRole('listitem').filter({ hasText: firstName }).getByRole('link', { name: 'ثبت معاینه' }).click()
   await expect(triage).toHaveURL(/\/triage\/\d+$/)
   const visitId = triage.url().match(/(\d+)$/)![1]
   await triage.getByLabel(/VA OD/).fill('۶/۹')
   await expect(triage.getByText('تغییرات ذخیره نشده')).toBeVisible()
 
   // Leaving with unsaved values asks first; declining keeps the form and what was typed.
-  triage.once('dialog', (dialog) => dialog.dismiss())
   await triage.getByRole('link', { name: 'بینایی‌سنجی' }).click()
+  await triage.getByRole('dialog').getByRole('button', { name: 'انصراف' }).click()
   await expect(triage).toHaveURL(/\/triage\/\d+$/)
   await expect(triage.getByLabel(/VA OD/)).toHaveValue('6/9')
 
@@ -163,7 +163,8 @@ test('full clinical journey crosses departments without re-entering data', async
   // Vision reached the doctor, who asks for refraction; the cashier collects its fee before it can start.
   const doctor = await staffPage(browser, `doc_${stamp}`, errors)
   await expect(doctor).toHaveURL(/\/doctor$/)
-  const docRow = doctor.getByRole('row', { name: new RegExp(firstName) }).filter({ hasText: 'آماده برای داکتر' })
+  // One row per patient in the doctor's list.
+  const docRow = doctor.getByRole('list', { name: 'صف مریضان' }).getByRole('listitem').filter({ hasText: firstName })
   await expect(docRow).toBeVisible()
   const visitRow = await call<{ patientId: number; patientFileNumber: string }>(doctor, 'GET', `/visits/${visitId}`)
   const tests = await call<{ id: number; kind: string }[]>(doctor, 'GET', '/diagnostic-tests')
@@ -172,28 +173,26 @@ test('full clinical journey crosses departments without re-entering data', async
 
   // The optometrist records stages separately; completing sends the patient back to the same doctor.
   await triage.goto(`/refraction/${visitId}`)
-  await triage.getByLabel('Auto Refraction: SPH OD').fill('-2.25')
-  await triage.getByLabel('Final Refraction: SPH OD').fill('-2.0')
-  await triage.getByLabel('Final Refraction: AXIS OD').fill('190')
-  await expect(triage.getByRole('alert')).toContainText('محور')
-  await triage.getByLabel('Final Refraction: AXIS OD').fill('90')
-  await triage.getByLabel('Final Refraction: CYL OD').fill('0.5')
-  await expect(triage.getByRole('alert')).toContainText('علامت')
-  await triage.getByLabel('Final Refraction: CYL OD').fill('-0.5')
-  await triage.getByLabel('Final Refraction: ADD OD').click()
-  await expect(triage.getByLabel('Final Refraction: SPH OD')).toHaveValue('-2.00')
-  await expect(triage.getByLabel('Final Refraction: CYL OD')).toHaveValue('-0.50')
-  await expect(triage.getByLabel('Final Refraction: SPH OS')).not.toHaveAttribute('placeholder')
+  await triage.getByLabel('SPHERE RE 1', { exact: true }).fill('-2.25')
+  await triage.getByLabel('SPHERE RE 3', { exact: true }).fill('-2.00')
+  await triage.getByLabel('AXIS RE 3', { exact: true }).fill('190.5')
+  await expect(triage.getByLabel('AXIS RE 3', { exact: true })).toHaveValue('190.5')
+  await triage.getByLabel('AXIS RE 3', { exact: true }).fill('90')
+  await triage.getByLabel('CYLENDAR RE 3', { exact: true }).fill('-0.50')
+  await triage.getByLabel('Add', { exact: true }).click()
+  await expect(triage.getByLabel('SPHERE RE 3', { exact: true })).toHaveValue('-2.00')
+  await expect(triage.getByLabel('CYLENDAR RE 3', { exact: true })).toHaveValue('-0.50')
+  await expect(triage.getByLabel('SPHERE LE 4', { exact: true })).not.toHaveAttribute('placeholder')
   await triage.getByLabel(/^PD/).fill('63')
   await triage.getByRole('button', { name: 'ذخیره', exact: true }).click()
   await expect(triage.getByText('ذخیره شد.')).toBeVisible()
   await triage.getByRole('button', { name: 'ذخیره و تکمیل' }).click()
-  await expect(triage.getByText('رفرکشن تکمیل شد و مریض به صف داکتر برگشت.')).toBeVisible()
+  await expect(triage.getByText('نسخه ذخیره و تکمیل شد؛ مریض به صف داکتر برگشت.')).toBeVisible()
 
   // Doctor sees it with the triage values in their places on the dossier, without retyping anything.
   await doctor.reload()
   await expect(docRow).toBeVisible()
-  await docRow.getByRole('link', { name: 'باز کردن پرونده' }).click()
+  await docRow.getByRole('link', { name: 'پرونده', exact: true }).click()
   const front = doctor.getByRole('article', { name: 'روی دوسیه' })
   await expect(front).toContainText('6/9')
   await expect(front).toContainText('17')
@@ -263,11 +262,12 @@ test('full clinical journey crosses departments without re-entering data', async
 
   const lab = await staffPage(browser, `lab_${stamp}`, errors)
   await expect(lab).toHaveURL(/\/lab$/)
-  const labRow = lab.getByRole('row', { name: new RegExp(testName) })
-  await labRow.getByRole('link', { name: 'ثبت نتیجه' }).click()
-  await lab.getByLabel('نتیجه', { exact: true }).fill('نتیجه نمونه آزمایش')
-  await lab.getByRole('button', { name: 'ثبت نتیجه' }).click()
-  await expect(lab).toHaveURL(/\/lab$/)
+  const labRow = lab.getByRole('listitem').filter({ hasText: testName })
+  await labRow.getByRole('button', { name: 'انجام شد' }).click()
+  const finish = lab.getByRole('dialog')
+  await finish.getByLabel('نتیجه', { exact: true }).fill('نتیجه نمونه آزمایش')
+  await finish.getByRole('button', { name: 'ثبت و پایان' }).click()
+  await expect(finish).toBeHidden()
   await expect(labRow).toContainText('نتیجه آماده')
 
   await doctor.reload()
@@ -277,16 +277,23 @@ test('full clinical journey crosses departments without re-entering data', async
   await expect(doctor.getByRole('row', { name: new RegExp(testName) })).toContainText('نتیجه نمونه آزمایش')
   await doctor.keyboard.press('Escape')
 
-  // Finalise: direct edit closes, amendment stays available.
+  // Finalise: the file stays open to its doctor, with no amendment form; the change is kept in history.
   await doctor.getByRole('button', { name: 'نهایی‌سازی', exact: true }).click()
   await expect(doctor.getByText('معاینه نهایی و مراجعه تکمیل شد.')).toBeVisible()
-  await expect(doctor.getByLabel('فوندوس OD')).toBeDisabled()
-  // Amendments live in the file's menu, off the page itself.
   await expect(doctor.getByRole('button', { name: 'ثبت اصلاحیه' })).toHaveCount(0)
+  await expect(doctor.getByLabel('پلان درمان')).toBeEnabled()
+  await doctor.getByLabel('پلان درمان').fill('پلان اصلاح‌شده پس از نهایی شدن')
+  await doctor.getByRole('button', { name: 'ذخیره', exact: true }).click()
+  await expect(doctor.getByRole('status').filter({ hasText: 'ذخیره شد' })).toBeVisible()
   await doctor.getByRole('button', { name: 'گزینه‌های بیشتر پرونده' }).click()
-  await doctor.getByRole('menuitem', { name: 'ادامه معاینه یا اصلاحیه' }).click()
-  await expect(doctor.getByRole('button', { name: 'ثبت اصلاحیه' })).toBeVisible()
+  await doctor.getByRole('menuitem', { name: 'تاریخچه تغییرات' }).click()
+  await expect(doctor.getByRole('dialog')).toContainText('پلان اصلاح‌شده پس از نهایی شدن')
   await doctor.keyboard.press('Escape')
+
+  // The closed visit is on the doctor's seen list, not in the queue.
+  await doctor.goto('/doctor')
+  await doctor.getByRole('tab', { name: /مریضان دیده‌شده/ }).click()
+  await expect(doctor.getByRole('list', { name: 'مریضان دیده‌شده' })).toContainText('تکمیل')
 
   // Reception still has no way into the clinical record.
   await reception.goto(doctor.url().replace(/^https?:\/\/[^/]+/, ''))

@@ -125,6 +125,7 @@ $appDir = Join-Path $Root 'app'
     Storage = @{ Path = (Join-Path $Root 'storage') }
     DataProtection = @{ KeysPath = (Join-Path $Root 'keys') }
     Backup = @{ StatusFile = (Join-Path $Root 'logs\backup-status.json') }
+    Update = @{ StatusFile = (Join-Path $Root 'logs\update-status.json'); ApprovalFile = (Join-Path $Root 'requests\update-approval.json') }
 } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $appDir 'appsettings.Production.json') -Encoding UTF8
 
 $step = 'database schema and first administrator'
@@ -183,19 +184,20 @@ $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $Root 'scri
 if ($BackupOptionalDestination) { $arguments += " -OptionalDestination `"$BackupOptionalDestination`"" }
 if ($AllowSameDisk) { $arguments += ' -AllowSameDisk' }
 # Every night at 02:00 Kabul time, and soon after start-up if a run was missed while the laptop was off.
-$trigger = New-ScheduledTaskTrigger -Daily -At (Get-NightlyBackupTime)
+$trigger = New-KabulBackupTrigger
 $taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
 Register-ScheduledTask -TaskName 'AlShifa Backup' -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments) `
     -Trigger $trigger -Settings $taskSettings -User 'SYSTEM' -RunLevel Highest | Out-Null
 Add-BackupRequestTrigger
+Set-AutoUpdateTasks $Root
+. (Join-Path $PSScriptRoot 'auto-update-common.ps1')
+try { Enable-PublisherFeed $Root $PSScriptRoot $BackupDestination ([bool]$AllowSameDisk) } catch { "WARNING: automatic updates were not enrolled: $_" }
 
 $step = 'first backup and restore test'
 $step
 & (Join-Path $Root 'scripts\backup.ps1') -Root $Root -Destination $BackupDestination -AllowSameDisk:$AllowSameDisk
 if ($LASTEXITCODE) {
     'WARNING: the first backup failed. Fix the destination, then run: Start-ScheduledTask "AlShifa Backup"'
-} else {
-    & (Join-Path $Root 'scripts\restore-test.ps1') -Root $Root -Backup $BackupDestination
 }
 
 ''

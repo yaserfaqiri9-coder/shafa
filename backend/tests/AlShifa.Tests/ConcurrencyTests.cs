@@ -6,6 +6,7 @@ using AlShifa.Api.Features.Clinical;
 using AlShifa.Api.Features.Finance;
 using AlShifa.Api.Features.Inventory;
 using AlShifa.Api.Features.Patients;
+using AlShifa.Api.Features.Realtime;
 using AlShifa.Api.Features.Users;
 using AlShifa.Api.Features.Visits;
 using AlShifa.Api.Infrastructure;
@@ -16,8 +17,24 @@ namespace AlShifa.Tests;
 
 /// <summary>Several users acting on one record at the same moment: at most one succeeds and nothing is lost silently.</summary>
 [Collection("api")]
-public sealed class ConcurrencyTests(ApiFixture api)
+public sealed class ConcurrencyTests(ApiFixture api) : PhysicalQueueTestScope(api)
 {
+    [Fact]
+    public async Task Concurrent_salary_payments_cannot_pay_the_same_earned_balance_twice()
+    {
+        var admin = await UserAsync(Roles.SuperAdmin);
+        var start = StaffPayroll.MonthStart(StaffPayroll.MonthStart(KabulClock.Today).AddDays(-1));
+        var created = await Created<JsonElement>(await admin.PostAsJsonAsync("/api/staff",
+            new SaveStaffRequest(Name("salary"), null, false, true, null, null, MonthlySalary: 1000, EmploymentStartDate: start)));
+        var id = created.GetProperty("id").GetInt64();
+        var attempts = await Task.WhenAll(Enumerable.Range(0, 2).Select(_ => admin.SendAsync(Post($"/api/staff/{id}/payouts", new StaffPayoutRequest(1000, KabulClock.Today, "Salary", null)))));
+        Assert.Equal(1, attempts.Count(r => r.StatusCode == HttpStatusCode.Created));
+        Assert.Equal(1, attempts.Count(r => r.StatusCode == HttpStatusCode.Conflict));
+        using var scope = api.Services.CreateScope();
+        Assert.Equal(1000m, await scope.ServiceProvider.GetRequiredService<AppDbContext>().Expenses.Where(e => e.StaffId == id && e.Status == ExpenseStatus.Recorded).SumAsync(e => e.Amount));
+        await AssertLedgerReconciles();
+    }
+
     private const int Racers = 6;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } };
@@ -335,7 +352,7 @@ public sealed class ConcurrencyTests(ApiFixture api)
     }
 
     [Fact]
-    public async Task A_refunded_sale_is_refused_a_return_with_a_clear_answer_and_stock_stays_put()
+    public async Task A_fully_refunded_pharmacy_sale_returns_stock_once_without_refunding_money_twice()
     {
         var rx = await PrescriptionInStockAsync(5);
         var pharmacist = await UserAsync(Roles.Pharmacist);
@@ -350,9 +367,15 @@ public sealed class ConcurrencyTests(ApiFixture api)
 
         var returned = await pharmacist.PostAsJsonAsync($"/api/pharmacy/sales/{sale.Id}/return", new ReturnSaleRequest(sale.Version, "برگشت جنس"));
 
-        Assert.Equal(HttpStatusCode.Conflict, returned.StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, returned.StatusCode);
         using var scope = api.Services.CreateScope();
-        Assert.Equal(99, await scope.ServiceProvider.GetRequiredService<AppDbContext>().StockBatches.Where(b => b.ProductId == rx.ProductId).SumAsync(b => b.Quantity));
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.Equal(100, await db.StockBatches.Where(b => b.ProductId == rx.ProductId).SumAsync(b => b.Quantity));
+        Assert.Equal(payment.Amount, await db.Refunds.Where(r => r.PaymentId == payment.Id).SumAsync(r => r.Amount));
+        Assert.Equal(1, await db.Refunds.CountAsync(r => r.PaymentId == payment.Id));
+        Assert.Equal(InvoiceStatus.Void, await db.Invoices.Where(i => i.Id == sale.InvoiceId).Select(i => i.Status).SingleAsync());
+        Assert.Equal(HttpStatusCode.Conflict, (await pharmacist.PostAsJsonAsync($"/api/pharmacy/sales/{sale.Id}/return", new ReturnSaleRequest(sale.Version, "تکرار برگشت"))).StatusCode);
+        Assert.Equal(100, await db.StockBatches.Where(b => b.ProductId == rx.ProductId).SumAsync(b => b.Quantity));
         await AssertLedgerReconciles();
     }
 
@@ -408,5 +431,46 @@ public sealed class ConcurrencyTests(ApiFixture api)
         // A drawer that really paid out the refund and the expense holds 1350, and shows as 150 short. No ledger entry records that difference.
         Assert.Equal(1350, result.CountedAmount);
         await AssertLedgerReconciles();
+    }
+
+    [Fact]
+    public async Task Retention_cleanup_deletes_expired_replay_records_in_batches_and_keeps_live_ones()
+    {
+        using var scope = api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var now = DateTime.UtcNow;
+        var cutoff = now.AddDays(-7);
+        // Rows from earlier tests are older by id; in production ids grow with time, so they are expired too.
+        await db.IdempotencyRecords.ExecuteUpdateAsync(s => s.SetProperty(r => r.CreatedAt, now.AddDays(-9)));
+        var marker = Guid.NewGuid().ToString("N")[..16];
+        var expired = Enumerable.Range(0, OutboxDispatcher.CleanupBatch * 2 + 7)
+            .Select(i => new IdempotencyRecord { UserId = 990_000_001, Key = $"{marker}-old-{i}", RequestHash = "h", StatusCode = 201, ResponseBody = "{}", CreatedAt = now.AddDays(-8) })
+            .ToList();
+        db.IdempotencyRecords.AddRange(expired);
+        await db.SaveChangesAsync();
+        var live = new IdempotencyRecord { UserId = 990_000_001, Key = $"{marker}-live", RequestHash = "h", StatusCode = 201, ResponseBody = "{}", CreatedAt = now.AddDays(-6) };
+        db.IdempotencyRecords.Add(live);
+        await db.SaveChangesAsync();
+
+        var deleted = await OutboxDispatcher.PurgeIdempotencyRecordsAsync(db, cutoff, CancellationToken.None);
+
+        Assert.True(deleted >= expired.Count);
+        Assert.False(await db.IdempotencyRecords.AnyAsync(r => r.CreatedAt < cutoff));
+        Assert.True(await db.IdempotencyRecords.AnyAsync(r => r.Key == live.Key));
+
+        // A request retried inside the retention window still replays instead of creating a second record.
+        var admin = await UserAsync(Roles.SuperAdmin);
+        var start = StaffPayroll.MonthStart(StaffPayroll.MonthStart(KabulClock.Today).AddDays(-1));
+        var staff = await Created<JsonElement>(await admin.PostAsJsonAsync("/api/staff",
+            new SaveStaffRequest(Name("replay"), null, false, true, null, null, MonthlySalary: 1000, EmploymentStartDate: start)));
+        var url = $"/api/staff/{staff.GetProperty("id").GetInt64()}/payouts";
+        var payout = new StaffPayoutRequest(400, KabulClock.Today, "Salary", null);
+        var key = Guid.NewGuid().ToString("N");
+        var first = await admin.SendAsync(Post(url, payout, key));
+        await OutboxDispatcher.PurgeIdempotencyRecordsAsync(db, cutoff, CancellationToken.None);
+        var second = await admin.SendAsync(Post(url, payout, key));
+        Assert.Equal(HttpStatusCode.Created, first.StatusCode);
+        Assert.Equal(HttpStatusCode.Created, second.StatusCode);
+        Assert.Equal(await first.Content.ReadAsStringAsync(), await second.Content.ReadAsStringAsync());
     }
 }

@@ -2,10 +2,13 @@ using System.ComponentModel.DataAnnotations;
 using System.Security.Cryptography;
 using AlShifa.Api.Features.Auth;
 using AlShifa.Api.Features.Clinical;
+using AlShifa.Api.Features.Visits;
 using AlShifa.Api.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 
 namespace AlShifa.Api.Features.Settings;
+
+public sealed record ResetQueueNumbersRequest(DateOnly Date, QueueShift QueueShift);
 
 public class Attachment
 {
@@ -83,6 +86,17 @@ public static class SettingsEndpoints
             await db.SaveChangesAsync(ct);
             return Results.Ok(await LoadAsync(db, ct));
         }).RequirePermission("settings.edit");
+
+        settings.MapGet("/queue-numbers/current", () =>
+        {
+            var today = KabulClock.Today;
+            var shift = QueueShifts.Current;
+            return Results.Ok(new { date = today, queueShift = shift.ToString(), queueShiftLabel = QueueShifts.Label(shift) });
+        }).RequirePermission("settings.edit");
+
+        settings.MapPost("/queue-numbers/reset", () => Results.Conflict(new {
+            code = "manual_queue_cards", message = "شماره کارت فیزیکی دستی ثبت می‌شود؛ شماره‌های امروز قابل شروع مجدد نیستند."
+        })).RequirePermission("settings.edit");
 
         settings.MapGet("/backup-status", (IConfiguration config) => Results.Ok(BackupStatus.Read(config["Backup:StatusFile"], DateTime.UtcNow)))
             .RequirePermission("settings.view");

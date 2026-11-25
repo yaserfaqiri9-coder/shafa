@@ -79,6 +79,10 @@ export const menu: MenuSection[] = [
     ],
   },
   {
+    title: 'ارتباطات',
+    items: [{ label: 'گفتگو با همکاران', icon: 'ri-chat-3-fill', to: '/chat' }],
+  },
+  {
     title: 'مدیریت',
     items: [
       { label: 'گزارش‌ها', icon: 'ri-bar-chart-box-fill', to: '/reports', permission: 'reports.view' },

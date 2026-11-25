@@ -4,7 +4,7 @@ import { api } from '@/api/http'
 import { parseFindings, parseMeasurements, parsePlan, parseRefractionExtras, systemicConditions } from '@/features/clinical/examRecord'
 import type { Chart, Refraction } from '@/features/clinical/types'
 import type { Patient } from '@/features/patients/types'
-import { patientName } from '@/features/patients/types'
+import { patientAge, patientName } from '@/features/patients/types'
 import { shamsiPaper, useClipper, useHospital, usePaperPage } from './paper'
 
 const RX_LINES = 16
@@ -100,6 +100,14 @@ const rxNotes = computed(() => (chart.value?.prescriptions ?? []).filter((p) => 
 const isMale = computed(() => patient.value?.gender === 'Male')
 const isFemale = computed(() => patient.value?.gender === 'Female')
 
+/** The printed Dari clinic footer from the supplied paper sample. */
+const sampleAddressDari = 'آدرس: افغانستان، هرات، سرک باغ آزادی، مقابل جاده کج'
+const sampleBookingText = 'جهت اخذ نوبت و معلومات به این شماره به تماس شوید:'
+const sampleConsultationText = 'جهت مشاوره طبی:'
+const sampleBookingPhone = '0796646401'
+const sampleConsultationPhone = '+93 0798144442'
+const sampleWhatsAppPhone = '0793253578'
+
 const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
 let fitRun = 0
 let resizeFrame = 0
@@ -139,8 +147,10 @@ function scheduleFit() {
   resizeFrame = requestAnimationFrame(() => void settleFit())
 }
 
-function printSingleSide(side: 'front' | 'back') {
+async function printSingleSide(side: 'front' | 'back') {
   printSide.value = side
+  // Vue batches the class update; wait until the unwanted side is hidden before print snapshots the page.
+  await nextTick()
   window.print()
 }
 
@@ -196,14 +206,17 @@ onBeforeUnmount(() => {
             <div class="kv line"><b>F/Name:</b> <span dir="auto">{{ patient.fatherName }}</span></div>
             <div class="kv line id-block__row">
               <span><b>Sex:</b> M <i class="tick" :class="{ 'tick--on': isMale }"></i> F <i class="tick" :class="{ 'tick--on': isFemale }"></i></span>
-              <span><b>Age:</b> {{ patient.ageYears }}</span>
+              <span><b>Age:</b> {{ patientAge(patient) }}</span>
               <span class="id-block__addr"><b>Add:</b> <span dir="auto">{{ clip('Address', patient.address, 60) }}</span></span>
             </div>
             <div class="kv"><b>Occupation:</b> <span dir="auto">{{ clip('Occupation', patient.occupation, 40) }}</span></div>
           </div>
           <div class="id-block__brand box">
             <img src="/print/alshefa-official-logo.png" alt="لوگوی شفاخانه تخصصی چشم الشفا" class="brand-logo" />
-            <div class="brand-name" dir="auto">{{ hospital?.hospitalName }}</div>
+            <div class="brand-name" aria-label="شفاخانه تخصصی چشم الشفا؛ Alshefa Eye Hospital">
+              <div class="brand-name__fa" dir="rtl">شفاخانه تخصصی چشم الشفا</div>
+              <div class="brand-name__en" dir="ltr">Alshefa Eye Hospital</div>
+            </div>
           </div>
         </header>
 
@@ -253,7 +266,7 @@ onBeforeUnmount(() => {
           <div class="slit__art">
             <h2 class="display">Slit Lamp Examination</h2>
             <svg viewBox="0 0 300 96" class="slit__eyes" aria-hidden="true">
-              <g fill="none" stroke="#000" stroke-width="1">
+              <g fill="none" stroke="#173B5C" stroke-width="1">
                 <path d="M18 34 Q72 8 132 36 Q72 24 18 34Z" />
                 <path d="M168 36 Q228 8 282 34 Q228 24 168 36Z" />
                 <path d="M16 62 Q74 26 134 62 Q74 94 16 62Z" />
@@ -295,7 +308,7 @@ onBeforeUnmount(() => {
             <div class="fundus__method"><b>Indirect: 90 D / 78 D / 20 D - 360° - Direct:</b> {{ method }}</div>
             <div class="fundus__grid">
               <svg viewBox="0 0 110 110" class="fundus__eye" aria-hidden="true">
-                <g fill="none" stroke="#000"><circle cx="55" cy="55" r="52" /><ellipse cx="72" cy="55" rx="9" ry="11" /><path d="M72 44 Q52 34 36 40 M72 66 Q52 76 36 70" /></g>
+                <g fill="none" stroke="#173B5C"><circle cx="55" cy="55" r="52" /><ellipse cx="72" cy="55" rx="9" ry="11" /><path d="M72 44 Q52 34 36 40 M72 66 Q52 76 36 70" /></g>
               </svg>
               <table class="grid fundus__table">
                 <thead><tr><th></th><th>OD</th><th>OS</th></tr></thead>
@@ -304,7 +317,7 @@ onBeforeUnmount(() => {
                 </tbody>
               </table>
               <svg viewBox="0 0 110 110" class="fundus__eye" aria-hidden="true">
-                <g fill="none" stroke="#000"><circle cx="55" cy="55" r="52" /><ellipse cx="38" cy="55" rx="9" ry="11" /><path d="M38 44 Q58 34 74 40 M38 66 Q58 76 74 70" /></g>
+                <g fill="none" stroke="#173B5C"><circle cx="55" cy="55" r="52" /><ellipse cx="38" cy="55" rx="9" ry="11" /><path d="M38 44 Q58 34 74 40 M38 66 Q58 76 74 70" /></g>
               </svg>
             </div>
           </div>
@@ -316,11 +329,11 @@ onBeforeUnmount(() => {
             <div class="kv"><b>Date:</b> {{ refraction ? shamsiPaper(refraction.recordedAt) : '' }}</div>
             <div class="refr__row"><b>present GL:</b> <span>OD: {{ rxText(stageLine('Current', 'OD')) }}</span> <span>OS: {{ rxText(stageLine('Current', 'OS')) }}</span></div>
             <div class="refr__row"><b>Retinoscopy:</b> <span>OD: {{ investigations.od.retinoscopy }}</span> <span>OS: {{ investigations.os.retinoscopy }}</span></div>
-            <div class="refr__row"><b>Final Rx:</b> <span>OD: {{ rxText(stageLine('Final', 'OD')) }}</span> <span>OS: {{ rxText(stageLine('Final', 'OS')) }}</span></div>
             <div class="refr__cross">
               <svg v-for="eye in ['OD', 'OS']" :key="eye" viewBox="0 0 120 56" aria-hidden="true">
-                <g stroke="#000" fill="none"><path d="M60 8V48 M26 28H94" /></g>
-                <g font-size="8" text-anchor="middle" fill="#000"><text x="60" y="7">90</text><text x="60" y="55">270</text><text x="16" y="31">180</text><text x="104" y="31">0</text></g>
+                <g stroke="#173B5C" fill="none"><path d="M60 8V48 M26 28H94" /></g>
+                <g stroke="#173B5C" fill="#fff"><ellipse cx="60" cy="7" rx="11" ry="6" /><ellipse cx="60" cy="49" rx="12" ry="6" /><ellipse cx="16" cy="28" rx="11" ry="6" /><ellipse cx="104" cy="28" rx="10" ry="6" /></g>
+                <g font-size="7" text-anchor="middle" dominant-baseline="middle" fill="#173B5C"><text x="60" y="7">90</text><text x="60" y="49">270</text><text x="16" y="28">180</text><text x="104" y="28">0</text></g>
               </svg>
             </div>
           </div>
@@ -419,8 +432,13 @@ onBeforeUnmount(() => {
           </div>
         </section>
         <footer class="back-foot" dir="auto">
-          <span v-if="hospital?.address">{{ hospital.address }}</span>
-          <span v-if="hospital?.phone" dir="ltr">{{ hospital.phone }}</span>
+          <div class="back-foot__row">
+            <span>{{ sampleAddressDari }}</span>
+          </div>
+          <div class="back-foot__row back-foot__contact">
+            <span>{{ sampleBookingText }} <bdi dir="ltr">{{ hospital?.phone || sampleBookingPhone }}</bdi></span>
+            <span>{{ hospital?.printFooter || sampleConsultationText }} <bdi dir="ltr">{{ sampleConsultationPhone }}</bdi> <i class="ri-whatsapp-line" aria-hidden="true"></i> <bdi dir="ltr">{{ sampleWhatsAppPhone }}</bdi> <i class="ri-facebook-circle-fill" aria-hidden="true"></i></span>
+          </div>
         </footer>
       </article>
     </div>
@@ -450,7 +468,11 @@ onBeforeUnmount(() => {
 
 /* One sheet side, at its real paper size. */
 .sheet {
-  --line: 0.5pt solid #000;
+  --ink: #1f2933;
+  --navy: #173b5c;
+  --line: 0.5pt solid #8aa0af;
+  --pale: #e8f0f5;
+  --soft: #d5e3eb;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
@@ -459,9 +481,11 @@ onBeforeUnmount(() => {
   height: 297mm;
   margin: 0 auto 12px;
   padding: 7mm 8mm;
+  box-sizing: border-box;
+  border: 1.5pt double var(--navy);
   overflow: hidden;
   background: #fff;
-  color: #000;
+  color: var(--ink);
   font-family: 'Poppins', 'Vazirmatn', sans-serif;
   font-size: 8.5pt;
   line-height: 1.3;
@@ -515,7 +539,7 @@ onBeforeUnmount(() => {
 
 /* Prints even with the browser's "background graphics" off, which is its default. */
 .tick--on {
-  box-shadow: inset 0 0 0 3mm #000;
+  box-shadow: inset 0 0 0 3mm var(--navy);
   print-color-adjust: exact;
   -webkit-print-color-adjust: exact;
 }
@@ -556,11 +580,28 @@ onBeforeUnmount(() => {
 .brand-logo {
   max-width: 100%;
   max-height: 14mm;
+  object-fit: contain;
 }
 
 .brand-name {
-  font-size: 10pt;
+  display: grid;
+  gap: 0.4mm;
+  width: 100%;
+  color: var(--ink);
+  font-size: 7.5pt;
   font-weight: 700;
+  line-height: 1.1;
+  text-align: center;
+}
+
+.brand-name__fa {
+  font-family: 'Vazirmatn', sans-serif;
+  font-size: 7.5pt;
+}
+
+.brand-name__en {
+  font-family: 'Poppins', sans-serif;
+  font-size: 7.8pt;
 }
 
 /* Grids */
@@ -588,9 +629,16 @@ onBeforeUnmount(() => {
   font-weight: 600;
 }
 
+.grid th:not(.dark),
+.rx-table th {
+  background: var(--pale);
+  print-color-adjust: exact;
+  -webkit-print-color-adjust: exact;
+}
+
 /* Solid black prints reliably even with the browser's "background graphics" turned off. */
 .dark {
-  box-shadow: inset 0 0 0 20mm #000;
+  box-shadow: inset 0 0 0 20mm var(--navy);
   color: #fff;
   print-color-adjust: exact;
   -webkit-print-color-adjust: exact;
@@ -604,7 +652,7 @@ onBeforeUnmount(() => {
 
 .display {
   margin: 0 0 1mm;
-  color: #000;
+  color: var(--navy);
   font-family: Georgia, 'Times New Roman', serif;
   font-size: 13pt;
   font-style: italic;
@@ -694,6 +742,7 @@ onBeforeUnmount(() => {
   font-weight: 700;
   writing-mode: vertical-rl;
   transform: rotate(180deg);
+  color: var(--navy);
 }
 
 /* Fundus */
@@ -754,42 +803,47 @@ onBeforeUnmount(() => {
 .refr__left {
   flex: 1;
   min-width: 0;
-  padding: 1mm 0;
-  font-size: 7.8pt;
+  padding: 1mm 0.8mm 0.5mm 0;
+  font-size: 7.6pt;
 }
 
 .refr__row {
   display: flex;
   flex-wrap: wrap;
-  gap: 2mm;
-  padding-block: 0.2mm;
+  align-items: baseline;
+  gap: 1.6mm;
+  min-height: 4.7mm;
+  padding-block: 0.1mm;
 }
 
 .refr__cross {
   display: flex;
   justify-content: space-around;
+  margin-top: 0.3mm;
 }
 
 .refr__cross svg {
-  width: 36mm;
+  width: 34mm;
+  height: 16mm;
 }
 
 .refr__right {
   display: flex;
   flex-direction: column;
-  gap: 0.8mm;
-  width: 76mm;
-  padding: 1mm 1.6mm 1mm 0;
+  gap: 0.5mm;
+  width: 74mm;
+  padding: 0.8mm 1.2mm 0.8mm 0;
 }
 
 .tagbox {
   display: flex;
   align-items: center;
-  gap: 2mm;
-  min-height: 9mm;
-  padding: 0.4mm 1.4mm 0.4mm 0;
+  gap: 1.4mm;
+  min-height: 9.2mm;
+  padding: 0.25mm 1.4mm 0.25mm 0;
   border: var(--line);
-  font-size: 7.8pt;
+  border-radius: 2mm;
+  font-size: 7.6pt;
 }
 
 .tag {
@@ -797,11 +851,13 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   align-self: stretch;
-  width: 10mm;
-  box-shadow: inset 0 0 0 20mm #000;
+  width: 12mm;
+  margin-inline-start: -1.5mm;
+  box-shadow: inset 0 0 0 20mm var(--navy);
   color: #fff;
   font-family: Georgia, 'Times New Roman', serif;
   font-size: 12pt;
+  clip-path: polygon(0 0, 100% 0, 100% 35%, 72% 50%, 100% 65%, 100% 100%, 0 100%, 0 65%, 28% 50%, 0 35%);
   print-color-adjust: exact;
   -webkit-print-color-adjust: exact;
 }
@@ -815,7 +871,18 @@ onBeforeUnmount(() => {
 .meas__top {
   display: grid;
   grid-template-columns: 2fr 1fr 1.4fr 1.4fr;
-  gap: 2mm;
+  gap: 0;
+  padding: 0;
+}
+
+.meas__top > span {
+  min-height: 6mm;
+  padding: 1.1mm 1.6mm;
+  border-inline-end: var(--line);
+}
+
+.meas__top > span:last-child {
+  border-inline-end: 0;
 }
 
 .meas__bottom {
@@ -836,6 +903,9 @@ onBeforeUnmount(() => {
 
 .meas__bottom th:not(.dark) {
   width: 9mm;
+  background: var(--pale);
+  print-color-adjust: exact;
+  -webkit-print-color-adjust: exact;
 }
 
 .note-block {
@@ -883,7 +953,7 @@ onBeforeUnmount(() => {
 .dots {
   display: block;
   min-height: 5mm;
-  border-bottom: 0.5pt dotted #000;
+  border-bottom: 0.5pt dotted #8aa0af;
 }
 
 .back-dx__general {
@@ -905,13 +975,14 @@ onBeforeUnmount(() => {
   font-style: italic;
   font-weight: 700;
   line-height: 1;
+  color: var(--navy);
 }
 
 .rx-table {
   table-layout: fixed;
   width: 100%;
   border-collapse: collapse;
-  border: 0.75pt solid #000;
+  border: 0.75pt solid var(--navy);
 }
 
 .rx-table__drug-col {
@@ -928,8 +999,8 @@ onBeforeUnmount(() => {
 
 .rx-table th,
 .rx-table td {
-  border-inline-start: 0.5pt solid #000;
-  border-bottom: 0.5pt solid #000;
+  border-inline-start: 0.5pt solid #8aa0af;
+  border-bottom: 0.5pt solid #8aa0af;
   text-align: start;
   vertical-align: middle;
 }
@@ -1098,17 +1169,41 @@ onBeforeUnmount(() => {
 .sign-line {
   display: inline-block;
   width: 45mm;
-  border-bottom: 0.5pt solid #000;
+  border-bottom: 0.5pt solid #8aa0af;
 }
 
 .back-foot {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  gap: 1mm 6mm;
+  display: grid;
+  gap: 0.5mm;
   padding-top: 1mm;
   border-top: var(--line);
-  font-size: 8pt;
+  direction: rtl;
+  font-size: 9pt;
+  text-align: right;
+}
+
+.back-foot__row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 3mm;
+  min-height: 4mm;
+}
+
+.back-foot__contact {
+  gap: 8mm;
+  flex-wrap: wrap;
+  font-size: 8.5pt;
+}
+
+.back-foot bdi {
+  font-size: 10pt;
+  font-weight: 700;
+}
+
+.back-foot i {
+  margin-inline: 0.8mm;
+  font-size: 10pt;
 }
 
 @media print {

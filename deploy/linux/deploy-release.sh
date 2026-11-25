@@ -112,6 +112,13 @@ core_counts "$db" > "$backup_dir/production-before.txt"
     Storage__Path=/var/lib/alshifa/storage DataProtection__KeysPath=/var/lib/alshifa/keys \
     ./AlShifa.Api --migrate --backup-taken
 ) > "$backup_dir/production-migration.log" 2>&1
+(
+  cd "$release"
+  sudo -u alshifa env ASPNETCORE_ENVIRONMENT=Production Mirror__Enabled=true \
+    ConnectionStrings__Default="$ALSHIFA_MIRROR_OWNER" \
+    Storage__Path=/var/lib/alshifa/storage DataProtection__KeysPath=/var/lib/alshifa/keys \
+    ./AlShifa.Api --online-superadmin-permissions
+) > "$backup_dir/online-permission-sync.log" 2>&1
 core_counts "$db" > "$backup_dir/production-after.txt"
 cmp "$backup_dir/production-before.txt" "$backup_dir/production-after.txt"
 # A new migration may recreate AspNetUsers; the read-only account's sign-in columns must stay writable.

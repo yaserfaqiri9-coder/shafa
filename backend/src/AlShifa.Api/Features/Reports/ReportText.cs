@@ -22,7 +22,8 @@ public static class ReportText
     public static string Time(DateTime utc)
     {
         var at = Kabul(utc);
-        return $"{Date(DateOnly.FromDateTime(at))}  {at:HH:mm}";
+        // 12-hour clock with the Dari day period, as on every screen.
+        return $"{Date(DateOnly.FromDateTime(at))}  {at:hh:mm} {(at.Hour < 12 ? "ق.ظ." : "ب.ظ.")}";
     }
 
     /// <summary>Such as «5 حمل 1405», for the days a report covers.</summary>
@@ -44,6 +45,9 @@ public static class ReportText
         (value == 0 ? 0 : value).ToString(value == decimal.Truncate(value) ? "#,##0" : "#,##0.##", CultureInfo.InvariantCulture);
 
     public static string Money(decimal value) => $"{Number(value)} افغانی";
+
+    /// <summary>Written where a figure cannot be known from the recorded data, so no made-up number is shown.</summary>
+    public const string Unknown = "نامعلوم";
 
     /// <summary>A cell as text for the PDF. Null reads as an empty cell.</summary>
     public static string Cell(object? value, string kind) => value switch

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { connectRealtime, disconnectRealtime } from '@/api/realtime'
+import { connectRealtime, disconnectRealtime, useLiveRefresh } from '@/api/realtime'
 import { api } from '@/api/http'
 import { useAudioStation, useAudioStationHost } from './audioStation'
 
@@ -9,8 +9,9 @@ defineOptions({ name: 'CallScreenPage' })
 const route = useRoute()
 useAudioStationHost()
 const { activated, onAir, needsAttention, busyElsewhere, error, preparing, retryAudio, activate, restoreSound, loadStatus } = useAudioStation()
-interface DisplayCall { id: number; queueNumber: number; destination: string; patientName: string | null }
+interface DisplayCall { id: number; queueNumber: number; queueShift: 'Morning' | 'Afternoon'; queueRound: number; destination: string }
 const shown = ref<DisplayCall | null>(null)
+const doctorQueue = ref<{ currentNumber: number | null; nextNumber: number | null; doctorName: string | null; calledNumber: number | null } | null>(null)
 const displayOffline = ref(false)
 let displayLoading = false
 let disposed = false
@@ -18,23 +19,27 @@ async function loadDisplay() {
   if (displayLoading) return
   displayLoading = true
   try {
-    const call = await api<DisplayCall | undefined>('/calls/display')
+    const [call, queue] = await Promise.all([api<DisplayCall | undefined>('/calls/display'), api<NonNullable<typeof doctorQueue.value>>('/calls/display/doctor-queue')])
     if (!disposed) {
       shown.value = call ?? null
+      doctorQueue.value = queue
       displayOffline.value = false
     }
   } catch {
     if (!disposed) {
-      shown.value = null
       displayOffline.value = true
     }
   } finally { displayLoading = false }
 }
 const digits = (value: string | number) => String(value).replace(/\d/g, (digit) => '۰۱۲۳۴۵۶۷۸۹'[Number(digit)]!)
-const ticket = computed(() => shown.value ? digits(shown.value.queueNumber) : '—')
+const ticket = computed(() => {
+  const number = doctorQueue.value?.currentNumber ?? doctorQueue.value?.calledNumber
+  return number == null ? '—' : digits(number)
+})
 const destination = computed(() => shown.value?.destination || '—')
+useLiveRefresh(['PatientCallChanged', 'VisitCreated', 'VisitStatusChanged', 'PreExamCompleted', 'ConsultationCompleted', 'DiagnosticOrderCreated', 'DiagnosticResultReady', 'PaymentReceived'], loadDisplay, 0)
 const now = ref(new Date())
-const time = computed(() => new Intl.DateTimeFormat('fa-AF', { timeZone: 'Asia/Kabul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(now.value))
+const time = computed(() => new Intl.DateTimeFormat('fa-AF', { timeZone: 'Asia/Kabul', hour: '2-digit', minute: '2-digit', hour12: true }).format(now.value))
 const date = computed(() => {
   const parts = new Intl.DateTimeFormat('fa-AF-u-ca-persian', { timeZone: 'Asia/Kabul', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).formatToParts(now.value)
   const part = (type: Intl.DateTimeFormatPartTypes) => parts.find((entry) => entry.type === type)?.value || ''
@@ -99,13 +104,15 @@ onBeforeUnmount(() => {
       </header>
       <section class="lcd__call" aria-live="assertive" aria-atomic="true" aria-label="فراخوان جاری">
         <div class="lcd__number-panel">
-          <div class="lcd__label">بیمار شماره</div>
-          <div v-if="shown?.patientName" class="lcd__patient-name">{{ shown.patientName }}</div>
-          <div class="lcd__number" :class="{ 'lcd__number--named': shown?.patientName }" dir="ltr" :style="{ fontSize: `${Math.min(shown?.patientName ? 310 : 440, ticket.length > 2 ? 650 / (ticket.length * .65) : 440)}px` }"><span class="lcd__digits">{{ ticket }}</span></div>
+          <div class="lcd__label">{{ doctorQueue?.doctorName ? `داکتر ${doctorQueue.doctorName}` : 'نوبت داکتر' }}</div>
+          <div class="lcd__queue-pair">
+            <div><h2>بیمار نزد داکتر</h2><strong dir="ltr">{{ ticket }}</strong></div>
+            <div><h2>بیمار بعدی</h2><strong dir="ltr">{{ doctorQueue?.nextNumber != null ? digits(doctorQueue.nextNumber) : '—' }}</strong></div>
+          </div>
         </div>
         <div class="lcd__destination-bar">
-          <span class="lcd__please">لطفاً به بخش</span>
-          <span class="lcd__destination" :style="{ fontSize: `${destination.length > 9 ? Math.max(24, 640 / destination.length) : 80}px` }">{{ destination }}</span>
+          <span class="lcd__please">شماره {{ shown ? digits(shown.queueNumber) : '—' }}</span>
+          <span class="lcd__destination" :style="{ fontSize: `${destination.length > 9 ? Math.max(24, 640 / destination.length) : 80}px` }"><span class="lcd__destination-label">{{ destination }}</span></span>
           <span class="lcd__proceed">مراجعه کنید.</span>
           <span class="lcd__icon-divider" aria-hidden="true"></span>
           <svg class="lcd__pharmacy" viewBox="0 0 110 112" fill="none" stroke="currentColor" stroke-width="6" stroke-linejoin="round" aria-hidden="true"><rect x="20" y="8" width="47" height="20" rx="4"/><path d="M24 29V38L13 49V91Q13 97 19 97H53M63 29V38L74 49V64M14 51H73M14 66H73M31 76H53M42 65V87"/><g transform="rotate(-36 79 87)"><rect x="55" y="73" width="49" height="28" rx="14"/><path d="M80 74V100"/></g></svg>
@@ -141,22 +148,26 @@ onBeforeUnmount(() => {
 .lcd__brand { position: absolute; left: 305px; top: 47px; text-align: left; white-space: nowrap; }
 .lcd__brand h1 { margin: 0; color: #061c50; font-size: 50px; font-weight: 900; line-height: 1.3; letter-spacing: -1.5px; }
 .lcd__brand p { margin: 0 0 0 4px; font-family: Arial, sans-serif; font-weight: 700; font-size: 30px; line-height: 1.65; color: #646e7f; }
-.lcd__datetime { position: absolute; top: 38px; left: 1267px; width: 250px; text-align: center; }
-.lcd__time { display: block; font-size: 73px; font-weight: 900; line-height: 1.22; letter-spacing: -3px; border-bottom: 2px solid #8d98a8; }
+.lcd__datetime { position: absolute; top: 38px; left: 1217px; width: 300px; text-align: center; }
+.lcd__time { display: block; font-size: 64px; font-weight: 900; line-height: 1.22; letter-spacing: -3px; border-bottom: 2px solid #8d98a8; }
 .lcd__date { display: block; padding-top: 6px; font-size: 25px; font-weight: 800; color: #606a79; white-space: nowrap; }
 .lcd__date-divider { position: absolute; left: 1530px; top: 70px; height: 87px; border-left: 2px solid #627083; }
 .lcd__calendar { position: absolute; left: 1551px; top: 70px; width: 60px; height: 60px; }
-.lcd__number-panel { position: absolute; left: 455px; top: 267px; width: 761px; height: 389px; border: 2px solid #fff; border-radius: 82px; background: linear-gradient(115deg, #ffffffc9, #ffffffec 49%, #f4f9ffd9); box-shadow: 0 17px 25px -8px #64aef288; }
-.lcd__label { position: absolute; top: -57px; left: 130px; width: 496px; height: 99px; display: flex; align-items: center; justify-content: center; border-radius: 55px; border: 1px solid #ffffffd9; background: linear-gradient(#e2f0ff, #b4daff); box-shadow: 0 15px 25px #85bcf333; font-size: 65px; font-weight: 900; line-height: 1; }
-.lcd__number { position: absolute; inset: 106px 15px 0; display: flex; align-items: center; justify-content: center; font-weight: 900; letter-spacing: -12px; }
-.lcd__number--named { top: 135px; }
-.lcd__patient-name { position: absolute; top: 48px; left: 24px; right: 24px; height: 60px; display: flex; align-items: center; justify-content: center; font-size: 38px; font-weight: 800; line-height: 1.3; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.lcd__number-panel { position: absolute; left: 160px; top: 267px; width: 1350px; height: 389px; border: 2px solid #fff; border-radius: 82px; background: linear-gradient(115deg, #ffffffc9, #ffffffec 49%, #f4f9ffd9); box-shadow: 0 17px 25px -8px #64aef288; }
+.lcd__label { position: absolute; top: -57px; left: 50%; transform: translateX(-50%); min-width: 496px; max-width: 1100px; padding: 12px 36px; height: 99px; display: flex; align-items: center; justify-content: center; border-radius: 55px; border: 1px solid #ffffffd9; background: linear-gradient(#e2f0ff, #b4daff); box-shadow: 0 15px 25px #85bcf333; font-size: 48px; font-weight: 900; line-height: 1; white-space: nowrap; overflow: hidden; }
+.lcd__shift { position: absolute; top: 53px; inset-inline: 0; text-align: center; color: #075ca5; font-size: 30px; font-weight: 800; }
+.lcd__queue-pair { position: absolute; inset: 75px 25px 15px; display: grid; grid-template-columns: 1fr 1fr; gap: 30px; text-align: center; }
+.lcd__queue-pair > div + div { border-right: 2px solid #80b5dc; }
+.lcd__queue-pair h2 { font-size: 45px; color: #075ca5; }
+.lcd__queue-pair strong { display: block; font-size: 210px; line-height: 1; color: #04356b; font-weight: 900; }
+.lcd__number { position: absolute; inset: 125px 15px 0; display: flex; align-items: center; justify-content: center; font-weight: 900; letter-spacing: -12px; }
 .lcd__digits { line-height: 1.2; background: linear-gradient(140deg, #04356b 20%, #041a40 80%); background-clip: text; -webkit-text-fill-color: transparent; }
-.lcd__destination-bar { position: absolute; top: 679px; left: 199px; width: 1273px; height: 147px; border: 2px solid #fff; border-radius: 76px; background: linear-gradient(110deg, #c5e5ffcc, #f2f9ffdc 44%, #c3e1ffcc); box-shadow: 0 18px 24px -10px #4e9fe288; }
+.lcd__destination-bar { position: absolute; top: 679px; left: 160px; width: 1350px; height: 147px; border: 2px solid #fff; border-radius: 76px; background: linear-gradient(110deg, #c5e5ffcc, #f2f9ffdc 44%, #c3e1ffcc); box-shadow: 0 18px 24px -10px #4e9fe288; }
 .lcd__please, .lcd__proceed { position: absolute; display: flex; align-items: center; justify-content: center; top: 8px; height: 122px; font-size: 54px; font-weight: 900; white-space: nowrap; letter-spacing: -1.5px; }
 .lcd__please { right: 43px; width: 316px; }
 .lcd__proceed { left: 225px; width: 285px; }
-.lcd__destination { position: absolute; left: 528px; top: 12px; width: 364px; height: 119px; display: flex; align-items: center; justify-content: center; padding: 0 15px; border: 1px solid #b9dcff; border-radius: 65px; background: linear-gradient(155deg, #034797, #002053); color: #fff; font-weight: 900; white-space: normal; overflow-wrap: anywhere; text-align: center; line-height: 1.15; }
+.lcd__destination { position: absolute; left: 528px; top: 12px; width: 440px; height: 119px; display: flex; align-items: center; justify-content: center; padding: 0 15px; border: 1px solid #b9dcff; border-radius: 65px; background: linear-gradient(155deg, #034797, #002053); color: #fff; font-weight: 900; text-align: center; line-height: 1.15; }
+.lcd__destination-label { display: block; max-width: 100%; white-space: normal; overflow-wrap: anywhere; text-overflow: clip; }
 .lcd__icon-divider { position: absolute; left: 201px; top: 27px; height: 90px; border-left: 2px solid #315984; }
 .lcd__pharmacy { position: absolute; left: 64px; top: 14px; width: 110px; height: 112px; color: #06366b; }
 .lcd__footer { position: absolute; right: 49px; bottom: 24px; font-size: 27px; font-weight: 800; color: #566174; }
@@ -166,6 +177,9 @@ onBeforeUnmount(() => {
 .lcd__start:focus-visible { outline: 4px solid #fff; outline-offset: -8px; }
 
 @media screen and (max-width: 767.98px) {
+  .lcd--compact .lcd__queue-pair { position: static; padding: 20px 0; gap: 8px; }
+  .lcd--compact .lcd__queue-pair h2 { font-size: 18px; }
+  .lcd--compact .lcd__queue-pair strong { font-size: clamp(56px, 19vw, 130px); }
   .lcd--compact { position: relative; min-height: 100dvh; overflow-y: auto; padding: 12px; cursor: auto; }
   .lcd--compact .lcd__canvas { position: relative; inset: auto; width: 100%; height: auto; min-height: calc(100dvh - 24px); padding: 18px 14px 88px; display: flex; flex-direction: column; gap: 18px; overflow: visible; border-radius: 18px; transform: none !important; }
   .lcd--compact .lcd__eye, .lcd--compact .lcd__waves, .lcd--compact .lcd__brand-divider, .lcd--compact .lcd__date-divider, .lcd--compact .lcd__calendar, .lcd--compact .lcd__icon-divider, .lcd--compact .lcd__pharmacy { display: none; }
@@ -179,12 +193,14 @@ onBeforeUnmount(() => {
   .lcd--compact .lcd__date { padding-top: 0; font-size: 11px; white-space: normal; }
   .lcd--compact .lcd__call { display: grid; gap: 18px; }
   .lcd--compact .lcd__number-panel, .lcd--compact .lcd__destination-bar { position: static; width: 100%; height: auto; min-height: 190px; border-radius: 24px; }
-  .lcd--compact .lcd__label { position: static; width: auto; height: auto; margin: -1px 18px 0; padding: 10px 12px; border-radius: 18px; font-size: clamp(22px, 7vw, 34px); }
+  .lcd--compact .lcd__label { position: static; width: auto; min-width: 0; max-width: 100%; transform: none; white-space: normal; height: auto; margin: -1px 18px 0; padding: 10px 12px; border-radius: 18px; font-size: clamp(22px, 7vw, 34px); }
+  .lcd--compact .lcd__shift { position: static; font-size: 18px; padding-top: 12px; }
+  .lcd--compact .lcd__shift--named { top: auto; }
   .lcd--compact .lcd__patient-name { position: static; width: auto; height: auto; margin: 12px 18px 0; font-size: clamp(17px, 5vw, 24px); white-space: normal; }
   .lcd--compact .lcd__number { position: static; min-height: 120px; padding: 10px 12px 20px; font-size: clamp(88px, 28vw, 170px) !important; letter-spacing: -4px; }
   .lcd--compact .lcd__destination-bar { display: grid; grid-template-columns: 1fr; place-items: center; gap: 4px; padding: 18px; }
   .lcd--compact .lcd__please, .lcd--compact .lcd__proceed, .lcd--compact .lcd__destination { position: static; width: auto; height: auto; font-size: clamp(20px, 6vw, 32px); line-height: 1.35; }
-  .lcd--compact .lcd__destination { max-width: 100%; padding: 10px 18px; border-radius: 18px; }
+  .lcd--compact .lcd__destination { max-width: 100%; padding: 10px 18px; border-radius: 18px; font-size: clamp(15px, 4.7vw, 24px) !important; }
   .lcd--compact .lcd__footer { position: static; margin-top: auto; font-size: 11px; text-align: center; }
   .lcd--compact .lcd__start { inset-inline: 16px; left: auto; bottom: max(16px, env(safe-area-inset-bottom)); max-width: none; min-height: 52px; cursor: pointer; font-size: 14px; }
   .lcd--compact .lcd__audio-error { inset-inline: 16px; bottom: max(86px, calc(70px + env(safe-area-inset-bottom))); }

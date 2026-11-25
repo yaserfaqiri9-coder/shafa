@@ -20,7 +20,7 @@ namespace AlShifa.Tests;
 
 /// <summary>Scenarios for several departments working at once on one host. All data is synthetic.</summary>
 [Collection("api")]
-public sealed class HospitalReadinessTests(ApiFixture api)
+public sealed class HospitalReadinessTests(ApiFixture api) : PhysicalQueueTestScope(api)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } };
 
@@ -181,7 +181,7 @@ public sealed class HospitalReadinessTests(ApiFixture api)
             new CreatePrescriptionRequest(visit.Id, null, [new RxItemInput("قطره چشم", "روزانه ۲ بار", null, "۷ روز", null, 2)]))));
 
         var pharmacist = await UserAsync(Roles.Pharmacist);
-        var seen = Assert.Single((await pharmacist.GetFromJsonAsync<List<PrescriptionDto>>("/api/prescriptions?q=" + rx.RxNumber, JsonOptions))!);
+        var seen = Assert.Single((await pharmacist.GetFromJsonAsync<List<PrescriptionDto>>("/api/prescriptions?q=" + rx.RxNumber, JsonOptions))!, p => p.Id == rx.Id);
         Assert.Equal(patient.Id, seen.PatientId);
         var item = Assert.Single(seen.Items);
         Assert.Equal(("قطره چشم", "روزانه ۲ بار", "۷ روز", 2m), (item.DrugName, item.Dose, item.Duration, item.Quantity));
@@ -290,7 +290,7 @@ public sealed class HospitalReadinessTests(ApiFixture api)
         var bills = await Task.WhenAll(responses.Where(r => r.StatusCode == HttpStatusCode.Created).Select(r => r.Content.ReadFromJsonAsync<SaleRow>(JsonOptions)));
         await Task.WhenAll(bills.Select(b => api.PayAndDeliverAsync(pharmacist, b!.Id)));
 
-        var stored = Assert.Single((await pharmacist.GetFromJsonAsync<List<PrescriptionDto>>("/api/prescriptions?q=" + rx.RxNumber, JsonOptions))!);
+        var stored = Assert.Single((await pharmacist.GetFromJsonAsync<List<PrescriptionDto>>("/api/prescriptions?q=" + rx.RxNumber, JsonOptions))!, p => p.Id == rx.Id);
         Assert.Equal(sold, stored.Items[0].DispensedQuantity);
 
         using var scope = api.Services.CreateScope();

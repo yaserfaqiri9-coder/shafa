@@ -12,6 +12,7 @@ declare module 'vue-router' {
 }
 
 const appChildren: RouteRecordRaw[] = [
+  { path: 'chat', name: 'chat', component: pages.chat, meta: { title: 'گفتگو با همکاران' } },
   { path: 'departments', name: 'departments', component: pages.directories, props: { kind: 'departments' }, meta: { permission: 'settings.view', title: 'مدیریت بخش‌ها' } },
   { path: 'suppliers', name: 'suppliers', component: pages.directories, props: { kind: 'suppliers' }, meta: { permission: 'inventory.view', title: 'تأمین‌کنندگان' } },
   { path: 'doctors', name: 'doctors', component: pages.doctors, meta: { permission: 'users.view', title: 'فهرست داکتران' } },
@@ -215,6 +216,13 @@ const appChildren: RouteRecordRaw[] = [
     name: 'audit',
     component: pages.audit,
     meta: { permission: 'audit.view', title: 'ثبت فعالیت‌ها' },
+  },
+  {
+    path: 'staff/:id',
+    name: 'staffProfile',
+    component: pages.staffProfile,
+    props: true,
+    meta: { permission: 'expenses.view' },
   },
   {
     path: 'staff',

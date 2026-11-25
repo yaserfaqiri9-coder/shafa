@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { askConfirm } from '@/components/confirm'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api, errorMessage } from '@/api/http'
 import UiComboBox, { type ComboOption } from '@/components/UiComboBox.vue'
@@ -67,7 +68,7 @@ async function submit() {
   const lines = form.lines.filter((l) => l.quantity > 0)
   const summary = lines.map((l) => `${l.name}: ${quantity(l.quantity)}`).join('\n')
   const where = locations.value.find((l) => l.code === form.location)?.name ?? form.location
-  if (!window.confirm(`این اجناس از «${where}» کسر شود؟ پس از ثبت، فقط از بخش گدام برگشت می‌شود.\n\n${summary || 'هیچ جنسی'}`)) return
+  if (!(await askConfirm(`این اجناس از «${where}» کسر شود؟ پس از ثبت، فقط از بخش گدام برگشت می‌شود.\n\n${summary || 'هیچ جنسی'}`, { title: 'کسر اجناس عملیات', confirmLabel: 'کسر شود', danger: true }))) return
   saving.value = true
   error.value = ''
   try {

@@ -21,7 +21,7 @@ public sealed record SaveStaffRequest(
     [MaxLength(500)] string? Facebook = null,
     [MaxLength(500)] string? Twitter = null,
     [MaxLength(500)] string? Google = null,
-    [Range(12,18)] int Avatar = 12);
+    [Range(12,18)] int Avatar = 12, decimal? MonthlySalary = null, DateOnly? EmploymentStartDate = null, DateOnly? EmploymentEndDate = null);
 
 public static class StaffEndpoints
 {
@@ -52,37 +52,43 @@ public static class StaffEndpoints
             return Results.Ok(new PagedResult<StaffRow>(items, total, page, pageSize));
         }).RequirePermission("users.view");
 
-        group.MapPost("/", async (SaveStaffRequest request, AppDbContext db, AuditService audit, CancellationToken ct) =>
+        group.MapPost("/", async (SaveStaffRequest request, AppDbContext db, AuditService audit, HttpContext http, CancellationToken ct) =>
         {
+            await using var tx = await db.BeginWorkflowTransactionAsync(ct);
             await EnsureUserExistsAsync(db, request, ct);
             var staff = new Staff();
             Apply(staff, request);
             db.Staff.Add(staff);
             await db.SaveChangesAsync(ct);
+            await StaffPayroll.ApplyTermsAsync(staff, request, db, http, audit, ct);
             audit.Add("StaffCreated", "Staff", staff.Id.ToString());
             await db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
             return Results.Created($"/api/staff/{staff.Id}", new { staff.Id });
         }).RequirePermission("users.create");
 
-        group.MapPut("/{id:long}", async (long id, SaveStaffRequest request, AppDbContext db, AuditService audit, CancellationToken ct) =>
+        group.MapPut("/{id:long}", async (long id, SaveStaffRequest request, AppDbContext db, AuditService audit, HttpContext http, CancellationToken ct) =>
         {
             if (request.Version is null)
             {
                 throw new AppException(StatusCodes.Status400BadRequest, "version_required", "نسخه رکورد ارسال نشده است.");
             }
 
+            await using var tx = await db.BeginWorkflowTransactionAsync(ct);
             await EnsureUserExistsAsync(db, request, ct);
-            var staff = await db.Staff.SingleOrDefaultAsync(s => s.Id == id, ct) ?? throw AppException.NotFound();
+            var staff = (await db.Staff.FromSqlInterpolated($"SELECT * FROM Staff WHERE Id = {id} FOR UPDATE").ToListAsync(ct)).SingleOrDefault() ?? throw AppException.NotFound();
             db.Entry(staff).Property(s => s.Version).OriginalValue = request.Version.Value;
             Apply(staff, request);
+            await StaffPayroll.ApplyTermsAsync(staff, request, db, http, audit, ct);
             audit.Add("StaffEdited", "Staff", id.ToString());
             await db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
             return Results.NoContent();
         }).RequirePermission("users.manage");
 
-        group.MapDelete("/{id:long}", async (long id, int version, AppDbContext db, AuditService audit, CancellationToken ct) =>
+        group.MapDelete("/{id:long}", async (long id, int version, AppDbContext db, AuditService audit, HttpContext http, CancellationToken ct) =>
         {
-            var staff = await db.Staff.SingleOrDefaultAsync(s => s.Id == id, ct) ?? throw AppException.NotFound();
+            var staff = (await db.Staff.FromSqlInterpolated($"SELECT * FROM Staff WHERE Id = {id} FOR UPDATE").ToListAsync(ct)).SingleOrDefault() ?? throw AppException.NotFound();
             db.Entry(staff).Property(s => s.Version).OriginalValue = version;
             return await SafeDelete.RemoveOrDeactivateAsync(db, audit, staff, "Staff", id.ToString(), staff.FullName, () => staff.IsActive = false, ct);
         }).RequirePermission("users.manage");

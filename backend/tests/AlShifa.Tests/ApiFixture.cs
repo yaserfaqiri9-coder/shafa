@@ -19,6 +19,34 @@ namespace AlShifa.Tests;
 /// <summary>Runs the real API against the real MySQL 8.4 test database, which is rebuilt once per test run.</summary>
 public sealed class ApiFixture : WebApplicationFactory<Program>, IAsyncLifetime
 {
+    private int physicalCard;
+    private int scenario;
+
+    public int NextPhysicalCard() {
+        var number = Interlocked.Increment(ref physicalCard);
+        return number <= 100 ? number : throw new InvalidOperationException("One synthetic queue scenario exceeded 100 cards.");
+    }
+
+    public async Task BeginPhysicalQueueScenarioAsync() {
+        if (Environment.GetEnvironmentVariable("ALSHIFA_ISOLATED_QUEUE_TESTS") != "1")
+            throw new InvalidOperationException("Use the verified dedicated-instance runner for queue tests.");
+        var connection = new MySql.Data.MySqlClient.MySqlConnectionStringBuilder(ConnectionString);
+        if (connection.Server != "127.0.0.1" || connection.Port is < 33379 or > 33399)
+            throw new InvalidOperationException("Queue scenario isolation requires the dedicated scratch MySQL listener.");
+        var archive = KabulClock.Today.AddDays(-10000 - Interlocked.Increment(ref scenario));
+        using var scope = Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var today = KabulClock.Today;
+        await using var tx = await db.Database.BeginTransactionAsync();
+        await db.Visits.Where(v => v.VisitDate == today).ExecuteUpdateAsync(s => s.SetProperty(v => v.VisitDate, archive));
+        await db.VisitTokens.Where(t => t.TokenDate == today).ExecuteUpdateAsync(s => s.SetProperty(t => t.TokenDate, archive));
+        await db.QueueCards.Where(c => c.Day == today).ExecuteUpdateAsync(s => s.SetProperty(c => c.Day, archive));
+        await db.QueueAttendances.Where(c => c.Day == today).ExecuteUpdateAsync(s => s.SetProperty(c => c.Day, archive));
+        await db.QueueDeskLanes.Where(c => c.Day == today).ExecuteUpdateAsync(s => s.SetProperty(c => c.Day, archive));
+        await tx.CommitAsync();
+        physicalCard = 0;
+    }
+
     public const string TestPassword = "Test-Password-123";
 
     internal static string ConnectionString
@@ -58,9 +86,11 @@ public sealed class ApiFixture : WebApplicationFactory<Program>, IAsyncLifetime
         builder.ConfigureLogging(logging => logging.ClearProviders());
         // The real trigger writes to the Windows event log, which would start a real backup on a machine that has one installed.
         builder.ConfigureTestServices(services => services.AddSingleton<IBackupTrigger>(BackupTrigger));
+        builder.ConfigureTestServices(services => services.AddSingleton<IUpdateTrigger>(UpdateTrigger));
     }
 
     public RecordingBackupTrigger BackupTrigger { get; } = new();
+    public RecordingUpdateTrigger UpdateTrigger { get; } = new();
 
     public async ValueTask InitializeAsync()
     {
@@ -180,10 +210,14 @@ public sealed class ApiFixture : WebApplicationFactory<Program>, IAsyncLifetime
     public async Task<VisitTokenRow> NewTokenAsync(string department = "triage")
     {
         var desk = await FeeDeskAsync();
-        var response = await desk.SendAsync(Keyed("/api/visit-tokens", new CreateVisitTokenRequest(await DepartmentIdAsync(department), null)));
+        var response = await desk.SendAsync(Keyed("/api/visit-tokens", new CreateVisitTokenRequest(await DepartmentIdAsync(department), null, NextPhysicalCard())));
         var text = await response.Content.ReadAsStringAsync();
         Assert.True(response.IsSuccessStatusCode, text);
-        return JsonSerializer.Deserialize<VisitTokenRow>(text, JsonSerializerOptions.Web)!;
+        // The API emits QueueShift as a string. Use its wire contract in shared
+        // test setup too, before any clinical/reception workflow is exercised.
+        var json = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        json.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter());
+        return JsonSerializer.Deserialize<VisitTokenRow>(text, json)!;
     }
 
     /// <summary>What must happen before a visit can exist: a token from reception, with its visit fee fully paid at the cashier.</summary>
@@ -299,4 +333,10 @@ public sealed class RecordingBackupTrigger : IBackupTrigger
     public int Requests => requests;
 
     public void Request() => Interlocked.Increment(ref requests);
+}
+
+public sealed class RecordingUpdateTrigger : IUpdateTrigger
+{
+    public System.Collections.Concurrent.ConcurrentQueue<string> Versions { get; } = new();
+    public void Approve(string version) => Versions.Enqueue(version);
 }

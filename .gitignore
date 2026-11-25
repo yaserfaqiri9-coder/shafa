@@ -77,3 +77,17 @@ storage/
 /scripts/perf/results/
 /*.png
 /alshefa_print_bundle/*.png
+
+# Hospital hand-carried bundles and generated copies (rebuilt from deploy/windows)
+/Setup.exe
+/Rebuild-Database.bat
+/hospital-recover/
+/database-repair/
+/update-recovery/
+/deliverables/
+/.tmp-pdf-render/
+/hospital-sync-review-*.json
+/sync-enrollment-request.json
+*.manus-*.tmp
+# Installation identity of this computer (never shared between installations)
+backend/src/AlShifa.Api/keys/

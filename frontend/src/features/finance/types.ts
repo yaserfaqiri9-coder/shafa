@@ -1,6 +1,7 @@
 import { quantity } from '@/utils/money'
 
 export interface InvoiceRow {
+  queueNumber?: number | null
   id: number
   invoiceNumber: string
   patientId: number | null
@@ -17,6 +18,8 @@ export interface InvoiceRow {
   version: number
   description: string | null
   itemCount: number
+  /** Departments the invoice charges for, e.g. «دواخانه» or «آزمایشگاه، عملیات». */
+  section?: string | null
 }
 
 export interface InvoiceItemRow {
@@ -40,6 +43,7 @@ export interface PaymentRow {
   receiptNumber: string
   invoiceId: number
   invoiceNumber: string
+  patientName?: string | null
   amount: number
   method: string
   reference: string | null
@@ -47,6 +51,11 @@ export interface PaymentRow {
   createdAt: string
   receivedBy: string | null
   queueNumber: number | null
+  queueShift: 'Morning' | 'Afternoon' | null
+  queueRound: number | null
+  description?: string | null
+  itemCount?: number
+  section?: string | null
 }
 
 export interface InvoiceDetail {

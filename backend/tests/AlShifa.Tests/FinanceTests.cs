@@ -16,8 +16,128 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AlShifa.Tests;
 
 [Collection("api")]
-public sealed class FinanceTests(ApiFixture api)
+public sealed class FinanceTests(ApiFixture api) : PhysicalQueueTestScope(api)
 {
+    [Fact]
+    public void Shamsi_payroll_prorates_start_end_and_rate_changes_without_charging_an_unfinished_month()
+    {
+        var calendar = new System.Globalization.PersianCalendar();
+        DateOnly Day(int y, int m, int d) => DateOnly.FromDateTime(calendar.ToDateTime(y, m, d, 0, 0, 0, 0));
+        var staff = new Staff { EmploymentStartDate = Day(1405, 1, 15), EmploymentEndDate = Day(1405, 2, 10) };
+        var terms = new[] { new StaffSalaryTerm { EffectiveFrom = staff.EmploymentStartDate.Value, MonthlySalary = 3100 } };
+        var beforeEnd = StaffPayroll.Earned(staff, terms, Day(1405, 1, 31));
+        Assert.Empty(beforeEnd);
+        var months = StaffPayroll.Earned(staff, terms, Day(1405, 3, 1));
+        Assert.Equal(new decimal[] { 1700, 1000 }, months.Select(m => m.Amount));
+        Assert.Equal(new[] { 17, 10 }, months.Select(m => m.WorkingDays));
+        Assert.Equal(2700m, months.Sum(m => m.Amount));
+        var changedRate = StaffPayroll.Earned(staff, [terms[0], new StaffSalaryTerm { EffectiveFrom = Day(1405, 2, 1), MonthlySalary = 6200 }], Day(1405, 3, 1));
+        Assert.Equal(3700m, changedRate.Sum(m => m.Amount));
+        staff.EmploymentStartDate = Day(1403, 12, 1);
+        staff.EmploymentEndDate = Day(1403, 12, 30);
+        Assert.Equal(3000m, Assert.Single(StaffPayroll.Earned(staff,
+            [new StaffSalaryTerm { EffectiveFrom = staff.EmploymentStartDate.Value, MonthlySalary = 3000 }], Day(1404, 1, 1))).Amount);
+    }
+
+    [Fact]
+    public async Task Staff_profile_tracks_monthly_debt_withdrawals_salary_retries_and_reversals()
+    {
+        var admin = await UserAsync(Roles.SuperAdmin);
+        var start = StaffPayroll.MonthStart(StaffPayroll.MonthStart(KabulClock.Today).AddDays(-1));
+        var created = await admin.PostAsJsonAsync("/api/staff", new SaveStaffRequest(Name("staff"), null, false, true, null, null,
+            MonthlySalary: 3000, EmploymentStartDate: start));
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        var id = (await created.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetInt64();
+        async Task<JsonElement> Profile() => await admin.GetFromJsonAsync<JsonElement>($"/api/staff/{id}/payroll");
+        Assert.Equal(3000m, (await Profile()).GetProperty("owed").GetDecimal());
+        var key = Guid.NewGuid().ToString("N");
+        var withdrawal = new StaffPayoutRequest(1000, KabulClock.Today, "Withdrawal", "synthetic advance");
+        var first = await Created<JsonElement>(await admin.SendAsync(Post($"/api/staff/{id}/payouts", withdrawal, key)));
+        var retry = await Created<JsonElement>(await admin.SendAsync(Post($"/api/staff/{id}/payouts", withdrawal, key)));
+        Assert.Equal(first.GetProperty("id").GetInt64(), retry.GetProperty("id").GetInt64());
+        Assert.Equal(2000m, (await Profile()).GetProperty("owed").GetDecimal());
+        var over = await admin.SendAsync(Post($"/api/staff/{id}/payouts", new StaffPayoutRequest(2001, KabulClock.Today, "Salary", null)));
+        Assert.Equal(HttpStatusCode.Conflict, over.StatusCode);
+        await Created<JsonElement>(await admin.SendAsync(Post($"/api/staff/{id}/payouts", new StaffPayoutRequest(2000, KabulClock.Today, "Salary", null))));
+        Assert.Equal(0m, (await Profile()).GetProperty("owed").GetDecimal());
+        using (var scope = api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.Equal(2, await db.Expenses.CountAsync(e => e.StaffId == id));
+            var expense = await db.Expenses.SingleAsync(e => e.Id == first.GetProperty("id").GetInt64());
+            var canceled = await admin.PostAsJsonAsync($"/api/expenses/{expense.Id}/cancel", new VoidRequest("synthetic correction", expense.Version));
+            Assert.Equal(HttpStatusCode.NoContent, canceled.StatusCode);
+        }
+        Assert.Equal(1000m, (await Profile()).GetProperty("owed").GetDecimal());
+        var reception = await UserAsync(Roles.Receptionist);
+        Assert.Equal(HttpStatusCode.Forbidden, (await reception.GetAsync($"/api/staff/{id}/payroll")).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await reception.SendAsync(Post($"/api/staff/{id}/payouts", withdrawal))).StatusCode);
+    }
+
+    [Fact]
+    public async Task Operation_price_and_package_snapshot_are_charged_and_consumed_once_at_final_payment()
+    {
+        var admin = await UserAsync(Roles.SuperAdmin);
+        var package = await Created<PackageRow>(await admin.PostAsJsonAsync("/api/surgery-packages", new SavePackageRequest(Name("kit"), 900, 100, 5, "surgery")));
+        var operationResponse = await Created<JsonElement>(await admin.PostAsJsonAsync("/api/operations", new SaveOperationRequest(Name("operation"), 5000, [new OperationPackageInput(package.Id, 2)])));
+        var operationId = operationResponse.GetProperty("id").GetInt32();
+        var patient = await NewPatientAsync();
+        long visitId;
+        using (var scope = api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var visit = new Visit { PatientId = patient.Id, VisitNumber = Name("visit"), DepartmentId = await db.Departments.Select(d => d.Id).FirstAsync(), Status = VisitStatus.InConsultation };
+            db.Visits.Add(visit);
+            await db.SaveChangesAsync();
+            visitId = visit.Id;
+        }
+        var surgery = await Created<SurgeryRow>(await admin.SendAsync(Post("/api/surgeries", new CreateSurgeryRequest(visitId, "ignored client name", EyeSide.OD, OperationDefinitionId: operationId))));
+        long invoiceId;
+        using (var scope = api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var item = await db.InvoiceItems.SingleAsync(i => i.SourceType == nameof(SurgeryCase) && i.SourceId == surgery.Id);
+            invoiceId = item.InvoiceId;
+            Assert.Equal(5000m, item.LineTotal);
+            Assert.Equal(5m, await db.StockBatches.Where(b => b.ProductId == package.Items[0].ProductId).SumAsync(b => b.Quantity));
+        }
+        var catalog = await admin.GetFromJsonAsync<JsonElement>("/api/operations?all=true");
+        var op = catalog.EnumerateArray().Single(o => o.GetProperty("id").GetInt32() == operationId);
+        Assert.Equal(HttpStatusCode.NoContent, (await admin.PutAsJsonAsync($"/api/operations/{operationId}", new SaveOperationRequest("Changed operation", 6000, [new OperationPackageInput(package.Id, 1)], Version: op.GetProperty("version").GetInt32()))).StatusCode);
+        var cashier = await CashierWithOpenSessionAsync();
+        await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", new PaymentRequest(invoiceId, 2000, PaymentMethod.Cash, null))));
+        using (var scope = api.Services.CreateScope())
+            Assert.Equal(5m, await scope.ServiceProvider.GetRequiredService<AppDbContext>().StockBatches.Where(b => b.ProductId == package.Items[0].ProductId).SumAsync(b => b.Quantity));
+        var key = Guid.NewGuid().ToString("N");
+        var final = new PaymentRequest(invoiceId, 3000, PaymentMethod.Cash, null);
+        await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", final, key)));
+        await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", final, key)));
+        using (var scope = api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.Equal(3m, await db.StockBatches.Where(b => b.ProductId == package.Items[0].ProductId).SumAsync(b => b.Quantity));
+            Assert.NotNull((await db.SurgeryCases.SingleAsync(c => c.Id == surgery.Id)).SuppliesRecordedAt);
+            Assert.Equal(2, await db.Payments.CountAsync(p => p.InvoiceId == invoiceId));
+            Assert.Equal(2m, -(await db.StockMovements.Where(m => m.SourceType == nameof(SurgeryCase) && m.SourceId == surgery.Id).SumAsync(m => m.Quantity)));
+        }
+        var latest = (await admin.GetFromJsonAsync<JsonElement>("/api/operations?all=true")).EnumerateArray().Single(o => o.GetProperty("id").GetInt32() == operationId);
+        Assert.Equal(HttpStatusCode.NoContent, (await admin.PutAsJsonAsync($"/api/operations/{operationId}",
+            new SaveOperationRequest("Four kits", 6000, [new OperationPackageInput(package.Id, 4)], Version: latest.GetProperty("version").GetInt32()))).StatusCode);
+        var secondCase = await Created<SurgeryRow>(await admin.SendAsync(Post("/api/surgeries", new CreateSurgeryRequest(visitId, "four kits", EyeSide.OD, OperationDefinitionId: operationId))));
+        long secondInvoice;
+        using (var scope = api.Services.CreateScope())
+            secondInvoice = (await scope.ServiceProvider.GetRequiredService<AppDbContext>().InvoiceItems.SingleAsync(i => i.SourceType == nameof(SurgeryCase) && i.SourceId == secondCase.Id)).InvoiceId;
+        var refused = await cashier.SendAsync(Post("/api/payments", new PaymentRequest(secondInvoice, 6000, PaymentMethod.Cash, null)));
+        Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+        using (var scope = api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.False(await db.Payments.AnyAsync(p => p.InvoiceId == secondInvoice));
+            Assert.Equal(0m, (await db.Invoices.SingleAsync(i => i.Id == secondInvoice)).Paid);
+            Assert.Equal(3m, await db.StockBatches.Where(b => b.ProductId == package.Items[0].ProductId).SumAsync(b => b.Quantity));
+        }
+    }
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } };
 
     private static string Name(string prefix) => $"{prefix}_{Guid.NewGuid():N}"[..20];
@@ -188,6 +308,33 @@ public sealed class FinanceTests(ApiFixture api)
         row = await cashier.GetFromJsonAsync<InvoiceDetail>($"/api/invoices/{invoice.Id}", JsonOptions);
         Assert.Equal(0, row!.Invoice.Balance);
         Assert.Equal(nameof(InvoiceStatus.Paid), row.Invoice.Status);
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
+    public async Task Cashier_settlement_applies_one_fixed_or_percent_discount_before_payment()
+    {
+        var serviceId = await NewServiceAsync(500);
+        var patient = await NewPatientAsync();
+        var fixedInvoice = await NewInvoiceAsync(patient.Id, serviceId);
+        var cashier = await CashierWithOpenSessionAsync();
+
+        var fixedReceipt = await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments/settle",
+            new CashierSettlementRequest(fixedInvoice.Id, 100, fixedInvoice.Version, new SettlementDiscount(400, DiscountMode.Amount)))));
+        Assert.Equal(100m, fixedReceipt.Amount);
+        var fixedDetail = await cashier.GetFromJsonAsync<InvoiceDetail>($"/api/invoices/{fixedInvoice.Id}", JsonOptions);
+        Assert.Equal(400m, fixedDetail!.Invoice.Discount);
+        Assert.Equal(0m, fixedDetail.Invoice.Balance);
+        Assert.Equal(nameof(InvoiceStatus.Paid), fixedDetail.Invoice.Status);
+        Assert.Single(fixedDetail.Discounts);
+
+        var percentInvoice = await NewInvoiceAsync(patient.Id, serviceId);
+        await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments/settle",
+            new CashierSettlementRequest(percentInvoice.Id, 400, percentInvoice.Version, new SettlementDiscount(20, DiscountMode.Percent)))));
+        var percentDetail = await cashier.GetFromJsonAsync<InvoiceDetail>($"/api/invoices/{percentInvoice.Id}", JsonOptions);
+        Assert.Equal(100m, percentDetail!.Invoice.Discount);
+        Assert.Equal(0m, percentDetail.Invoice.Balance);
+        Assert.Single(percentDetail.Discounts);
         await AssertLedgerReconciles();
     }
 
@@ -522,6 +669,136 @@ public sealed class FinanceTests(ApiFixture api)
 
         var moved = await optical.PostAsJsonAsync($"/api/optical/orders/{order.Id}/status", new ChangeOpticalStatusRequest(OpticalOrderStatus.Delivered, seen.Version));
         Assert.Equal(HttpStatusCode.NoContent, moved.StatusCode);
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
+    public async Task Complimentary_optical_order_requires_approval_takes_stock_and_never_creates_revenue_or_a_receivable()
+    {
+        var frameId = await NewProductAsync(salePrice: 1500, kind: ProductKind.Frame);
+        await StockAsync(frameId, 1, "optical", 800);
+        var optical = await UserAsync(Roles.Optical);
+
+        var refused = await optical.SendAsync(Post("/api/optical/orders", new CreateOpticalOrderRequest(null, null, "تحویل خیرخواهانه", [new SaleLineInput(frameId, 1)], [], true)));
+        Assert.Equal(HttpStatusCode.BadRequest, refused.StatusCode);
+
+        var order = await Created<OpticalOrderRow>(await optical.SendAsync(Post("/api/optical/orders", new CreateOpticalOrderRequest(null, null, "تحویل خیرخواهانه", [new SaleLineInput(frameId, 1)], [], true, "تأیید اداره", "مسئول مالی"))));
+        Assert.True(order.IsComplimentary);
+        Assert.Equal(0, order.Total);
+        Assert.Equal(0, order.Balance);
+
+        using (var scope = api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.Equal(0, await db.StockBatches.Where(b => b.ProductId == frameId && b.Location!.Code == "optical").SumAsync(b => b.Quantity));
+            var freeLineIds = db.InvoiceItems.Where(i => i.InvoiceId == order.InvoiceId).Select(i => i.Id);
+            Assert.False(await db.LedgerTransactions.AnyAsync(t => t.Kind == "Charge" && t.SourceType == nameof(InvoiceItem) && freeLineIds.Contains(t.SourceId)));
+        }
+
+        var cashier = await CashierWithOpenSessionAsync();
+        var duplicate = await cashier.SendAsync(Post("/api/payments", new PaymentRequest(order.InvoiceId, 1, PaymentMethod.Cash, null)));
+        Assert.Equal(HttpStatusCode.Conflict, duplicate.StatusCode);
+        var list = await optical.GetFromJsonAsync<PagedResult<OpticalOrderRow>>("/api/optical/orders", JsonOptions);
+        var seen = list!.Items.Single(o => o.Id == order.Id);
+        Assert.Equal(HttpStatusCode.NoContent, (await optical.PostAsJsonAsync($"/api/optical/orders/{order.Id}/status", new ChangeOpticalStatusRequest(OpticalOrderStatus.Cancelled, seen.Version, "لغو تحویل رایگان"))).StatusCode);
+        Assert.Equal(1, await api.InDbAsync(db => db.StockBatches.Where(b => b.ProductId == frameId && b.Location!.Code == "optical").SumAsync(b => b.Quantity)));
+
+        var delivered = await Created<OpticalOrderRow>(await optical.SendAsync(Post("/api/optical/orders", new CreateOpticalOrderRequest(null, null, "تحویل رایگان گزارش", [new SaleLineInput(frameId, 1)], [], true, "تأیید اداره", "مسئول مالی"))));
+        var reportList = await optical.GetFromJsonAsync<PagedResult<OpticalOrderRow>>("/api/optical/orders", JsonOptions);
+        var reportVersion = reportList!.Items.Single(row => row.Id == delivered.Id).Version;
+        Assert.Equal(HttpStatusCode.NoContent, (await optical.PostAsJsonAsync($"/api/optical/orders/{delivered.Id}/status", new ChangeOpticalStatusRequest(OpticalOrderStatus.Delivered, reportVersion))).StatusCode);
+        var accountant = await UserAsync(Roles.Accountant);
+        var report = await accountant.GetFromJsonAsync<List<ComplimentaryOpticalReportRow>>("/api/optical/reports/complimentary", JsonOptions);
+        Assert.Contains(report!, row => row.Id == delivered.Id && row.Items.Contains("جنس", StringComparison.Ordinal));
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
+    public async Task Walk_in_optical_order_keeps_the_customer_name_and_is_found_by_name_or_phone()
+    {
+        var optical = await UserAsync(Roles.Optical);
+        var name = $"مشتری {Guid.NewGuid():N}"[..20];
+        var phone = $"07{Random.Shared.Next(10000000, 99999999)}";
+        var order = await Created<OpticalOrderRow>(await optical.SendAsync(Post("/api/optical/orders", new CreateOpticalOrderRequest(null, null, "عینک آفتابی", [], [new CustomLineInput("عدسی", 300, true)],
+            CustomerName: $"  {name}  ", CustomerPhone: phone))));
+        Assert.Equal(name, order.PatientName);
+        Assert.Equal(phone, order.CustomerPhone);
+
+        // Found among all orders, not only the first page.
+        var byName = await optical.GetFromJsonAsync<PagedResult<OpticalOrderRow>>($"/api/optical/orders?q={Uri.EscapeDataString(name)}", JsonOptions);
+        Assert.Equal(order.Id, Assert.Single(byName!.Items).Id);
+        var byPhone = await optical.GetFromJsonAsync<PagedResult<OpticalOrderRow>>($"/api/optical/orders?q={phone}", JsonOptions);
+        Assert.Contains(byPhone!.Items, row => row.Id == order.Id);
+
+        var printed = System.Text.RegularExpressions.Regex.Unescape(await optical.GetStringAsync($"/api/print/optical-order/{order.Id}"));
+        Assert.Contains(name, printed, StringComparison.Ordinal);
+        Assert.Contains(phone, printed, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Nonstock_lens_is_billed_without_a_warehouse_movement_and_order_receipt_can_be_reprinted()
+    {
+        var optical = await UserAsync(Roles.Optical);
+        var order = await Created<OpticalOrderRow>(await optical.SendAsync(Post("/api/optical/orders", new CreateOpticalOrderRequest(null, null, "عدسی سفارشی", [], [new CustomLineInput("عدسی غیرانباری", 700, true)]))));
+        Assert.Equal(700, order.Total);
+
+        using (var scope = api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var saleId = await db.Sales.Where(s => s.InvoiceId == order.InvoiceId).Select(s => s.Id).SingleAsync();
+            Assert.Empty(await db.Set<SaleItem>().Where(i => i.SaleId == saleId).ToListAsync());
+            Assert.Empty(await db.StockMovements.Where(m => m.SourceType == nameof(Sale) && m.SourceId == saleId).ToListAsync());
+        }
+        var printed = await optical.GetAsync($"/api/print/optical-order/{order.Id}");
+        Assert.Equal(HttpStatusCode.OK, printed.StatusCode);
+        Assert.Contains("OpticalNonStockLens", await api.InDbAsync(db => db.InvoiceItems.Where(i => i.InvoiceId == order.InvoiceId).Select(i => i.SourceType).SingleAsync()));
+
+        var cashier = await CashierWithOpenSessionAsync();
+        await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", new PaymentRequest(order.InvoiceId, 700, PaymentMethod.Cash, null))));
+        var unpaid = await cashier.GetFromJsonAsync<List<OpticalOrderRow>>("/api/optical/orders/unpaid", JsonOptions);
+        Assert.DoesNotContain(unpaid!, row => row.Id == order.Id);
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
+    public async Task Counted_stock_adjustment_records_before_after_reason_and_approver()
+    {
+        var productId = await NewProductAsync();
+        await StockAsync(productId, 5, "optical", 40);
+        var batchId = await api.InDbAsync(db => db.StockBatches.Where(b => b.ProductId == productId).Select(b => b.Id).SingleAsync());
+        var pharmacist = await UserAsync(Roles.Pharmacist);
+        Assert.Equal(HttpStatusCode.Forbidden, (await pharmacist.SendAsync(Post("/api/inventory/adjustments/set-quantity", new SetStockQuantityRequest(batchId, 3, "شمارش بخش عینک")))).StatusCode);
+
+        var inventory = await UserAsync(Roles.Inventory);
+        var saved = await inventory.SendAsync(Post("/api/inventory/adjustments/set-quantity", new SetStockQuantityRequest(batchId, 3, "شمارش بخش عینک")));
+        Assert.Equal(HttpStatusCode.Created, saved.StatusCode);
+        using var scope = api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var document = await db.StockAdjustments.SingleAsync(a => a.BatchId == batchId);
+        Assert.Equal((5m, 3m, "شمارش بخش عینک"), (document.PreviousQuantity, document.NewQuantity, document.Reason));
+        Assert.True(await db.StockMovements.AnyAsync(m => m.SourceType == nameof(StockAdjustment) && m.SourceId == document.Id && m.Quantity == -2));
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
+    public async Task Batch_expiry_correction_changes_only_the_date_and_is_audited()
+    {
+        var productId = await NewProductAsync();
+        await StockAsync(productId, 5, "optical", 40);
+        var batchId = await api.InDbAsync(db => db.StockBatches.Where(b => b.ProductId == productId).Select(b => b.Id).SingleAsync());
+        var expiry = new DateOnly(2030, 6, 30);
+        var pharmacist = await UserAsync(Roles.Pharmacist);
+        Assert.Equal(HttpStatusCode.Forbidden, (await pharmacist.PutAsJsonAsync($"/api/inventory/batches/{batchId}/expiry", new SetBatchExpiryRequest(expiry, "اصلاح تاریخ"))).StatusCode);
+
+        var inventory = await UserAsync(Roles.Inventory);
+        Assert.Equal(HttpStatusCode.OK, (await inventory.PutAsJsonAsync($"/api/inventory/batches/{batchId}/expiry", new SetBatchExpiryRequest(expiry, "اصلاح تاریخ"))).StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, (await inventory.PutAsJsonAsync($"/api/inventory/batches/{batchId}/expiry", new SetBatchExpiryRequest(expiry, "اصلاح تاریخ"))).StatusCode);
+
+        using var scope = api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var batch = await db.StockBatches.SingleAsync(b => b.Id == batchId);
+        Assert.Equal((expiry, 5m, 40m), (batch.ExpiryDate, batch.Quantity, batch.UnitCost));
+        Assert.True(await db.AuditLogs.AnyAsync(a => a.Action == "BatchExpiryChanged" && a.EntityId == batchId.ToString()));
         await AssertLedgerReconciles();
     }
 

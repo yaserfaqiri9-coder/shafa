@@ -28,10 +28,16 @@ public sealed class SyncOptions
 
     /// <summary>Lets the hospital application start first.</summary>
     public int StartDelaySeconds { get; set; } = 20;
+
+    /// <summary>Offline installer upgrades wait for a technical compatibility review before reconnecting.</summary>
+    public bool RequireCompatibilityApproval { get; set; }
 }
 
 public sealed record SyncStatusDto(
-    string Mode, bool Enabled, DateTime? LastSuccessAt, DateTime? LastAttemptAt, string? LastError, int? Pending, int IntervalMinutes, bool? Connected);
+    string Mode, bool Enabled, DateTime? LastSuccessAt, DateTime? LastAttemptAt, string? LastError, int? Pending, int IntervalMinutes, bool? Connected,
+    bool Configured = false, string? ConfigurationProblem = null);
+
+public sealed record SyncEnabledRequest(bool Enabled);
 
 /// <summary>
 /// Copies changed rows from the hospital database to the online copy, one way only. Runs beside the application and never inside a request:
@@ -46,10 +52,9 @@ public sealed class SyncWorker(IServiceScopeFactory scopes, IHttpClientFactory h
 
     public void RequestRun()
     {
-        if (wake.CurrentCount == 0)
-        {
-            wake.Release();
-        }
+        // Concurrent callers need only one pending wake-up.
+        try { wake.Release(); }
+        catch (SemaphoreFullException) { }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -84,7 +89,7 @@ public sealed class SyncWorker(IServiceScopeFactory scopes, IHttpClientFactory h
     {
         try
         {
-            await wake.WaitAsync(TimeSpan.FromMinutes(Math.Max(1, options.Value.IntervalMinutes)), stoppingToken);
+            await wake.WaitAsync(TimeSpan.FromMinutes(Math.Clamp(options.Value.IntervalMinutes, 1, 5)), stoppingToken);
         }
         catch (OperationCanceledException)
         {
@@ -99,6 +104,8 @@ public sealed class SyncWorker(IServiceScopeFactory scopes, IHttpClientFactory h
         {
             using var scope = scopes.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            if (config["DataProtection:KeysPath"] is { } keys && File.Exists(Path.Combine(keys, "update-maintenance"))) return;
+            if (!Configured(options.Value) || !await EnabledAsync(db, ct)) return;
             await SetStateAsync(db, "push.lastAttemptAt", DateTime.UtcNow.ToString("o"), ct);
             try
             {
@@ -110,17 +117,23 @@ public sealed class SyncWorker(IServiceScopeFactory scopes, IHttpClientFactory h
 
                 var schema = SyncSchema.SchemaVersion(db);
                 var remote = await MirrorStateAsync(http, ct);
-                if (remote.Schema != schema)
+                if (remote.ProtocolVersion != 2)
+                    throw new InvalidOperationException("sync_protocol_mismatch: upgrade and verify the online service before enabling replication.");
+                if (remote.SourceId is not null && remote.SourceId != scope.ServiceProvider.GetRequiredService<InstallationIdentity>().Id)
+                    throw new InvalidOperationException("source_conflict: this mirror belongs to another installation; reviewed enrollment is required.");
+                // An online copy one version ahead may still list this version as accepted while this server waits for its upgrade.
+                if (remote.Schema != schema && remote.AcceptedSchemas?.Contains(schema, StringComparer.Ordinal) != true)
                 {
                     // Nothing is sent and nothing is lost: changes wait here until both sides run the same version.
                     throw new InvalidOperationException($"schema_mismatch: online copy is at {remote.Schema}, this server at {schema}. Update the online copy (deploy-release.sh), then this server.");
                 }
 
-                // The online copy lost batches it had confirmed (rebuilt or restored), or holds batches this database never sent
-                // (a test, or this database was restored from a backup): it is emptied and filled again.
+                // Divergent databases require reviewed reconciliation. Never erase the remote copy automatically.
                 var acked = ReadLong(await GetStateAsync(db, "push.ackedSeq", ct));
                 var sent = ReadLong(await GetStateAsync(db, "push.seq", ct));
                 var reset = remote.Seq < acked || remote.Seq > sent;
+                if (reset)
+                    throw new InvalidOperationException("sync_reconciliation_required: replication history differs; both copies must be reviewed before resuming. No remote data was reset.");
 
                 var commandResults = await PullCommandsAsync(http, ct);
 
@@ -338,7 +351,9 @@ public sealed class SyncWorker(IServiceScopeFactory scopes, IHttpClientFactory h
     private async Task SendAsync(HttpClient http, string schema, List<SyncTableRows> tables, CancellationToken ct, bool reset = false)
     {
         var seq = await NextSeqAsync(ct);
-        var body = JsonSerializer.SerializeToUtf8Bytes(new SyncBatch(schema, seq, DateTime.UtcNow, tables, reset), JsonSerializerOptions.Web);
+        using var identityScope = scopes.CreateScope();
+        var sourceId = identityScope.ServiceProvider.GetRequiredService<InstallationIdentity>().Id;
+        var body = JsonSerializer.SerializeToUtf8Bytes(new SyncBatch(schema, seq, DateTime.UtcNow, tables, reset, sourceId), JsonSerializerOptions.Web);
         using var request = await SignedAsync(HttpMethod.Post, "api/sync/mirror/apply", body, ct);
         using var response = await http.SendAsync(request, ct);
         await EnsureSuccessAsync(response, ct);
@@ -411,8 +426,8 @@ public sealed class SyncWorker(IServiceScopeFactory scopes, IHttpClientFactory h
                 throw new HttpRequestException($"The online server is not available right now (HTTP {(int)response.StatusCode}). Changes wait here and are sent when it is back.");
             }
 
-            var text = await response.Content.ReadAsStringAsync(ct);
-            throw new HttpRequestException($"Online server answered {(int)response.StatusCode}: {text[..Math.Min(text.Length, 400)]}");
+            // A remote error body can contain record values or proxy diagnostics. Never persist it in status/logs.
+            throw new HttpRequestException($"Online server refused the request (HTTP {(int)response.StatusCode}). Technical review is required; local changes remain queued.");
         }
     }
 
@@ -454,7 +469,7 @@ public sealed class SyncWorker(IServiceScopeFactory scopes, IHttpClientFactory h
     public static async Task<string?> GetStateAsync(AppDbContext db, string key, CancellationToken ct) =>
         await db.SyncStates.AsNoTracking().Where(s => s.Key == key).Select(s => s.Value).SingleOrDefaultAsync(ct);
 
-    private static async Task SetStateAsync(AppDbContext db, string key, string? value, CancellationToken ct)
+    internal static async Task SetStateAsync(AppDbContext db, string key, string? value, CancellationToken ct)
     {
         var state = await db.SyncStates.SingleOrDefaultAsync(s => s.Key == key, ct);
         if (state is null)
@@ -474,6 +489,26 @@ public sealed class SyncWorker(IServiceScopeFactory scopes, IHttpClientFactory h
         _ => e.Message.Length > 1000 ? e.Message[..1000] : e.Message,
     };
 
+    public static bool Configured(SyncOptions value) => ConfigurationProblem(value) is null;
+
+    // Return fixed operator guidance only; configuration values may contain secrets.
+    public static string? ConfigurationProblem(SyncOptions value)
+    {
+        if (value.RequireCompatibilityApproval)
+            return "همگام‌سازی پس از به‌روزرسانی در انتظار تأیید سازگاری دو سرور است؛ مدیر فنی باید نسخه، دیتابیس و هویت منبع را بررسی کند.";
+        if (string.IsNullOrWhiteSpace(value.Url))
+            return "آدرس سرور آنلاین روی این کمپیوتر تنظیم نشده است؛ مدیر فنی باید اتصال اولیه را آماده کند.";
+        if (!Uri.TryCreate(value.Url, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps
+            || !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment))
+            return "آدرس همگام‌سازی باید HTTPS معتبر و بدون مشخصات ورود، پارامتر یا بخش اضافی باشد.";
+        if (string.IsNullOrEmpty(value.Key) || value.Key.Length < 32)
+            return "کلید امن همگام‌سازی تنظیم نشده یا معتبر نیست؛ مدیر فنی باید کلید مشترک دو سرور را از مسیر امن تنظیم کند.";
+        return null;
+    }
+
+    public static async Task<bool> EnabledAsync(AppDbContext db, CancellationToken ct) =>
+        await GetStateAsync(db, "push.enabled", ct) != "false";
+
     /// <summary>Status for Settings, read from the database so it survives a restart.</summary>
     public static async Task<SyncStatusDto> StatusAsync(AppDbContext db, SyncOptions options, bool enabled, CancellationToken ct)
     {
@@ -482,9 +517,9 @@ public sealed class SyncWorker(IServiceScopeFactory scopes, IHttpClientFactory h
         var success = Time("push.lastSuccessAt");
         var attempt = Time("push.lastAttemptAt");
         return new SyncStatusDto(
-            "local", enabled, success, attempt, states.GetValueOrDefault("push.lastError"),
-            await db.SyncChanges.CountAsync(ct), options.IntervalMinutes,
-            attempt is null ? null : success is not null && success >= attempt);
+            "local", enabled && states.GetValueOrDefault("push.enabled") != "false", success, attempt, states.GetValueOrDefault("push.lastError"),
+            await db.SyncChanges.CountAsync(ct), Math.Clamp(options.IntervalMinutes, 1, 5),
+            attempt is null ? null : success is not null && success >= attempt, enabled, ConfigurationProblem(options));
     }
 }
 
@@ -509,13 +544,26 @@ public static class SyncEndpoints
                 return Results.Ok(new SyncStatusDto("local", !string.IsNullOrWhiteSpace(options.Value.Url), null, null, null, null, options.Value.IntervalMinutes, null));
             }
 
-            return Results.Ok(await SyncWorker.StatusAsync(db, options.Value, !string.IsNullOrWhiteSpace(options.Value.Url), ct));
+            return Results.Ok(await SyncWorker.StatusAsync(db, options.Value, SyncWorker.Configured(options.Value), ct));
         }).RequireAuthorization();
 
         if (!mirror)
         {
-            group.MapPost("/run", (IServiceProvider services) =>
+            group.MapPut("/enabled", async (SyncEnabledRequest request, AppDbContext db, IOptions<SyncOptions> options, IServiceProvider services, AuditService audit, CancellationToken ct) =>
             {
+                if (request.Enabled && SyncWorker.ConfigurationProblem(options.Value) is { } problem)
+                    throw new AppException(StatusCodes.Status409Conflict, "sync_enrollment_required", problem);
+                await SyncWorker.SetStateAsync(db, "push.enabled", request.Enabled ? "true" : "false", ct);
+                audit.Add(request.Enabled ? "SyncEnabled" : "SyncDisabled", "Sync", null);
+                await db.SaveChangesAsync(ct);
+                if (request.Enabled) services.GetService<SyncWorker>()?.RequestRun();
+                return Results.Ok(await SyncWorker.StatusAsync(db, options.Value, SyncWorker.Configured(options.Value), ct));
+            }).RequirePermission("settings.edit");
+
+            group.MapPost("/run", async (IServiceProvider services, AppDbContext db, IOptions<SyncOptions> options, CancellationToken ct) =>
+            {
+                if (!SyncWorker.Configured(options.Value) || !await SyncWorker.EnabledAsync(db, ct))
+                    throw new AppException(StatusCodes.Status409Conflict, "sync_off", "همگام‌سازی آنلاین فعال نیست.");
                 var worker = services.GetServices<IHostedService>().OfType<SyncWorker>().FirstOrDefault()
                     ?? throw new AppException(StatusCodes.Status409Conflict, "sync_off", "همگام‌سازی آنلاین روی این سرور تنظیم نشده است.");
                 worker.RequestRun();

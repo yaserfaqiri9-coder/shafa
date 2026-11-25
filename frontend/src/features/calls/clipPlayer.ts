@@ -1,11 +1,12 @@
 ﻿/** Recorded assets are immutable and versioned together with the server's VoicePack.RecordedBase. */
-export const RECORDED_VERSION = 'recorded-c98dd13ed170'
+export const RECORDED_VERSION = 'recorded-queue-20261120'
 export const RECORDED_BASE = `/audio/${RECORDED_VERSION}/WAV/`
-export const RECORDED_DESTINATIONS = ['doctor', 'refraction', 'imaging', 'pharmacy', 'optical', 'initial_exam', 'reception', 'cashier', 'surgery'] as const
+export const RECORDED_DESTINATIONS = ['doctor', 'refraction', 'imaging', 'pharmacy', 'optical', 'initial_exam', 'reception', 'lab', 'cashier', 'surgery'] as const
 export const recordedClips = [
-  ...Array.from({ length: 50 }, (_, i) => `${RECORDED_BASE}numbers/number_${String(i + 1).padStart(3, '0')}.wav`),
+  ...Array.from({ length: 100 }, (_, i) => `${RECORDED_BASE}numbers/number_${String(i + 1).padStart(3, '0')}.mp3`),
   ...RECORDED_DESTINATIONS.map(key => `${RECORDED_BASE}destinations/destination_${key}.wav`),
 ]
+export const RECORDED_WELCOME = `${RECORDED_BASE}welcome.wav`
 const CACHE_NAME = `alshifa-queue-${RECORDED_VERSION}`
 const END_GRACE_MS = 3_000
 const RESUME_WAIT_MS = 300
@@ -15,7 +16,7 @@ export const JOIN_GAP_MS = 30
 
 export class MissingClipError extends Error {
   constructor(public readonly clip: string) {
-    super(clip ? `فایل صوتی ${clip} بارگذاری نشد؛ اتصال محلی را بررسی و دوباره تلاش کنید.` : 'برای این شماره یا مقصد صدای ضبط‌شده موجود نیست؛ شماره‌های بسته ۱ تا ۵۰ است. فراخوان ثبت شده و شماره یا مقصد جایگزین نشده است.')
+    super(clip ? `فایل صوتی ${clip} بارگذاری نشد؛ اتصال محلی را بررسی و دوباره تلاش کنید.` : 'برای این شماره یا مقصد صدای ضبط‌شده موجود نیست؛ شماره‌های بسته ۱ تا ۱۰۰ است. فراخوان ثبت شده و شماره یا مقصد جایگزین نشده است.')
   }
 }
 
@@ -23,14 +24,19 @@ export class MissingClipError extends Error {
 export function joinBuffers(context: BaseAudioContext, buffers: AudioBuffer[], gapMs = JOIN_GAP_MS) {
   if (!buffers.length) throw new MissingClipError('')
   const rate = buffers[0]!.sampleRate
-  const channels = buffers[0]!.numberOfChannels
-  if (buffers.some(b => b.sampleRate !== rate || b.numberOfChannels !== channels)) throw new Error('قالب فایل‌های صوتی یکسان نیست؛ بسته را بررسی کنید.')
+  const channels = Math.max(...buffers.map(buffer => buffer.numberOfChannels))
+  if (buffers.some(b => b.sampleRate !== rate || b.numberOfChannels < 1 || b.numberOfChannels > 2)) throw new Error('قالب فایل‌های صوتی یکسان نیست؛ بسته را بررسی کنید.')
   const gap = Math.round(rate * gapMs / 1000)
   const length = buffers.reduce((total, b) => total + b.length, 0) + gap * (buffers.length - 1)
   const joined = context.createBuffer(channels, length, rate)
   let offset = 0
   buffers.forEach((buffer, index) => {
-    for (let channel = 0; channel < channels; channel++) joined.getChannelData(channel).set(buffer.getChannelData(channel), offset)
+    // The spoken numbers are mono while destination recordings are stereo. Duplicate mono
+    // samples into both output channels so the number and destination can play as one call.
+    for (let channel = 0; channel < channels; channel++) {
+      const sourceChannel = Math.min(channel, buffer.numberOfChannels - 1)
+      joined.getChannelData(channel).set(buffer.getChannelData(sourceChannel), offset)
+    }
     offset += buffer.length + (index + 1 < buffers.length ? gap : 0)
   })
   return joined
@@ -72,8 +78,8 @@ export function createClipPlayer() {
   }
 
   async function rawClip(clip: string) {
-    // Only bundled recorded WAVs can be requested. No external URL or old voice pack.
-    if (!recordedClips.includes(clip)) throw new MissingClipError(clip)
+    // Only bundled recordings can be requested. No external URL or old voice pack.
+    if (![...recordedClips, RECORDED_WELCOME].includes(clip)) throw new MissingClipError(clip)
     let persistent: Cache | null = null
     try {
       if ('caches' in globalThis) persistent = await caches.open(CACHE_NAME)
@@ -109,10 +115,11 @@ export function createClipPlayer() {
   /** Preload every supported pair for playback without internet; errors remain visible and retryable. */
   async function prepare() {
     if (!context) throw new Error('ابتدا صدا را فعال کنید.')
+    const clips = [...recordedClips, RECORDED_WELCOME]
     let index = 0
     // Limit concurrent downloads/decodes on the small computers driving the waiting-room TV.
     await Promise.all(Array.from({ length: 4 }, async () => {
-      while (index < recordedClips.length) await load(recordedClips[index++]!)
+      while (index < clips.length) await load(clips[index++]!)
     }))
     try {
       if ('caches' in globalThis) for (const key of await caches.keys()) {

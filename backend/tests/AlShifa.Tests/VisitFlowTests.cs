@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using AlShifa.Api.Features.Auth;
 using AlShifa.Api.Features.Clinical;
+using AlShifa.Api.Features.Calls;
 using AlShifa.Api.Features.Finance;
 using AlShifa.Api.Features.Patients;
 using AlShifa.Api.Features.Visits;
@@ -14,9 +15,9 @@ namespace AlShifa.Tests;
 
 /// <summary>The confirmed Al-Shifa flow: paid token, free Vision, paid refraction and imaging, all inside one visit.</summary>
 [Collection("api")]
-public sealed class VisitFlowTests(ApiFixture api)
+public sealed class VisitFlowTests(ApiFixture api) : PhysicalQueueTestScope(api)
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } };
 
     private static string Name(string prefix) => $"{prefix}_{Guid.NewGuid():N}"[..20];
 
@@ -76,7 +77,7 @@ public sealed class VisitFlowTests(ApiFixture api)
     private async Task<int> TestIdAsync(HttpClient doctor, string kind)
     {
         var tests = await doctor.GetFromJsonAsync<JsonElement>("/api/diagnostic-tests");
-        return tests.EnumerateArray().First(t => t.GetProperty("kind").GetString() == kind).GetProperty("id").GetInt32();
+        return tests.EnumerateArray().First(t => t.GetProperty("kind").GetString() == kind && t.GetProperty("serviceId").ValueKind == JsonValueKind.Number).GetProperty("id").GetInt32();
     }
 
     private async Task<DiagnosticOrderDto> RequestAsync(HttpClient doctor, PatientDto patient, VisitRow visit, string kind, bool returnToDoctor = true) =>
@@ -120,10 +121,10 @@ public sealed class VisitFlowTests(ApiFixture api)
         await Read<JsonElement>(await feeCashier.SendAsync(ApiFixture.Keyed("/api/payments",
             new PaymentRequest(token.InvoiceId, token.Balance, PaymentMethod.Cash, null, token.InvoiceVersion))), HttpStatusCode.Created);
 
-        // The number comes from the payment, never before it.
-        Assert.Null(token.QueueNumber);
+        // The physical card is entered before payment and stays unchanged.
+        Assert.NotNull(token.QueueNumber);
         var numbered = await desk.GetFromJsonAsync<VisitTokenRow>($"/api/visit-tokens/{token.Id}", JsonOptions);
-        Assert.NotNull(numbered!.QueueNumber);
+        Assert.Equal(token.QueueNumber, numbered!.QueueNumber);
 
         var visit = await Read<VisitRow>(await desk.SendAsync(ApiFixture.Keyed("/api/visits", Visit(token.Id))), HttpStatusCode.Created);
         Assert.Equal(numbered.QueueNumber, visit.QueueNumber);
@@ -273,8 +274,19 @@ public sealed class VisitFlowTests(ApiFixture api)
         Assert.True(Has(await triage.GetFromJsonAsync<JsonElement>("/api/refractions/queue?done=true"), visit.Id));
         Assert.False(Has(await triage.GetFromJsonAsync<JsonElement>($"/api/refractions/queue?done=true&date={KabulClock.Today.AddDays(-1):yyyy-MM-dd}"), visit.Id));
 
+        // Back from refraction the patient stays on the doctor's seen list with the result marked, and never re-enters the queue.
         var queue = await doctor.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=doctor", JsonOptions);
-        Assert.Contains(queue!, v => v.Id == visit.Id && v.Status == nameof(VisitStatus.ReadyForDoctor));
+        Assert.DoesNotContain(queue!, v => v.Id == visit.Id);
+        var seen = await doctor.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=doctor&done=true", JsonOptions);
+        Assert.Contains(seen!, v => v.Id == visit.Id && v.Status == nameof(VisitStatus.ReadyForDoctor) && v.ResultReady);
+
+        // Opening the file is the review: the mark goes, the patient stays seen, and nothing is announced or numbered again.
+        var queueNumber = (await ReadVisitAsync(doctor, visit.Id)).QueueNumber;
+        Assert.Equal(HttpStatusCode.NoContent, (await doctor.PostAsync($"/api/consultations/{visit.Id}/start", null)).StatusCode);
+        seen = await doctor.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=doctor&done=true", JsonOptions);
+        Assert.Contains(seen!, v => v.Id == visit.Id && !v.ResultReady && v.QueueNumber == queueNumber);
+        Assert.DoesNotContain((await doctor.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=doctor", JsonOptions))!, v => v.Id == visit.Id);
+        Assert.Equal(0, await InDbAsync(db => db.PatientCalls.CountAsync(c => c.VisitId == visit.Id && c.Desk == CallDesk.Doctor)));
 
         // Same visit, no second visit fee, and the earlier exam is intact.
         Assert.Equal(1, await InDbAsync(db => db.Visits.CountAsync(v => v.PatientId == patient.Id)));

@@ -22,6 +22,9 @@ interface PrintDocument {
   highlight: PrintField | null
   signer: string | null
   signerTitle: string | null
+  department?: string | null
+  purposeItems?: string[] | null
+  hideNumber?: boolean
 }
 type PaperSize = 'receipt-80' | 'receipt-58' | 'a5' | 'a4'
 
@@ -46,6 +49,17 @@ const loading = ref(false)
 const paper = ref<HTMLElement | null>(null)
 const selectedPaper = ref<PaperSize>('a5')
 
+/** The counter's printer does not change between receipts, so its roll width is remembered on this computer. */
+const ROLL_KEY = 'alshifa.print.roll'
+function savedRoll(): PaperSize {
+  try {
+    const value = localStorage.getItem(ROLL_KEY)
+    return value === 'receipt-58' ? 'receipt-58' : 'receipt-80'
+  } catch {
+    return 'receipt-80'
+  }
+}
+
 const filled = (value: string | null | undefined): value is string => value != null && value.trim() !== ''
 /** Amounts, counts and dates read in Dari digits as on the reference; document numbers and names keep their own letters. */
 const show = (value: string) => (/[A-Za-z]/.test(value) ? value : latinDigits(value))
@@ -62,13 +76,13 @@ const highlight = computed(() => (filled(doc.value?.highlight?.value) ? doc.valu
 
 /** The facts a card prints in its rows: number and date first, as on the reference, then the document's own. */
 const cardRows = computed(() => [
-  { label: numberLabel.value, value: doc.value?.number ?? '' },
+  ...(doc.value?.hideNumber ? [] : [{ label: numberLabel.value, value: doc.value?.number ?? '' }]),
   { label: 'تاریخ', value: dateText.value },
   ...fields.value.map((field) => ({ label: field.label, value: show(field.value!) })),
 ])
 
 const columnClass = (header: string) =>
-  header === '#' ? 'pd-col-index' : header === 'مبلغ' ? 'pd-col-amount' : header === 'مقدار' ? 'pd-col-qty' : 'pd-col-text'
+  header === '#' ? 'pd-col-index' : header === 'مبلغ' ? 'pd-col-amount' : header === 'مقدار' || header === 'تعداد' ? 'pd-col-qty' : 'pd-col-text'
 const cell = (header: string, value: string | null) => (!filled(value) ? '—' : header === '#' ? value : show(value))
 
 /** Each line of a prescription: the drug, then dose, route and instructions over the course, exactly as recorded. */
@@ -104,7 +118,8 @@ function updatePageSize() {
     return
   }
   const width = PAPER[selectedPaper.value].width
-  const height = paper.value ? Math.ceil((paper.value.scrollHeight * 25.4) / 96) + 2 : 100
+  // A few spare millimetres: a page cut even slightly short drops the last line, the amount, onto a second slip.
+  const height = paper.value ? Math.ceil((paper.value.scrollHeight * 25.4) / 96) + 6 : 100
   pageStyle.textContent = `@page { size: ${width}mm ${Math.max(60, height)}mm; margin: 0; }`
 }
 
@@ -117,7 +132,7 @@ async function load() {
     const result = await api<PrintDocument>(`/print/${props.kind}/${props.id}`)
     if (current !== request) return
     doc.value = result
-    selectedPaper.value = result.format === 'receipt' ? 'receipt-80' : 'a5'
+    selectedPaper.value = result.format === 'receipt' ? savedRoll() : 'a5'
     await nextTick()
     observer?.disconnect()
     if (paper.value) observer?.observe(paper.value)
@@ -142,7 +157,10 @@ onMounted(() => {
   void load()
 })
 watch(() => [props.kind, props.id], load)
-watch(selectedPaper, async () => {
+watch(selectedPaper, async (value) => {
+  if (value.startsWith('receipt-')) {
+    try { localStorage.setItem(ROLL_KEY, value) } catch { /* private window: the choice is only kept for this page */ }
+  }
   await nextTick()
   updatePageSize()
 })
@@ -173,7 +191,8 @@ async function openPrintDialog() {
         <button type="button" class="btn print-button" :disabled="!doc || loading" @click="openPrintDialog"><i class="ri-printer-line" aria-hidden="true"></i> چاپ</button>
         <button type="button" class="btn pdf-button" :disabled="!doc || loading" @click="openPrintDialog"><i class="ri-file-pdf-2-line" aria-hidden="true"></i> ذخیره به PDF</button>
       </div>
-      <p class="print-actions__hint">برای PDF، در پنجره چاپ «Save as PDF» را انتخاب کنید. «Margins» را روی «None» و «Background graphics» را روشن بگذارید.</p>
+      <p v-if="isReceipt" class="print-actions__hint">پرنتر رسید: در پنجره چاپ، «Margins» را روی «None» و «Scale» را روی «Default» یا 100 بگذارید. اندازه کاغذ پرنتر باید با رول انتخاب‌شده (80 یا 58 میلی‌متر) یکی باشد.</p>
+      <p v-else class="print-actions__hint">برای PDF، در پنجره چاپ «Save as PDF» را انتخاب کنید. «Margins» را روی «None» و «Background graphics» را روشن بگذارید.</p>
     </section>
 
     <div v-if="loading" class="print-state" role="status"><span class="spinner-border spinner-border-sm" aria-hidden="true"></span><p>سند در حال آماده‌سازی است…</p></div>
@@ -183,13 +202,14 @@ async function openPrintDialog() {
       <header class="pd-head">
         <div class="pd-brand">
           <div class="pd-brand__fa">{{ hospitalName }}</div>
-          <div class="pd-brand__en" dir="ltr">AL-SHEFA Specialist Eye Hospital</div>
+          <div v-if="layout === 'rx'" class="pd-brand__en" dir="ltr">AL-SHEFA Specialist Eye Hospital</div>
         </div>
         <img :src="logoSrc" alt="لوگوی شفاخانه تخصصی چشم الشفا" class="pd-logo" />
       </header>
       <hr class="pd-rule pd-rule--head" />
 
       <h2 class="pd-title">{{ doc.title }}</h2>
+      <p v-if="doc.department" class="pd-department"><span>بخش:</span> <bdi>{{ doc.department }}</bdi></p>
       <p v-if="doc.subtitle" class="pd-subtitle"><bdi>{{ doc.subtitle }}</bdi></p>
 
       <!-- Prescription: name and date in a shaded box, then the recorded medicines under the Rx mark. -->
@@ -234,10 +254,14 @@ async function openPrintDialog() {
 
       <!-- Receipt card: number, date and patient, a rule, and the amount band. -->
       <template v-else>
-        <div v-if="highlight" class="pd-box pd-box--single"><div class="pd-inline"><span>{{ highlight.label }}:</span><bdi>{{ highlight.value }}</bdi></div></div>
+        <div v-if="highlight" :class="['pd-box', 'pd-box--single', { 'pd-box--queue': doc.hideNumber }]"><div class="pd-inline"><span>{{ highlight.label }}:</span><bdi>{{ highlight.value }}</bdi></div></div>
         <dl class="pd-rows">
           <div v-for="row in cardRows" :key="row.label"><dt>{{ row.label }}:</dt><dd><bdi>{{ row.value }}</bdi></dd></div>
         </dl>
+        <section v-if="doc.purposeItems?.length" class="pd-purposes" aria-label="بابت این رسید">
+          <h3>بابت:</h3>
+          <ul><li v-for="(item, index) in doc.purposeItems" :key="index"><bdi>{{ item }}</bdi></li></ul>
+        </section>
         <p v-if="doc.note" class="pd-note">{{ doc.note }}</p>
         <template v-if="band">
           <hr class="pd-rule pd-rule--foot" />
@@ -304,6 +328,9 @@ async function openPrintDialog() {
 }
 .pd--a5 { min-height: 210mm; }
 .pd--a4 { --u: calc(148mm / 348 * 1.15); min-height: 297mm; }
+/* Page invoices use readable document type, rather than enlarging a receipt's
+   typography until a short pharmacy bill spills onto a second sheet. */
+.pd--table.pd--a5 { --u: calc(100mm / 348); }
 .pd * { box-sizing: border-box; }
 .pd bdi { unicode-bidi: isolate; }
 
@@ -331,6 +358,10 @@ async function openPrintDialog() {
 .pd-box--single { padding-block: calc(var(--u) * 3); }
 .pd-inline { display: flex; align-items: baseline; gap: calc(var(--u) * 30); min-height: calc(var(--u) * 28.5); line-height: calc(var(--u) * 28.5); }
 .pd-box--single .pd-inline { min-height: calc(var(--u) * 32); line-height: calc(var(--u) * 32); }
+.pd-box--queue { margin-top: calc(var(--u) * 14); padding: calc(var(--u) * 10) calc(var(--u) * 11); text-align: center; background: #e7f1f8; }
+.pd-box--queue .pd-inline { display: grid; gap: calc(var(--u) * 2); justify-items: center; line-height: 1.15; }
+.pd-box--queue .pd-inline > span { font-size: calc(var(--u) * 15); }
+.pd-box--queue .pd-inline > bdi { font-size: calc(var(--u) * 39); font-weight: 800; color: var(--ink); direction: ltr; }
 .pd-inline > span { flex: none; color: var(--text); }
 .pd-inline > bdi { color: var(--text); }
 .pd--card .pd-box + .pd-rows { margin-top: calc(var(--u) * 12); }
@@ -379,6 +410,48 @@ async function openPrintDialog() {
 .pd--receipt-58 .pd-table td::before { content: attr(data-label); color: #55617d; }
 .pd--receipt-58 .pd-table td.pd-col-index { display: none; }
 
+/*
+ * Thermal rolls. The paper is 80 or 58 mm but the head prints only about 72 or 48 mm of it, and drivers place that
+ * strip differently, so everything sits inside the printable strip, centred, with nothing pushed past it.
+ * The head prints black dots only: light blue fills and rules vanish, so a roll is black on white with outlines.
+ */
+.pd--receipt-80 { --print-w: 72mm; }
+.pd--receipt-58 { --print-w: 48mm; }
+.pd--roll {
+  --u: calc(var(--print-w) / 300);
+  --ink: #000;
+  --text: #000;
+  --rule: #000;
+  --grid: #000;
+  --band: #fff;
+  --shade: #fff;
+  --head: #fff;
+  padding: calc(var(--u) * 12) calc((var(--paper-w) - var(--print-w)) / 2) calc(var(--u) * 18);
+  font-weight: 500;
+}
+/* 58 mm: a larger unit, or the type falls under what a thermal head prints legibly. */
+.pd--receipt-58 { --u: calc(var(--print-w) / 255); }
+.pd--roll .pd-box,.pd--roll .pd-band,.pd--roll .pd-band--table,.pd--roll .pd-table { width: 100%; margin-inline: 0; }
+.pd--roll .pd-box { border: max(1px, var(--u)) dashed #000; }
+.pd--roll .pd-band { min-height: calc(var(--u) * 40); margin-top: calc(var(--u) * 20); padding-inline: calc(var(--u) * 10); border: max(1.5px, calc(var(--u) * 1.5)) solid #000; }
+.pd--roll .pd-band__label { font-weight: 700; }
+.pd--roll .pd-rows { padding-inline: 0; margin-top: calc(var(--u) * 14); }
+.pd--roll .pd-rows > div { min-height: calc(var(--u) * 28); }
+.pd--roll .pd-rows dd,.pd--roll .pd-foot dd { font-weight: 700; }
+.pd--roll .pd-foot { grid-template-columns: auto 1fr; column-gap: calc(var(--u) * 10); }
+.pd--roll .pd-foot dt { padding-inline-start: 0; }
+.pd--roll .pd-table th,.pd--roll .pd-table td { padding-inline: calc(var(--u) * 4); }
+.pd--roll .pd-table td::before { color: #000; }
+.pd--roll .pd-rule--head { margin-top: calc(var(--u) * 12); }
+.pd--roll .pd-title { margin-top: calc(var(--u) * 8); font-size: calc(var(--u) * 22); }
+.pd--roll .pd-logo { filter: grayscale(1) contrast(1.6); }
+
+.pd-department { margin: calc(var(--u) * 8) 0 0; text-align: center; font-size: calc(var(--u) * 15); font-weight: 600; overflow-wrap: anywhere; }
+.pd-purposes { margin-top: calc(var(--u) * 14); padding-top: calc(var(--u) * 10); border-top: max(1px, var(--u)) solid var(--rule); font-size: calc(var(--u) * 15); }
+.pd-purposes h3 { margin: 0 0 calc(var(--u) * 5); font-size: inherit; font-weight: 700; }
+.pd-purposes ul { margin: 0; padding-inline-start: calc(var(--u) * 18); }
+.pd-purposes li { padding-block: calc(var(--u) * 3); overflow-wrap: anywhere; break-inside: avoid; }
+
 @media (max-width: 650px) {
   .print-screen { padding: 18px 12px 32px; }
   .print-actions { align-items: stretch; margin-bottom: 20px; }
@@ -391,6 +464,7 @@ async function openPrintDialog() {
   .print-screen { min-height: 0; padding: 0; background: #fff; }
   .print-actions,.print-state { display: none !important; }
   .pd { max-width: none; margin: 0; box-shadow: none; border-radius: 0; }
+  .pd--table.pd--a5,.pd--table.pd--a4 { min-height: 0; }
   .pd-head,.pd-title,.pd-subtitle,.pd-box,.pd-rows > div,.pd-foot,.pd-signer { break-inside: avoid; }
   .pd-table thead { display: table-header-group; }
   .pd-table tr { break-inside: avoid; }

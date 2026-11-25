@@ -3,7 +3,8 @@ import { computed } from 'vue'
 import ReportAvatar from './ReportAvatar.vue'
 import type { ReportTile } from './types'
 
-const props = defineProps<{ label: string; value: string; kind: ReportTile['kind']; note?: string; negative?: boolean }>()
+/** unknown: the system cannot give a true figure, so the value is a word and the card is marked. */
+const props = defineProps<{ label: string; value: string; kind: ReportTile['kind']; note?: string; negative?: boolean; unknown?: boolean }>()
 
 /** The gallery picture that fits the figure best, read from its label; the kind decides when no word matches. */
 const pictures: [RegExp, string][] = [
@@ -11,7 +12,7 @@ const pictures: [RegExp, string][] = [
   [/طلب|فاکتورهای باز|کهنه/, 'outstanding'],
   [/تخفیف|برگشت|باطل/, 'adjustments'],
   [/دریافت|صندوق|کسری/, 'cash'],
-  [/درآمد|نتیجه/, 'income'],
+  [/درآمد|نتیجه|عواید|سود|زیان/, 'income'],
   [/فروش/, 'sales'],
   [/موجودی|جنس|اجناس|بسته|تاریخ/, 'stock'],
   [/تشخیص|بیماری/, 'diseases'],
@@ -25,11 +26,11 @@ const picture = computed(
 )
 /** The figure stands alone in large type; its unit moves to the small line under it. */
 const figure = computed(() => props.value.replace(/\s*افغانی$/, ''))
-const small = computed(() => [props.kind === 'money' ? 'افغانی' : '', props.note ?? ''].filter(Boolean).join(' · '))
+const small = computed(() => [props.kind === 'money' && !props.unknown ? 'افغانی' : '', props.note ?? ''].filter(Boolean).join(' · '))
 </script>
 
 <template>
-  <div class="rs" :title="note ? `${label}: ${value} — ${note}` : `${label}: ${value}`">
+  <div class="rs" :class="{ 'rs--unknown': unknown }" :title="note ? `${label}: ${value} — ${note}` : `${label}: ${value}`">
     <div class="rs__text">
       <div class="rs__label">{{ label }}</div>
       <div class="rs__value" :class="{ 'rs__value--negative': negative }">{{ figure }}</div>
@@ -46,12 +47,13 @@ const small = computed(() => [props.kind === 'money' ? 'افغانی' : '', prop
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  height: 84px;
+  min-height: 84px;
+  height: 100%;
   padding: 12px 18px;
   overflow: hidden;
   border-radius: 10px;
   background: var(--xr-surface);
-  box-shadow: 0 1px 2px rgba(31, 42, 68, 0.05), 0 4px 16px rgba(31, 42, 68, 0.06);
+  box-shadow: var(--xr-shadow-card);
 }
 
 .rs__text {
@@ -59,27 +61,43 @@ const small = computed(() => [props.kind === 'money' ? 'افغانی' : '', prop
   min-width: 0;
 }
 
-.rs__label,
-.rs__value,
-.rs__note {
+.rs__value {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* Labels and notes explain the figure: they wrap to a second line rather than lose their end to an ellipsis. */
+.rs__label,
+.rs__note {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow-wrap: anywhere;
+}
+
 .rs__label {
-  color: #3a4256;
+  color: var(--xr-switch-text);
   font-size: 12.5px;
   font-weight: 500;
   line-height: 1.6;
 }
 
 .rs__value {
-  color: #1f2a44;
+  color: var(--xr-text);
   font-size: 20px;
   font-weight: 700;
   line-height: 1.4;
   font-variant-numeric: tabular-nums;
+}
+
+.rs--unknown {
+  box-shadow: inset 0 0 0 1px #f0d48a, var(--xr-shadow-card);
+}
+
+.rs--unknown .rs__value {
+  color: #9a6b00;
 }
 
 .rs__value--negative {
@@ -87,7 +105,7 @@ const small = computed(() => [props.kind === 'money' ? 'افغانی' : '', prop
 }
 
 .rs__note {
-  color: #8a94a6;
+  color: var(--xr-text-soft);
   font-size: 11px;
   line-height: 1.5;
 }
@@ -99,8 +117,14 @@ const small = computed(() => [props.kind === 'money' ? 'افغانی' : '', prop
 }
 
 @media (max-width: 575.98px) {
+  /* Two cards share a phone's width: labels wrap instead of losing their meaning to an ellipsis. */
   .rs {
     padding: 10px 12px;
+  }
+
+  .rs__label,
+  .rs__note {
+    -webkit-line-clamp: 3;
   }
 
   .rs__value {

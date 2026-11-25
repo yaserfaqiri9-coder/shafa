@@ -155,12 +155,12 @@ onMounted(async () => {
               </div>
               <UiComboBox v-else v-model="line.productId" :label="`جنس ردیف ${i + 1}`" hide-label :search="search" :selected-label="line.productName" required chip placeholder="نام یا کد جنس را تایپ کنید" create-label="افزودن جنس جدید" @create="addNewProduct(line, $event)" />
             </td>
-            <td><input v-model="line.lot" class="form-control" dir="ltr" maxlength="50" :aria-label="`شماره بچ ردیف ${i + 1}`" /></td>
-            <td class="purchase__date"><ShamsiDateInput v-model="line.expiry" :label="`تاریخ انقضا ردیف ${i + 1}`" class="purchase__date-field" /></td>
-            <td><input v-model.number="line.quantity" class="form-control" type="number" min="0.001" step="any" required :aria-label="`مقدار ردیف ${i + 1}`" /></td>
-            <td><input v-model.number="line.unitCost" class="form-control" type="number" min="0" step="0.01" placeholder="اختیاری" :aria-label="`قیمت خرید واحد ردیف ${i + 1}`" /></td>
-            <td class="xr-lines__money">{{ money((line.quantity || 0) * (line.unitCost || 0)) }}</td>
-            <td><button type="button" class="btn btn-soft-danger btn-icon" :aria-label="`حذف ردیف ${i + 1}`" title="حذف ردیف" :disabled="form.lines.length === 1" @click="form.lines.splice(i, 1)"><i class="ri-close-line" aria-hidden="true"></i></button></td>
+            <td data-label="شماره بچ/لات"><input v-model="line.lot" class="form-control" dir="ltr" maxlength="50" :aria-label="`شماره بچ ردیف ${i + 1}`" /></td>
+            <td class="purchase__date" data-label="تاریخ انقضا"><ShamsiDateInput v-model="line.expiry" :label="`تاریخ انقضا ردیف ${i + 1}`" class="purchase__date-field" /></td>
+            <td data-label="مقدار"><input v-model.number="line.quantity" class="form-control" type="number" min="0.001" step="any" required :aria-label="`مقدار ردیف ${i + 1}`" /></td>
+            <td data-label="قیمت خرید واحد"><input v-model.number="line.unitCost" class="form-control" type="number" min="0" step="0.01" placeholder="اختیاری" :aria-label="`قیمت خرید واحد ردیف ${i + 1}`" /></td>
+            <td class="xr-lines__money" data-label="مبلغ">{{ money((line.quantity || 0) * (line.unitCost || 0)) }}</td>
+            <td class="xr-lines__remove"><button type="button" class="btn btn-soft-danger btn-icon" :aria-label="`حذف ردیف ${i + 1}`" title="حذف ردیف" :disabled="form.lines.length === 1" @click="form.lines.splice(i, 1)"><i class="ri-close-line" aria-hidden="true"></i></button></td>
           </tr>
         </tbody>
       </table>
@@ -179,6 +179,12 @@ onMounted(async () => {
 <style scoped>
 .purchase {
   min-width: 860px;
+}
+
+/* Phones show each line as a card (base.css), so the table no longer needs its desktop width. */
+@media (max-width: 575.98px) {
+  .purchase { min-width: 0; }
+  .purchase__product, .purchase__date { width: auto; }
 }
 
 .purchase__product {

@@ -4,11 +4,13 @@ import { useLiveRefresh } from '@/api/realtime'
 import { useAuthStore } from '@/stores/auth'
 import { sharedPlayer } from './clipPlayer'
 
-export type CallDeskName = 'Reception' | 'Vision' | 'Doctor' | 'Refraction' | 'Imaging' | 'Lab' | 'Pharmacy' | 'Optical'
+export type CallDeskName = 'Reception' | 'Cashier' | 'Vision' | 'Doctor' | 'Refraction' | 'Imaging' | 'Lab' | 'Pharmacy' | 'Optical' | 'Surgery'
 
 export interface CallRow {
   id: number
   queueNumber: number
+  queueShift: 'Morning' | 'Afternoon'
+  queueRound: number
   destination: string
   isRecall: boolean
   status: 'Queued' | 'Playing' | 'Played' | 'Failed' | 'Cancelled'
@@ -23,11 +25,18 @@ export interface CallQueueRow {
   visitId: number | null
   tokenId: number | null
   queueNumber: number
+  queueShift: 'Morning' | 'Afternoon'
+  queueRound: number
+  present?: boolean
+  isServing?: boolean
+  canCall?: boolean
+  isCurrentQueue: boolean
   lastCall: CallRow | null
 }
 
 const permissions: Record<CallDeskName, string> = {
   Reception: 'visitfees.create',
+  Cashier: 'payments.create',
   Vision: 'preexam.edit',
   Doctor: 'consultation.edit',
   Refraction: 'preexam.edit',
@@ -35,6 +44,7 @@ const permissions: Record<CallDeskName, string> = {
   Lab: 'diagnostics.edit',
   Pharmacy: 'pharmacy.create',
   Optical: 'optical.create',
+  Surgery: 'surgery.edit',
 }
 
 // Any of these can move a patient in or out of a desk's queue.
@@ -42,6 +52,7 @@ const refreshOn = [
   'PatientCallChanged',
   'VisitCreated',
   'VisitStatusChanged',
+  'InvoiceIssued',
   'PreExamCompleted',
   'ConsultationCompleted',
   'DiagnosticOrderCreated',
@@ -54,10 +65,12 @@ const refreshOn = [
 ]
 
 /** One desk's queue as the server sees it. A row with no entry here is not callable, whatever the page shows. */
-export function useCallDesk(desk: CallDeskName) {
+export function useCallDesk(desk: CallDeskName, includeSeen = false) {
   const enabled = useAuthStore().can(permissions[desk])
   const rows = ref<CallQueueRow[]>([])
   const stationOnline = ref(true)
+  const currentNumber = ref<number | null>(null)
+  const nextNumber = ref<number | null>(null)
   const error = ref('')
   const loadError = ref('')
   // Per row: a press on one patient must not swallow a press on the next.
@@ -69,8 +82,10 @@ export function useCallDesk(desk: CallDeskName) {
     if (!enabled || loading) return
     loading = true
     try {
-      const view = await api<{ stationOnline: boolean; rows: CallQueueRow[] }>(`/calls/desk/${desk}`)
+      const view = await api<{ stationOnline: boolean; rows: CallQueueRow[]; currentNumber?: number | null; nextNumber?: number | null }>(`/calls/desk/${desk}${includeSeen ? '?includeSeen=true' : ''}`)
       rows.value = view.rows
+      currentNumber.value = view.currentNumber ?? null
+      nextNumber.value = view.nextNumber ?? null
       stationOnline.value = view.stationOnline
       loadError.value = ''
     } catch (cause) {
@@ -118,13 +133,15 @@ export function useCallDesk(desk: CallDeskName) {
     return act(row, '/calls', { desk, visitId: row.visitId, tokenId: row.tokenId, recall })
   }
 
-  const mark = (row: CallQueueRow, outcome: 'Attended' | 'NoShow') => act(row, `/calls/${row.lastCall!.id}/outcome`, { outcome })
+  const mark = (row: CallQueueRow, outcome: 'Attended' | 'NoShow') => row.lastCall
+    ? act(row, `/calls/${row.lastCall.id}/outcome`, { outcome })
+    : act(row, '/calls/presence', { desk, visitId: row.visitId, tokenId: row.tokenId, present: outcome === 'Attended' })
 
   // Station activation does not emit a patient event; poll its heartbeat as well as live queue changes.
   useLiveRefresh(enabled ? refreshOn : [], () => { if (enabled) void load() }, 15_000)
   onMounted(load)
 
-  return { enabled, rows, stationOnline, error: computed(() => error.value || loadError.value), isSending, load, entry, call, mark }
+  return { desk, enabled, rows, stationOnline, currentNumber, nextNumber, error: computed(() => error.value || loadError.value), isSending, load, entry, call, mark }
 }
 
 export type CallDeskHandle = ReturnType<typeof useCallDesk>

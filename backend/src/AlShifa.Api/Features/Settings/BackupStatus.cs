@@ -19,7 +19,8 @@ public sealed record BackupStatusDto(
     IReadOnlyList<BackupFileDto> Backups,
     string? OffsiteTarget = null,
     DateTime? OffsiteLastSuccessAt = null,
-    string? OffsiteError = null);
+    string? OffsiteError = null,
+    DateTime? RestoreVerifiedAt = null);
 
 /// <summary>Reads the status file written by deploy/windows/backup.ps1, so a backup that stops working cannot go unnoticed.</summary>
 public static class BackupStatus
@@ -36,7 +37,8 @@ public static class BackupStatus
         List<BackupFileDto>? Backups,
         string? OffsiteTarget,
         DateTime? OffsiteLastSuccessAt,
-        string? OffsiteError);
+        string? OffsiteError,
+        DateTime? RestoreVerifiedAt);
 
     // The backup runs once a day at 02:00 Kabul time; a little slack keeps a run that took longer from raising an alarm.
     private static readonly TimeSpan MaxAge = TimeSpan.FromHours(26);
@@ -71,7 +73,7 @@ public static class BackupStatus
             status?.LastRunAt?.ToUniversalTime(),
             running,
             status?.LastError,
-            stale || !string.IsNullOrEmpty(status?.LastError) || !string.IsNullOrEmpty(status?.OffsiteError),
+            stale || status?.RestoreVerifiedAt is null || !string.IsNullOrEmpty(status?.LastError) || !string.IsNullOrEmpty(status?.OffsiteError),
             status?.Destination,
             status?.OptionalDestination,
             status?.LastSizeBytes,
@@ -79,7 +81,8 @@ public static class BackupStatus
             status?.Backups?.OrderByDescending(b => b.CreatedAt).ToList() ?? [],
             status?.OffsiteTarget,
             status?.OffsiteLastSuccessAt?.ToUniversalTime(),
-            status?.OffsiteError);
+            status?.OffsiteError,
+            status?.RestoreVerifiedAt?.ToUniversalTime());
     }
 }
 

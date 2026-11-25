@@ -2,11 +2,13 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api, ApiError, errorMessage, newIdempotencyKey } from '@/api/http'
 import { useLiveRefresh } from '@/api/realtime'
 import { useAuthStore } from '@/stores/auth'
-import { sharedPlayer as player } from './clipPlayer'
+import { RECORDED_WELCOME, sharedPlayer as player } from './clipPlayer'
 
 export interface StationCall {
   id: number
   queueNumber: number
+  queueShift: 'Morning' | 'Afternoon'
+  queueRound: number
   destination: string
   clips: string[]
 }
@@ -15,6 +17,8 @@ export interface StationHistoryRow {
   id: number
   visitNumber: string | null
   queueNumber: number
+  queueShift: 'Morning' | 'Afternoon'
+  queueRound: number
   destination: string
   isRecall: boolean
   status: string
@@ -40,6 +44,7 @@ const PAUSE_BETWEEN_CALLS_MS = 700
 const VOLUME_KEY = 'alshifa.audio.volume'
 const STATION_KEY = 'alshifa.audio.station'
 const RESUME_KEY = 'alshifa.audio.resume'
+const WELCOME_KEY = 'alshifa.audio.welcome-date'
 
 function readStored(storage: () => Storage, key: string) {
   try {
@@ -86,6 +91,7 @@ const nowPlaying = ref<StationCall | null>(null)
 const volume = ref(loadVolume())
 const error = ref('')
 const testing = ref(false)
+const playingWelcome = ref(false)
 const preparing = ref(false)
 const prepared = ref(false)
 
@@ -116,6 +122,17 @@ function stop(message: string) {
   error.value = message
 }
 
+function welcomeDateKey() {
+  return new Date().toISOString().slice(0, 10)
+}
+
+async function playWelcomeOnce() {
+  const today = welcomeDateKey()
+  if (readStored(local, WELCOME_KEY) === today) return
+  await player.play([RECORDED_WELCOME], `welcome:${today}`)
+  writeStored(local, WELCOME_KEY, today)
+}
+
 async function activate(takeOver = false, quiet = false) {
   if (activating) return
   activating = true
@@ -133,6 +150,13 @@ async function activate(takeOver = false, quiet = false) {
     needsClick.value = false
     waitingForClick.value = false
     writeStored(local, RESUME_KEY, '1')
+    try {
+      await playWelcomeOnce()
+    } catch (cause) {
+      activated.value = false
+      writeStored(local, RESUME_KEY, null)
+      throw cause
+    }
     await pump()
     await loadStatus()
   } catch (cause) {
@@ -223,6 +247,22 @@ async function testSound() {
   }
 }
 
+async function playWelcome() {
+  if (playingWelcome.value) return
+  playingWelcome.value = true
+  error.value = ''
+  try {
+    if (!(await player.unlock())) throw new Error('مرورگر اجازه پخش صدا را نداد؛ دوباره کلیک کنید.')
+    needsClick.value = false
+    await player.play([RECORDED_WELCOME])
+    writeStored(local, WELCOME_KEY, welcomeDateKey())
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : 'پخش خوشامدگویی ناموفق بود.'
+  } finally {
+    playingWelcome.value = false
+  }
+}
+
 async function prepareAudio() {
   preparing.value = true
   try {
@@ -299,6 +339,7 @@ export function useAudioStation() {
     volume,
     error,
     testing,
+    playingWelcome,
     preparing,
     prepared,
     retryAudio,
@@ -309,6 +350,7 @@ export function useAudioStation() {
     activate,
     loadStatus,
     testSound,
+    playWelcome,
     restoreSound,
   }
 }

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { askConfirm } from '@/components/confirm'
 import { computed, onMounted, ref, watch } from 'vue'
 import { api, errorMessage } from '@/api/http'
 import UiAvatar from '@/components/UiAvatar.vue'
@@ -98,9 +99,7 @@ async function removePatient() {
   const p = patient.value
   if (
     !p ||
-    !window.confirm(
-      `پرونده «${patientName(p)}» حذف شود؟ این کار برگشت ندارد. پرونده‌ای که مراجعه یا سابقه دارد حذف نمی‌شود.`,
-    )
+    !(await askConfirm(`پرونده «${patientName(p)}» حذف شود؟ این کار برگشت ندارد. پرونده‌ای که مراجعه یا سابقه دارد حذف نمی‌شود.`, { title: 'حذف پرونده', confirmLabel: 'حذف شود', danger: true }))
   )
     return
   error.value = ''

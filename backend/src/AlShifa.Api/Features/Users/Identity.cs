@@ -44,6 +44,8 @@ public class Staff
     [MaxLength(500)] public string? Twitter { get; set; }
     [MaxLength(500)] public string? Google { get; set; }
     public int Avatar { get; set; } = 12;
+    public DateOnly? EmploymentStartDate { get; set; }
+    public DateOnly? EmploymentEndDate { get; set; }
 
     public long Id { get; set; }
 

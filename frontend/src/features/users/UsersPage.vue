@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api, ApiError } from '@/api/http'
 import UiCard from '@/components/UiCard.vue'
 import UiFilterBar from '@/components/UiFilterBar.vue'
 import UiPager from '@/components/UiPager.vue'
+import UiInactiveToggle, { useInactiveFilter } from '@/components/UiInactiveToggle.vue'
 import UiModal from '@/components/UiModal.vue'
 import UiRowMenu from '@/components/UiRowMenu.vue'
 import { useAuthStore } from '@/stores/auth'
@@ -20,6 +21,7 @@ interface UserRow {
 
 const auth = useAuthStore()
 const rows = ref<UserRow[]>([])
+const { showInactive, shown, inactiveCount } = useInactiveFilter(rows)
 const total = ref(0)
 const page = ref(1)
 const pageSize = 25
@@ -53,6 +55,14 @@ function search() {
   page.value = 1
   load()
 }
+
+// Searches while typing, as every list does; a short pause keeps the server from a request per letter.
+let searchTimer: ReturnType<typeof setTimeout> | undefined
+watch(q, () => {
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(search, 350)
+})
+onBeforeUnmount(() => clearTimeout(searchTimer))
 
 function goTo(next: number) {
   page.value = next
@@ -210,10 +220,9 @@ onMounted(load)
 </script>
 
 <template>
-  <!-- The search here is asked for, not live, so the bar sits in a form and Enter or the button sends it. -->
   <form @submit.prevent="search">
     <UiFilterBar v-model:search="q" title="کاربران" search-label="جستجو" search-placeholder="جستجوی نام یا نام کاربری">
-      <button type="submit" class="btn btn-soft">جستجو</button>
+      <UiInactiveToggle v-model="showInactive" :count="inactiveCount" />
       <template v-if="auth.can('users.create')" #actions>
         <button type="button" class="btn btn-primary" @click="openCreate">کاربر جدید</button>
       </template>
@@ -238,7 +247,7 @@ onMounted(load)
           </tr>
         </thead>
         <tbody>
-          <tr v-for="user in rows" :key="user.id">
+          <tr v-for="user in shown" :key="user.id">
             <td><span class="ltr-num">{{ user.userName }}</span></td>
             <td>{{ user.fullName }}</td>
             <td>{{ user.roles.map(roleLabel).join('، ') }}</td>

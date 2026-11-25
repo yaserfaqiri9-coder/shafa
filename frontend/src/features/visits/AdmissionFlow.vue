@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import QueueCardInput from './QueueCardInput.vue'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, ApiError, errorMessage, newIdempotencyKey } from '@/api/http'
@@ -38,7 +39,7 @@ const fee = ref<number | null>(null)
 
 const patient = reactive({ id: null as number | null, label: null as string | null })
 const openVisit = ref<VisitRow | null>(null)
-const form = reactive({ departmentId: null as number | null, doctorStaffId: null as number | null, serviceId: null as number | null, reason: '' })
+const form = reactive({ queueNumber: null as number | null, departmentId: null as number | null, doctorStaffId: null as number | null, serviceId: null as number | null, reason: '' })
 const admission = ref<Admission | null>(null)
 const discount = reactive({ open: false, amount: null as number | null, reason: '' })
 /** The extra paid service is rare, so it stays folded until asked for. */
@@ -96,7 +97,7 @@ async function createVisit() {
     const row = await api<Admission>('/admissions', {
       method: 'POST',
       idempotencyKey: visitKey.value,
-      body: { patientId: patient.id, departmentId: form.departmentId, doctorStaffId: form.doctorStaffId, serviceId: form.serviceId, reason: form.reason },
+      body: { queueNumber: form.queueNumber, patientId: patient.id, departmentId: form.departmentId, doctorStaffId: form.doctorStaffId, serviceId: form.serviceId, reason: form.reason },
     })
     show(row)
     if (!receipt.open(row.visitId, row.queueNumber) && auth.can('visits.print')) notice.value = 'مراجعه ثبت شد. برای چاپ رسید نوبت، دکمه «چاپ رسید نوبت» را بزنید.'
@@ -119,7 +120,7 @@ async function recoverNumber() {
   saving.value = true
   error.value = ''
   try {
-    show(await api<Admission>(`/admissions/${admission.value!.visitId}/issue-number`, { method: 'POST' }))
+    show(await api<Admission>(`/admissions/${admission.value!.visitId}/reserve-number`, { method: 'POST', body: { queueNumber: form.queueNumber } }))
     emit('changed')
   } catch (cause) {
     error.value = errorMessage(cause)
@@ -146,7 +147,7 @@ async function applyDiscount() {
 
 function reset() {
   Object.assign(patient, { id: null, label: null })
-  Object.assign(form, { departmentId: null, doctorStaffId: null, serviceId: null, reason: '' })
+  Object.assign(form, { queueNumber: null, departmentId: null, doctorStaffId: null, serviceId: null, reason: '' })
   showService.value = false
   Object.assign(discount, { open: false, amount: null, reason: '' })
   admission.value = null
@@ -246,6 +247,7 @@ onMounted(async () => {
   <form v-else-if="step === 'visit'" class="admission-pane" @submit.prevent="createVisit">
     <p class="admission-who">{{ patient.label }}</p>
     <div class="row g-3 mb-3">
+      <div class="col-md-6"><QueueCardInput v-model="form.queueNumber" /></div>
       <div class="col-md-6"><UiComboBox v-model="form.departmentId" label="بخش" :options="departments" required chip /></div>
       <div class="col-md-6"><UiComboBox v-model="form.doctorStaffId" label="داکتر (اختیاری)" :options="doctors" chip placeholder="بدون انتخاب" /></div>
       <div class="col-md-6">
@@ -258,7 +260,7 @@ onMounted(async () => {
       </div>
     </div>
     <div class="xr-form-actions align-items-center">
-      <button type="submit" class="btn btn-primary" :disabled="saving || !form.departmentId">{{ saving ? 'در حال ثبت…' : 'ثبت مراجعه و چاپ نوبت' }}</button>
+      <button type="submit" class="btn btn-primary" :disabled="saving || !form.departmentId || form.queueNumber === null">{{ saving ? 'در حال ثبت…' : 'ثبت مراجعه و چاپ نوبت' }}</button>
       <button type="button" class="btn btn-soft" @click="reset">بازگشت</button>
       <span v-if="fee !== null" class="ms-auto">فیس معاینه: <strong>{{ money(fee) }}</strong></span>
     </div>
@@ -276,7 +278,8 @@ onMounted(async () => {
 
     <template v-if="needsRecovery">
       <div class="alert alert-warning" role="alert">پرداخت این مراجعه ثبت شده و نوبت آن صادر نشده است. پولی دوباره گرفته نمی‌شود.</div>
-      <button type="button" class="btn btn-primary" :disabled="saving" @click="recoverNumber">صدور نوبت</button>
+      <QueueCardInput v-model="form.queueNumber" />
+      <button type="button" class="btn btn-primary" :disabled="saving || form.queueNumber === null" @click="recoverNumber">ثبت شماره کارت</button>
     </template>
     <template v-else>
       <div v-if="admission.visitDate !== todayIso()" class="alert alert-warning" role="alert">این مراجعه از روز گذشته مانده و پرداخت نمی‌شود. آن را در «صف امروز» لغو کنید و دوباره ثبت نمایید.</div>
@@ -311,6 +314,7 @@ onMounted(async () => {
   <div v-else-if="step === 'done' && admission" class="admission-pane admission-done" role="status">
     <p class="admission-done__label">شماره نوبت</p>
     <p class="admission-done__number">{{ quantity(admission.queueNumber) }}</p>
+   
     <p class="admission-who">{{ admission.patientName }} <span class="ltr-num">{{ admission.patientFileNumber }}</span></p>
     <dl class="xr-facts mb-3">
       <div><dt>بخش</dt><dd>{{ admission.departmentName }}</dd></div>

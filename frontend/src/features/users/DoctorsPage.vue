@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api, errorMessage } from '@/api/http'
+import UiInactiveToggle, { useInactiveFilter } from '@/components/UiInactiveToggle.vue'
 import UiModal from '@/components/UiModal.vue'
 import { clearLookups } from '@/api/lookups'
 import { useAuthStore } from '@/stores/auth'
@@ -8,6 +9,7 @@ import { removeRecord } from '@/utils/removeRecord'
 import DoctorFormModal, { type DoctorRow as Doctor } from './DoctorFormModal.vue'
 const auth = useAuthStore()
 const rows = ref<Doctor[]>([])
+const { showInactive, shown, inactiveCount } = useInactiveFilter(rows)
 const loading = ref(true)
 const error = ref('')
 const notice = ref('')
@@ -55,10 +57,11 @@ onMounted(load)
     <div v-if="auth.can('users.manage') && unlinked.length" class="alert alert-warning" role="alert">این داکتران حساب کاربری وصل‌شده ندارند و مریضان‌شان در صف مشترک داکتران دیده می‌شوند، نه صف خودشان: {{ unlinked.join('، ') }}.</div>
     <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
     <div v-if="notice" class="alert alert-success" role="status">{{ notice }}</div>
+    <div class="mb-2"><UiInactiveToggle v-model="showInactive" :count="inactiveCount" /></div>
     <div v-if="loading" class="xr-state" role="status">در حال بارگذاری...</div>
     <div v-else-if="!rows.length && !error" class="xr-state">داکتری ثبت نشده است. با دکمهٔ «ثبت داکتر» در بالای همین صفحه، داکتر جدید را ثبت کنید.</div>
     <div v-else class="doctor-directory__grid">
-      <article v-for="row in rows" :key="row.id" class="doctor-card">
+      <article v-for="row in shown" :key="row.id" class="doctor-card">
         <img :src="avatar(row)" alt="" width="80" height="80" class="doctor-card__avatar" />
         <div class="doctor-card__info"><h3>{{ row.fullName }}</h3><p>{{ row.specialty || row.departmentName || '—' }}</p><a v-if="safeLink(row.website)" :href="safeLink(row.website)" target="_blank" rel="noopener noreferrer" dir="ltr">{{ row.website }}</a><span v-else class="doctor-card__website">—</span></div>
         <p class="doctor-card__description">{{ row.biography || 'معرفی ثبت نشده است.' }}</p>

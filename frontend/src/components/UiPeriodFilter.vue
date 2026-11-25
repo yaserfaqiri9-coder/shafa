@@ -8,7 +8,8 @@ import ShamsiDateInput from './ShamsiDateInput.vue'
  * The days a page shows, as one row of choices: امروز, دیروز, این هفته, این ماه, ماه گذشته and دوره دلخواه,
  * with «همه روزها» first on a list that may show every day. null means every day.
  */
-const props = withDefaults(defineProps<{ allowAll?: boolean; label?: string }>(), { label: 'دوره' })
+/** kinds: the quick choices to offer, when a page needs fewer than all of them. */
+const props = withDefaults(defineProps<{ allowAll?: boolean; label?: string; kinds?: PeriodKind[] }>(), { label: 'دوره', kinds: undefined })
 const range = defineModel<DateRange | null>({ required: true })
 
 const today = todayIso()
@@ -21,7 +22,10 @@ const active = computed<PeriodKind | 'all'>(() => {
   return kindOf(range.value, today)
 })
 
-const choices = computed(() => [...(props.allowAll ? [{ kind: 'all' as const, label: 'همه روزها' }] : []), ...periodChoices])
+const choices = computed(() => [
+  ...(props.allowAll ? [{ kind: 'all' as const, label: 'همه روزها' }] : []),
+  ...periodChoices.filter((c) => !props.kinds || props.kinds.includes(c.kind)),
+])
 
 // A custom range that arrives from outside, such as from the address, shows its two dates.
 watch(
@@ -85,8 +89,9 @@ function showCustom() {
   flex-wrap: wrap;
   gap: 4px;
   padding: 3px;
+  border: 1px solid var(--xr-switch-border);
   border-radius: 10px;
-  background: #f2f5f9;
+  background: var(--xr-switch-bg);
 }
 
 .period__choice {
@@ -95,7 +100,7 @@ function showCustom() {
   border: 0;
   border-radius: 8px;
   background: transparent;
-  color: #3a4256;
+  color: var(--xr-switch-text);
   font-size: 13px;
   font-weight: 500;
   white-space: nowrap;
@@ -108,9 +113,9 @@ function showCustom() {
 
 .period__choice--active,
 .period__choice--active:hover {
-  background: var(--xr-surface);
-  box-shadow: 0 1px 3px rgba(31, 42, 68, 0.12);
-  color: var(--xr-tone-primary-text);
+  background: var(--xr-switch-on);
+  box-shadow: var(--xr-switch-on-shadow);
+  color: #fff;
   font-weight: 700;
 }
 

@@ -2,6 +2,7 @@ using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using AlShifa.Api.Features.Auth;
 using AlShifa.Api.Features.Calls;
+using AlShifa.Api.Features.Chat;
 using AlShifa.Api.Features.Clinical;
 using AlShifa.Api.Features.Finance;
 using AlShifa.Api.Features.Inventory;
@@ -35,11 +36,13 @@ builder.Host.UseWindowsService(o => o.ServiceName = "AlShifaApi");
 var connectionString = builder.Configuration.GetConnectionString("Default")
     ?? throw new InvalidOperationException("ConnectionStrings:Default is not configured.");
 
+connectionString = DatabaseSafety.WithBoundedWaits(connectionString);
 builder.Services.AddDbContext<AppDbContext>(o => o.UseMySQL(connectionString));
 
 // The hospital server records changes for the online copy; the online copy (Mirror:Enabled) queues writes for local validation.
 var syncSwitch = SyncSwitch.From(builder.Configuration);
 builder.Services.AddSingleton(syncSwitch);
+builder.Services.AddSingleton<InstallationIdentity>();
 builder.Services.Configure<SyncOptions>(builder.Configuration.GetSection("Sync"));
 builder.Services.Configure<MirrorOptions>(builder.Configuration.GetSection("Mirror"));
 
@@ -122,9 +125,12 @@ builder.Services.AddScoped<CommandStore>();
 builder.Services.AddScoped<CurrentUser>();
 builder.Services.AddScoped<AuditService>();
 builder.Services.AddSingleton<IBackupTrigger, EventLogBackupTrigger>();
+builder.Services.AddSingleton<DatabaseDownload>();
+builder.Services.AddSingleton<IUpdateTrigger, EventLogUpdateTrigger>();
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddScoped<NumberService>();
+builder.Services.AddScoped<QueueNumberService>();
 builder.Services.AddScoped<Outbox>();
 builder.Services.AddScoped<Idempotency>();
 builder.Services.AddScoped<VisitService>();
@@ -222,6 +228,15 @@ if (args.Contains("--online-access") || args.Contains("--online-revoke"))
     return;
 }
 
+// Repairs only missing SuperAdmin permission claims on the online mirror using the current role matrix.
+if (args.Contains("--online-superadmin-permissions"))
+{
+    using var scope = app.Services.CreateScope();
+    var added = await Seeder.AddMissingOnlineSuperAdminPermissionsAsync(scope.ServiceProvider);
+    Console.WriteLine($"Added {added} missing SuperAdmin permission claims. No accounts or other roles were changed.");
+    return;
+}
+
 using (var scope = app.Services.CreateScope())
 {
     var startupDb = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -260,6 +275,19 @@ app.Use(next =>
 });
 app.UseExceptionHandler();
 
+app.Use(async (http, next) =>
+{
+    var keyPath = app.Configuration["DataProtection:KeysPath"];
+    if (keyPath is not null && File.Exists(Path.Combine(keyPath, "update-maintenance")) && http.Request.Path != "/health")
+    {
+        http.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+        http.Response.Headers.RetryAfter = "60";
+        await http.Response.WriteAsJsonAsync(new { code = "update_maintenance", message = "سیستم در حال به‌روزرسانی است؛ لطفاً چند دقیقه بعد تلاش کنید." });
+        return;
+    }
+    await next();
+});
+
 app.Use((http, next) =>
 {
     http.Response.Headers.XContentTypeOptions = "nosniff";
@@ -293,6 +321,11 @@ if (hostsFrontend)
 {
     app.UseFrontendFiles();
 }
+
+// Online database downloads are handled locally, before the online command queue.
+// The handler enforces the manager role, settings permission and CSRF itself.
+app.MapWhen(http => http.Request.Path.StartsWithSegments("/api/settings/database-backup"), branch =>
+    branch.Run(http => http.RequestServices.GetRequiredService<DatabaseDownload>().Handle(http)));
 
 app.UseRouting();
 app.UseRateLimiter();
@@ -334,6 +367,7 @@ app.MapDirectories();
 app.MapPatients();
 app.MapVisits();
 app.MapCalls();
+app.MapChat();
 app.MapReceptionFees();
 app.MapClinical();
 app.MapRefractions();
@@ -341,6 +375,8 @@ app.MapPrescriptions();
 app.MapDiagnostics();
 app.MapSurgeries();
 app.MapSurgeryPackages();
+app.MapOperations();
+app.MapStaffPayroll();
 app.MapFinance();
 app.MapInventory();
 app.MapPharmacy();
@@ -349,6 +385,7 @@ app.MapReports();
 app.MapPrint();
 app.MapAudit();
 app.MapSyncStatus(syncSwitch.IsOnline);
+if (!syncSwitch.IsOnline) app.MapSoftwareUpdate();
 if (syncSwitch.IsOnline)
 {
     app.MapMirror();

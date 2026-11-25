@@ -68,6 +68,42 @@ public sealed class AuthTests(ApiFixture api)
     }
 
     [Fact]
+    public async Task Online_super_admin_permission_repair_adds_missing_permissions_once()
+    {
+        using var scope = api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var roles = scope.ServiceProvider.GetRequiredService<RoleManager<AppRole>>();
+        var role = await roles.FindByNameAsync(Roles.SuperAdmin);
+        Assert.NotNull(role);
+
+        var legacy = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "audit.view", "calls.manage", "patients.view", "services.edit", "settings.edit", "settings.manage",
+            "settings.view", "users.create", "users.edit", "users.manage", "users.view", "visits.view",
+        };
+        var expected = RolePermissions.For(Roles.SuperAdmin).ToHashSet(StringComparer.Ordinal);
+        Assert.Subset(expected, legacy);
+
+        await using var transaction = await db.Database.BeginTransactionAsync();
+        var current = await db.RoleClaims
+            .Where(c => c.RoleId == role!.Id && c.ClaimType == RolePermissions.ClaimType)
+            .ToListAsync();
+        db.RoleClaims.RemoveRange(current.Where(c => c.ClaimValue is null || !legacy.Contains(c.ClaimValue)));
+        await db.SaveChangesAsync();
+
+        var added = await Seeder.AddMissingSuperAdminPermissionsAsync(db, roles);
+        var after = await db.RoleClaims.AsNoTracking()
+            .Where(c => c.RoleId == role.Id && c.ClaimType == RolePermissions.ClaimType)
+            .Select(c => c.ClaimValue)
+            .ToListAsync();
+        var repeated = await Seeder.AddMissingSuperAdminPermissionsAsync(db, roles);
+
+        Assert.Equal(expected.Count - legacy.Count, added);
+        Assert.Equal(0, repeated);
+        Assert.Equal(expected, after.ToHashSet(StringComparer.Ordinal));
+    }
+
+    [Fact]
     public async Task Deactivated_user_loses_access_immediately_and_cannot_log_in_again()
     {
         var adminName = Name("admin");

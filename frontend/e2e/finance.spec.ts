@@ -95,14 +95,11 @@ test('stock is bought, sold at the pharmacy, paid at the cashier and reconciled 
   await pharmacy.getByRole('button', { name: 'ایجاد بل و ارسال به صندوق' }).click()
   await expect(pharmacy.getByRole('alert')).toContainText('موجودی این جنس کافی نیست')
   // The typed sale is still open, so leaving asks first.
-  const asked: string[] = []
-  pharmacy.once('dialog', (dialog) => {
-    asked.push(dialog.message())
-    dialog.accept()
-  })
   await pharmacy.getByRole('link', { name: 'بازگشت به دواخانه' }).click()
+  const leave = pharmacy.getByRole('dialog')
+  await expect(leave).toContainText('ذخیره نشده')
+  await leave.getByRole('button', { name: 'خروج بدون ذخیره' }).click()
   await expect(pharmacy).toHaveURL(/\/pharmacy$/)
-  expect(asked[0]).toContain('ذخیره نشده')
 
   // Cashier has to open a session first, then takes a partial payment.
   // A register of this run's own: a register has one open session at a time, so a shared one could be held by another run.
@@ -118,8 +115,8 @@ test('stock is bought, sold at the pharmacy, paid at the cashier and reconciled 
 
   await cashier.getByLabel('جستجوی فاکتور').fill(invoiceNumber)
   // The invoices to collect; the register's own receipts below list the same invoice number once paid.
-  const toCollect = cashier.locator('section', { has: cashier.getByRole('heading', { name: 'فاکتورهای قابل دریافت' }) })
-  const row = toCollect.getByRole('row', { name: new RegExp(invoiceNumber) })
+  const toCollect = cashier.getByRole('list', { name: 'فاکتورهای قابل دریافت' })
+  const row = toCollect.getByRole('listitem').filter({ hasText: invoiceNumber })
   await expect(row).toContainText('500')
   await row.getByRole('button', { name: 'دریافت' }).click()
   const pay = cashier.getByRole('dialog')
@@ -130,8 +127,9 @@ test('stock is bought, sold at the pharmacy, paid at the cashier and reconciled 
   await expect(row).toContainText('پرداخت ناقص')
   await expect(row).toContainText('300')
   // The payment is now listed under this register, ready to be printed again.
-  const receipts = cashier.locator('section', { has: cashier.getByRole('heading', { name: 'دریافت‌های این صندوق' }) })
-  await expect(receipts.getByRole('row', { name: new RegExp(invoiceNumber) })).toContainText('200')
+  await cashier.getByRole('tab', { name: 'دریافت‌های این صندوق' }).click()
+  const receipts = cashier.getByRole('list', { name: 'دریافت‌های این صندوق' })
+  await expect(receipts.getByRole('listitem').filter({ hasText: invoiceNumber })).toContainText('200')
 
   // Accountant sees the ledger reconciled and can see the same invoice.
   const accounting = await staffPage(browser, `acc_${stamp}`, errors)

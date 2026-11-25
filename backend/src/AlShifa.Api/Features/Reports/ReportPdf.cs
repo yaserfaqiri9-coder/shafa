@@ -41,13 +41,12 @@ public static class ReportPdf
     public static IDocument Create(ReportDocument document, string? hospital)
     {
         _ = Ready.Value;
-        var table = document.Tables.FirstOrDefault();
-        var columns = table?.Columns ?? [];
+        var widest = document.Tables.Count == 0 ? 0 : document.Tables.Max(t => t.Columns.Count);
         var printedAt = ReportText.Time(DateTime.UtcNow);
 
         return Document.Create(container => container.Page(page =>
         {
-            page.Size(columns.Count > 6 ? PageSizes.A4.Landscape() : PageSizes.A4);
+            page.Size(widest > 6 ? PageSizes.A4.Landscape() : PageSizes.A4);
             page.Margin(1.2f, Unit.Centimetre);
             page.ContentFromRightToLeft();
             page.PageColor(Colors.White);
@@ -79,92 +78,106 @@ public static class ReportPdf
             {
                 body.Spacing(12);
 
-                if (document.Tiles.Count > 0)
+                // Four figures to a row; a figure the system cannot know reads as a word, never as a number.
+                foreach (var group in document.Tiles.Chunk(4))
                 {
                     body.Item().Row(row =>
                     {
                         row.Spacing(8);
-                        foreach (var tile in document.Tiles)
+                        foreach (var tile in group)
                         {
                             row.RelativeItem().Border(0.8f).BorderColor(Line).Background(TotalFill).PaddingVertical(7).PaddingHorizontal(10).Column(box =>
                             {
                                 box.Item().Text(tile.Label).FontSize(8.5f).FontColor(Soft);
                                 box.Item().Text(text =>
                                 {
-                                    text.Span(ReportText.Number(tile.Value)).Bold().FontSize(14).FontColor(Ink);
-                                    if (tile.Kind == ReportKind.Money)
+                                    text.Span(tile.Value is { } value ? ReportText.Number(value) : ReportText.Unknown).Bold().FontSize(14).FontColor(Ink);
+                                    if (tile.Kind == ReportKind.Money && tile.Value is not null)
                                     {
                                         text.Span("  افغانی").FontSize(8).FontColor(Soft);
                                     }
                                 });
+                                if (!string.IsNullOrWhiteSpace(tile.Note))
+                                {
+                                    box.Item().Text(tile.Note).FontSize(7.5f).FontColor(Soft);
+                                }
                             });
                         }
+
+                        for (var empty = group.Length; empty < 4; empty++)
+                        {
+                            row.RelativeItem();
+                        }
                     });
                 }
 
-                if (table is null)
+                foreach (var warning in document.Warnings ?? [])
                 {
-                    return;
+                    body.Item().Border(0.8f).BorderColor("#E8C97A").Background("#FFF8E6").Padding(7).Text($"توجه: {warning}").FontSize(9).FontColor(Ink);
                 }
 
-                body.Item().Text(table.Title).Bold().FontSize(11.5f).FontColor(Ink);
+                foreach (var table in document.Tables)
+                {
+                    var columns = table.Columns;
+                    body.Item().Text(table.Title).Bold().FontSize(11.5f).FontColor(Ink);
 
-                if (table.Rows.Count == 0)
-                {
-                    body.Item().Border(0.8f).BorderColor(Line).Padding(14).AlignCenter().Text("برای این دوره چیزی ثبت نشده است.").FontColor(Soft);
-                }
-                else
-                {
-                    body.Item().Table(grid =>
+                    if (table.Rows.Count == 0)
                     {
-                        grid.ColumnsDefinition(define =>
+                        body.Item().Border(0.8f).BorderColor(Line).Padding(14).AlignCenter().Text("برای این دوره چیزی ثبت نشده است.").FontColor(Soft);
+                    }
+                    else
+                    {
+                        body.Item().Table(grid =>
                         {
-                            define.ConstantColumn(34);
-                            foreach (var weight in Weights(table))
+                            grid.ColumnsDefinition(define =>
                             {
-                                define.RelativeColumn(weight);
+                                define.ConstantColumn(34);
+                                foreach (var weight in Weights(table))
+                                {
+                                    define.RelativeColumn(weight);
+                                }
+                            });
+
+                            grid.Header(header =>
+                            {
+                                header.Cell().Element(HeaderCell).AlignCenter().Text("ردیف");
+                                foreach (var column in columns)
+                                {
+                                    header.Cell().Element(HeaderCell).AlignCenter().Text(column.Kind == ReportKind.Money ? $"{column.Label} (افغانی)" : column.Label);
+                                }
+                            });
+
+                            var number = 0;
+                            foreach (var cells in table.Rows)
+                            {
+                                number++;
+                                grid.Cell().Element(BodyCell).AlignCenter().Text(ReportText.Number(number)).FontColor(Soft).FontSize(8.5f);
+                                for (var c = 0; c < columns.Count; c++)
+                                {
+                                    Value(grid.Cell().Element(BodyCell), cells[c], columns[c].Kind, false);
+                                }
+                            }
+
+                            if (table.Total is { } total)
+                            {
+                                grid.Cell().Element(TotalCell).Text("");
+                                for (var c = 0; c < columns.Count; c++)
+                                {
+                                    Value(grid.Cell().Element(TotalCell), total[c], columns[c].Kind, true);
+                                }
                             }
                         });
+                    }
 
-                        grid.Header(header =>
-                        {
-                            header.Cell().Element(HeaderCell).AlignCenter().Text("ردیف");
-                            foreach (var column in columns)
-                            {
-                                header.Cell().Element(HeaderCell).AlignCenter().Text(column.Kind == ReportKind.Money ? $"{column.Label} (افغانی)" : column.Label);
-                            }
-                        });
-
-                        var number = 0;
-                        foreach (var cells in table.Rows)
-                        {
-                            number++;
-                            grid.Cell().Element(BodyCell).AlignCenter().Text(ReportText.Number(number)).FontColor(Soft).FontSize(8.5f);
-                            for (var c = 0; c < columns.Count; c++)
-                            {
-                                Value(grid.Cell().Element(BodyCell), cells[c], columns[c].Kind, false);
-                            }
-                        }
-
-                        if (table.Total is { } total)
-                        {
-                            grid.Cell().Element(TotalCell).Text("");
-                            for (var c = 0; c < columns.Count; c++)
-                            {
-                                Value(grid.Cell().Element(TotalCell), total[c], columns[c].Kind, true);
-                            }
-                        }
-                    });
+                    if (!string.IsNullOrWhiteSpace(table.Note))
+                    {
+                        body.Item().Text(table.Note).Italic().FontSize(8.5f).FontColor(Soft);
+                    }
                 }
 
                 if (!string.IsNullOrWhiteSpace(document.Description))
                 {
                     body.Item().Text(document.Description).FontSize(8.5f).FontColor(Soft);
-                }
-
-                if (!string.IsNullOrWhiteSpace(table.Note))
-                {
-                    body.Item().Text(table.Note).Italic().FontSize(8.5f).FontColor(Soft);
                 }
             });
 

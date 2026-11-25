@@ -2,7 +2,11 @@
 import { onMounted, reactive, ref } from 'vue'
 import { clearLookups } from '@/api/lookups'
 import { api, errorMessage } from '@/api/http'
+import ShamsiDateInput from '@/components/ShamsiDateInput.vue'
+import { todayIso } from '@/utils/date'
+import StaffPayoutsPanel from './StaffPayoutsPanel.vue'
 import UiCard from '@/components/UiCard.vue'
+import UiInactiveToggle, { useInactiveFilter } from '@/components/UiInactiveToggle.vue'
 import UiModal from '@/components/UiModal.vue'
 import type { LookupItem } from '@/features/visits/types'
 import { useAuthStore } from '@/stores/auth'
@@ -22,6 +26,8 @@ interface StaffRow {
 
 const auth = useAuthStore()
 const rows = ref<StaffRow[]>([])
+const { showInactive, shown, inactiveCount } = useInactiveFilter(rows)
+const tab = ref<'staff' | 'withdrawals'>('staff')
 const departments = ref<LookupItem[]>([])
 const users = ref<{ id: number; userName: string; fullName: string }[]>([])
 const loading = ref(true)
@@ -33,6 +39,10 @@ const form = reactive({
   id: null as number | null,
   version: null as number | null,
   fullName: '',
+  monthlySalary: null as number | null,
+  employmentStartDate: null as string | null,
+  employmentEndDate: null as string | null,
+  salaryLoading: false,
   phone: '',
   isActive: true,
   departmentId: null as number | null,
@@ -53,25 +63,39 @@ async function load() {
   }
 }
 
-function open(row?: StaffRow) {
+async function open(row?: StaffRow) {
   Object.assign(form, {
     open: true,
     id: row?.id ?? null,
     version: row?.version ?? null,
     fullName: row?.fullName ?? '',
     phone: row?.phone ?? '',
+    monthlySalary: null,
+    employmentStartDate: row ? null : todayIso(),
+    employmentEndDate: null,
     isActive: row?.isActive ?? true,
     departmentId: row?.departmentId ?? null,
     userId: row?.userId ?? null,
     saving: false,
     error: '',
   })
+  if (row && auth.can('expenses.view') && auth.can('expenses.create')) {
+    form.salaryLoading = true
+    try {
+      const payroll = await api<{ terms: { monthlySalary: number }[]; employmentStartDate: string | null; employmentEndDate: string | null }>(`/staff/${row.id}/payroll`)
+      if (form.id === row.id) Object.assign(form, { monthlySalary: payroll.terms.at(-1)?.monthlySalary ?? null, employmentStartDate: payroll.employmentStartDate, employmentEndDate: payroll.employmentEndDate })
+    } catch (cause) { form.error = errorMessage(cause) }
+    finally { form.salaryLoading = false }
+  }
 }
 
 async function save() {
   form.saving = true
   form.error = ''
   const body = {
+    monthlySalary: auth.can('expenses.create') && Number.isFinite(form.monthlySalary) ? form.monthlySalary : null,
+    employmentStartDate: auth.can('expenses.create') && Number.isFinite(form.monthlySalary) ? form.employmentStartDate : null,
+    employmentEndDate: auth.can('expenses.create') && Number.isFinite(form.monthlySalary) ? form.employmentEndDate : null,
     fullName: form.fullName,
     phone: form.phone,
     isDoctor: false,
@@ -126,8 +150,15 @@ onMounted(async () => {
 <template>
   <UiCard title="کارمندان">
     <template #actions>
+      <nav class="xr-tabs" aria-label="کارمندان و برداشت‌ها">
+        <button type="button" class="xr-tab" :class="{ 'xr-tab--active': tab === 'staff' }" @click="tab = 'staff'">کارمندان</button>
+        <button v-if="auth.can('expenses.view')" type="button" class="xr-tab" :class="{ 'xr-tab--active': tab === 'withdrawals' }" @click="tab = 'withdrawals'">برداشت‌های کارمندان</button>
+      </nav>
+      <UiInactiveToggle v-if="tab === 'staff'" v-model="showInactive" :count="inactiveCount" />
       <button v-if="auth.can('users.create')" type="button" class="btn btn-primary" @click="open()">کارمند جدید</button>
     </template>
+    <StaffPayoutsPanel v-if="tab === 'withdrawals'" />
+    <template v-else>
     <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
     <div v-if="notice" class="alert alert-success" role="status">{{ notice }}</div>
     <div v-if="loading" class="xr-state" role="status">در حال بارگذاری...</div>
@@ -138,8 +169,8 @@ onMounted(async () => {
           <tr><th>نام</th><th>بخش</th><th>تماس</th><th>حساب کاربری</th><th>وضعیت</th><th v-if="auth.can('users.manage')">عملیات</th></tr>
         </thead>
         <tbody>
-          <tr v-for="row in rows" :key="row.id">
-            <td>{{ row.fullName }}</td>
+          <tr v-for="row in shown" :key="row.id">
+            <td><RouterLink v-if="auth.can('expenses.view')" :to="`/staff/${row.id}`">{{ row.fullName }}</RouterLink><span v-else>{{ row.fullName }}</span></td>
             <td>{{ row.departmentName ?? '—' }}</td>
             <td><span class="ltr-num">{{ row.phone ?? '—' }}</span></td>
             <td><span class="ltr-num">{{ row.userName ?? '—' }}</span></td>
@@ -152,6 +183,7 @@ onMounted(async () => {
         </tbody>
       </table>
     </div>
+    </template>
   </UiCard>
 
   <UiModal v-if="form.open" :title="form.id ? 'ویرایش کارمند' : 'کارمند جدید'" @close="form.open = false">
@@ -164,6 +196,14 @@ onMounted(async () => {
         <label class="form-label" for="s-phone">تماس</label>
         <input id="s-phone" v-model="form.phone" class="form-control" dir="ltr" maxlength="30" />
       </div>
+      <fieldset v-if="auth.can('expenses.create')" class="mb-3" :disabled="form.salaryLoading">
+        <legend class="h6">معاش و مدت کار</legend>
+        <label for="s-salary" class="form-label">معاش ماهوار (افغانی)</label>
+        <input id="s-salary" v-model.number="form.monthlySalary" class="form-control mb-3" type="number" min="0" max="100000000" step="0.01" />
+        <ShamsiDateInput v-model="form.employmentStartDate" label="تاریخ شروع کار" :required="form.monthlySalary !== null" />
+        <div class="mt-3"><ShamsiDateInput v-model="form.employmentEndDate" label="تاریخ ختم کار (اختیاری)" :min="form.employmentStartDate ?? undefined" /></div>
+        <p class="form-hint mb-0">معاش در پایان ماه شمسی محاسبه می‌شود؛ ماه ناقص به نسبت روزهای کار است. تغییر نرخ معاش از اول ماه آینده اجرا می‌شود.</p>
+      </fieldset>
       <div class="mb-3">
         <label class="form-label" for="s-dept">بخش</label>
         <select id="s-dept" v-model.number="form.departmentId" class="form-select">
@@ -183,7 +223,7 @@ onMounted(async () => {
       </div>
       <div v-if="form.error" class="alert alert-danger" role="alert">{{ form.error }}</div>
       <div class="xr-form-actions">
-        <button type="submit" class="btn btn-primary" :disabled="form.saving">ذخیره</button>
+        <button type="submit" class="btn btn-primary" :disabled="form.saving || form.salaryLoading">ذخیره</button>
         <button type="button" class="btn btn-soft-danger" data-modal-cancel>انصراف</button>
       </div>
     </form>

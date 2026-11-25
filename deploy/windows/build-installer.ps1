@@ -10,7 +10,8 @@ param(
     [switch]$IncludeVisualCppRuntime,
     # A folder of voice clips the hospital may use. They install with the system, so calling works with no Import-AlShifa-Voice step.
     # Off by default: whether a voice's licence allows this is the hospital's decision. See DEPLOYMENT-WINDOWS.md.
-    [string]$VoicePack
+    [string]$VoicePack,
+    [switch]$UpgradeOnly
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -112,6 +113,7 @@ try {
         $manifest = if ($AsUser) { @() } else { @("/win32manifest:$(Join-Path $PSScriptRoot 'installer\app.manifest')") }
         $arguments = @('/nologo', '/target:winexe', '/optimize+', '/codepage:65001') + $manifest + @("/win32icon:$(Join-Path $repo 'frontend\public\favicon.ico')", "/out:$Output") +
             @($references | ForEach-Object { "/r:$_" }) + @($Source | ForEach-Object { Join-Path $PSScriptRoot "installer\$_" })
+        if($UpgradeOnly -and $Source -contains 'InstallAlShifa.cs'){$arguments += '/define:UPGRADE_ONLY'}
         Invoke-Native $csc $arguments | Out-Null
     }
     New-InstallerProgram 'ConnectAlShifa.cs', 'Discovery.cs' (Join-Path $tools 'Connect-AlShifa.exe')
@@ -152,6 +154,11 @@ try {
         $output.Dispose()
     }
 
+    # Beside the installer, for a server whose database files are damaged: the update refuses to run until they are rebuilt.
+    $repair = Join-Path $target 'database-repair'
+    New-Item -ItemType Directory $repair | Out-Null
+    foreach ($script in 'rebuild-database.ps1', 'common.ps1', 'db-integrity.ps1', 'upgrade-safety.ps1', 'health-check.ps1', 'test-lan-access.ps1') { Copy-Item (Join-Path $PSScriptRoot $script) $repair }
+    Copy-Item (Join-Path $PSScriptRoot 'Rebuild-Database.bat') $target
     foreach ($guide in 'INSTALL-SIMPLE.md', 'PILOT-CHECKLIST.md', 'DEPLOYMENT-WINDOWS.md') { Copy-Item (Join-Path $repo $guide) $target }
     Copy-Item (Join-Path $repo 'docs/windows-lan-installation.md') $target
     $header = "Third-party programs inside Install-AlShifa.exe. Each was checked against its publisher's hash and signature when this package was built.`r`nThe GPL programs are passed on unchanged. Source code for exactly these versions is at the addresses below.`r`n`r`n"

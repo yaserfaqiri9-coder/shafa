@@ -21,7 +21,7 @@ namespace AlShifa.Tests;
 
 /// <summary>Scenarios for the four-user hospital pilot that no other test class covers end to end.</summary>
 [Collection("api")]
-public sealed class PilotReadinessTests(ApiFixture api)
+public sealed class PilotReadinessTests(ApiFixture api) : PhysicalQueueTestScope(api)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } };
 
@@ -192,7 +192,7 @@ public sealed class PilotReadinessTests(ApiFixture api)
                 new CreatePrescriptionRequest(visit.Id, null, [new RxItemInput($"دوا-{number}", null, null, null, null, 1)]))));
             Assert.Contains(rx.RxNumber, await pharmacist.GetStringAsync("/api/prescriptions?status=Issued"));
 
-            var unpaid = await cashier.GetFromJsonAsync<PagedResult<InvoiceRow>>($"/api/invoices?unpaid=true&q={patient.FileNumber}", JsonOptions);
+            var unpaid = await cashier.GetFromJsonAsync<PagedResult<InvoiceRow>>($"/api/invoices?unpaid=true&patientId={patient.Id}", JsonOptions);
             var invoice = Assert.Single(unpaid!.Items);
             var payment = await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, invoice.Balance, PaymentMethod.Cash, null))));
 
@@ -219,6 +219,8 @@ public sealed class PilotReadinessTests(ApiFixture api)
             Assert.True(BackupStatus.Read(file, now).NeedsAttention);
 
             await File.WriteAllTextAsync(file, """{ "lastSuccessAt": "2026-11-02T08:00:00Z", "lastError": null }""");
+            Assert.True(BackupStatus.Read(file, now).NeedsAttention);
+            await File.WriteAllTextAsync(file, """{ "lastSuccessAt": "2026-11-02T08:00:00Z", "restoreVerifiedAt": "2026-11-02T08:00:00Z", "lastError": null }""");
             Assert.False(BackupStatus.Read(file, now).NeedsAttention);
             Assert.True(BackupStatus.Read(file, now.AddHours(25)).NeedsAttention);
 

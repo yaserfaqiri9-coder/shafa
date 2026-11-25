@@ -136,6 +136,23 @@ public sealed class GlobalExceptionHandler(ILogger<GlobalExceptionHandler> logge
     private const int MySqlDuplicateEntry = 1062;
     private const int MySqlLockTimeout = 1205;
     private const int MySqlDeadlock = 1213;
+    private const int MySqlTooManyConnections = 1040;
+    private const int MySqlUnableToConnect = 1042;
+    private const int MySqlServerGone = 2006;
+    private const int MySqlLostConnection = 2013;
+
+    /// <summary>The database is down, restarting or not answering in time. The request fails quickly instead of hanging.</summary>
+    public static bool IsDatabaseUnavailable(Exception exception)
+    {
+        for (var e = exception; e is not null; e = e.InnerException)
+        {
+            if (e is TimeoutException) return true;
+            if (e is MySqlException { Number: MySqlTooManyConnections or MySqlUnableToConnect or MySqlServerGone or MySqlLostConnection }) return true;
+            if (e is MySqlException { InnerException: TimeoutException or System.Net.Sockets.SocketException or IOException }) return true;
+        }
+
+        return false;
+    }
 
     public async ValueTask<bool> TryHandleAsync(HttpContext http, Exception exception, CancellationToken ct)
     {
@@ -153,6 +170,9 @@ public sealed class GlobalExceptionHandler(ILogger<GlobalExceptionHandler> logge
                 (StatusCodes.Status409Conflict, "possible_duplicate", "مریض مشابهی قبلاً ثبت شده است. لطفاً بررسی کنید."),
             OperationCanceledException when http.RequestAborted.IsCancellationRequested =>
                 (499, "cancelled", "درخواست لغو شد."),
+            _ when IsDatabaseUnavailable(exception) =>
+                (StatusCodes.Status503ServiceUnavailable, "database_unavailable",
+                    "دیتابیس موقتاً پاسخ نمی‌دهد و این عملیات ثبت نشد. چند لحظه بعد صفحه را تازه کنید و دوباره بررسی کنید."),
             _ => (StatusCodes.Status500InternalServerError, "server_error", "خطای داخلی رخ داد. دوباره تلاش کنید."),
         };
 

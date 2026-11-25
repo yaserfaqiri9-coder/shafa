@@ -261,6 +261,9 @@ public enum ExpenseStatus
 
 public class Expense
 {
+    public long? StaffId { get; set; }
+    public Users.Staff? Staff { get; set; }
+    [MaxLength(20)] public string? StaffPaymentKind { get; set; }
     public long Id { get; set; }
 
     [MaxLength(20)]

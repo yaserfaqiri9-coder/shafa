@@ -237,7 +237,7 @@ test('an expense, a sale and an invoice are corrected in place, and the books st
   const sale = await call<{ saleNumber: string }>(pharmacist, 'POST', '/pharmacy/sales', { items: [{ productId: product.id, quantity: 4 }] })
   await pharmacist.goto('/pharmacy')
   await pharmacist.getByRole('tab', { name: 'سوابق فروش' }).click()
-  await pharmacist.getByRole('row', { name: new RegExp(sale.saleNumber) }).getByRole('link', { name: 'اصلاح' }).click()
+  await pharmacist.getByRole('listitem').filter({ hasText: sale.saleNumber }).getByRole('link', { name: 'اصلاح' }).click()
   await expect(pharmacist.getByRole('heading', { name: new RegExp(`اصلاح فروش ${sale.saleNumber}`) })).toBeVisible()
   await expect(pharmacist.getByText(drug)).toBeVisible()
   await pharmacist.getByLabel('مقدار ردیف 1').fill('2')
@@ -310,18 +310,18 @@ test('clinical records change freely until final, and with a visible reason afte
   await expect(doctor.getByRole('status').filter({ hasText: 'ذخیره شد و نسخه دوا برای دواخانه ارسال شد' })).toBeVisible()
   await expect(doctor.getByLabel('تعداد 1')).toHaveValue('5')
 
-  // Final: the same edit now asks why, and the history shows old, new and reason.
+  // Final: the same edit is saved straight away, and the history keeps old, new and a standard note.
   const chart = await call<{ consultation: { version: number } | null }>(doctor, 'GET', `/consultations/${visit.id}/chart`)
   const version = chart.consultation?.version ?? (await call<{ version: number }>(doctor, 'PUT', `/consultations/${visit.id}`, { findingsOd: 'یافته' })).version
   await call(doctor, 'POST', `/consultations/${visit.id}/finalize`, { version, closeVisit: false })
   await doctor.reload()
   await doctor.getByLabel('تعداد 1').fill('6')
-  await doctor.getByLabel('دلیل اصلاح نسخه').fill('مقدار دوباره بررسی شد')
+  await expect(doctor.getByLabel('دلیل اصلاح نسخه')).toHaveCount(0)
   await doctor.getByRole('button', { name: 'ذخیره', exact: true }).click()
   await expect(doctor.getByRole('status').filter({ hasText: 'ذخیره شد و نسخه دوا برای دواخانه ارسال شد' })).toBeVisible()
 
   const after = await call<{ amendments: { field: string; reason: string; newValue: string | null }[] }>(doctor, 'GET', `/consultations/${visit.id}/chart`)
-  expect(after.amendments.map((a) => a.reason)).toEqual(expect.arrayContaining(['مقدار دوباره بررسی شد', 'اشتباه خوانده شد']))
+  expect(after.amendments.map((a) => a.reason)).toEqual(expect.arrayContaining(['اصلاح مستقیم داکتر پس از نهایی شدن', 'اشتباه خوانده شد']))
   expect(after.amendments.find((a) => a.field === 'VisualAcuityOd')?.newValue).toBe('6/12')
 
   expect(errors).toEqual([])

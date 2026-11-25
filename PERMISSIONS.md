@@ -31,7 +31,7 @@
 | `visitfees` | پذیرش مراجعه و ساختن فاکتور فیس ویزیت، بدون دریافت پول. همه فیس‌ها را صندوق‌دار با `payments.create` می‌گیرد |
 | `ledger` | دفتر مالی |
 | `expenses` | مصارف |
-| `reports` | گزارش‌های کاری، فقط شمارش و بدون نام مریض (`reports.view`). گزارش‌های مالی `ledger.view`، موجودی گدام `inventory.view` و فروش `pharmacy.view` یا `optical.view` می‌خواهند. چاپ `reports.print` و خروجی اکسل `reports.export` |
+| `reports` | سه گزارش: «گزارش عمومی شفاخانه» با `reports.view` (شمارش بدون نام مریض؛ ارقام پولی آن فقط با `ledger.view`)، «گزارش مالی و حسابداری» با `ledger.view`، «گزارش دواخانه و گدام» با `inventory.view` (فروش دواخانه با `pharmacy.view` و فروش عینک با `optical.view`). چاپ `reports.print` و خروجی اکسل `reports.export` |
 | `users` | کاربران، نقش‌ها |
 | `settings` | تنظیمات |
 | `services` | ثبت قیمت خدمات (`services.edit`). هر تغییر با قیمت قبلی و جدید در Audit ثبت می‌شود |

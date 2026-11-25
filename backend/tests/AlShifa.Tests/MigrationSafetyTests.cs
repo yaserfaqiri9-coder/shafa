@@ -11,6 +11,40 @@ namespace AlShifa.Tests;
 /// <summary>Rehearses the upgrade to Refractions and VisitTokens on a throwaway database holding records from before them.</summary>
 public sealed class MigrationSafetyTests
 {
+    [Fact]
+    public async Task Physical_card_migration_preserves_legacy_duplicate_rounds_and_sync_progress()
+    {
+        var connection = ConnectionString();
+        Assert.True(DatabaseSafety.IsDisposable(connection));
+        await using var db = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>().UseMySQL(connection).Options);
+        await db.Database.EnsureDeletedAsync();
+        try {
+            await db.GetService<IMigrator>().MigrateAsync("20261122151006_OperationsAndStaffPayroll");
+            var patient = new AlShifa.Api.Features.Patients.Patient { FileNumber = "legacy-card", FirstName = "Synthetic", CreatedByUserId = 1 };
+            var department = new AlShifa.Api.Features.Users.Department { Code = "card-test", Name = "Synthetic", IsActive = true };
+            db.AddRange(patient, department);
+            await db.SaveChangesAsync();
+            db.Visits.AddRange(
+                new Visit { VisitNumber = "legacy-card-a", PatientId = patient.Id, DepartmentId = department.Id, VisitDate = KabulClock.Today, QueueNumber = 3, QueueShift = QueueShift.Morning, QueueRound = 1, Status = VisitStatus.Completed, CreatedByUserId = 1 },
+                new Visit { VisitNumber = "legacy-card-b", PatientId = patient.Id, DepartmentId = department.Id, VisitDate = KabulClock.Today, QueueNumber = 3, QueueShift = QueueShift.Afternoon, QueueRound = 2, Status = VisitStatus.Completed, CreatedByUserId = 1 });
+            db.SyncStates.AddRange(
+                new AlShifa.Api.Features.Sync.SyncState { Key = "push.seq", Value = "12", UpdatedAt = DateTime.UtcNow },
+                new AlShifa.Api.Features.Sync.SyncState { Key = "push.ackedSeq", Value = "10", UpdatedAt = DateTime.UtcNow },
+                new AlShifa.Api.Features.Sync.SyncState { Key = "push.enabled", Value = "true", UpdatedAt = DateTime.UtcNow });
+            db.SyncChanges.Add(new() { TableName = "Patients", KeyJson = $"[{patient.Id}]", CreatedAt = DateTime.UtcNow });
+            await db.SaveChangesAsync();
+            var before = JsonSerializer.Serialize(await db.Visits.AsNoTracking().OrderBy(v => v.Id).ToListAsync());
+            var progress = JsonSerializer.Serialize(await db.SyncStates.AsNoTracking().OrderBy(v => v.Key).ToListAsync());
+            await db.Database.MigrateAsync();
+            db.ChangeTracker.Clear();
+            Assert.Equal(before, JsonSerializer.Serialize(await db.Visits.AsNoTracking().OrderBy(v => v.Id).ToListAsync()));
+            Assert.Equal(progress, JsonSerializer.Serialize(await db.SyncStates.AsNoTracking().OrderBy(v => v.Key).ToListAsync()));
+            Assert.Single(await db.QueueCards.Where(c => c.Day == KabulClock.Today && c.Number == 3).ToListAsync());
+            Assert.Equal(1, await db.SyncChanges.CountAsync());
+            Assert.Empty(await db.Database.GetPendingMigrationsAsync());
+        } finally { await db.Database.EnsureDeletedAsync(); }
+    }
+
     private const string BeforeNewFeatures = "20261101213721_SettingsAttachments";
 
     /// <summary>A database of its own, so the shared test database is not disturbed. Creating one needs the local root account.</summary>
@@ -39,6 +73,30 @@ public sealed class MigrationSafetyTests
 
     private static Task<int> CountAsync(AppDbContext db, string table) =>
         db.Database.SqlQueryRaw<int>($"SELECT COUNT(*) AS Value FROM {table}").SingleAsync();
+
+    [Fact]
+    public async Task Current_online_schema_upgrades_without_losing_the_patient_or_replication_history()
+    {
+        var connection = ConnectionString();
+        Assert.True(DatabaseSafety.IsDisposable(connection));
+        await using var db = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>().UseMySQL(connection).Options);
+        await db.Database.EnsureDeletedAsync();
+        try
+        {
+            await db.GetService<IMigrator>().MigrateAsync("20261120153000_QueueShiftNumbering");
+            await db.Database.ExecuteSqlRawAsync("INSERT INTO Patients (Id, FileNumber, FirstName, Gender, CreatedAt, CreatedByUserId, Version) VALUES (1, '1', 'Synthetic legacy mirror patient', 'Male', '2026-11-20 11:00:00', 1, 7)");
+            await db.Database.ExecuteSqlRawAsync("INSERT INTO SyncStates (`Key`,`Value`,UpdatedAt) VALUES ('apply.seq','1795172809252',UTC_TIMESTAMP(6)),('apply.lastAt','2026-11-20T11:06:49.8327637Z',UTC_TIMESTAMP(6))");
+            await db.Database.MigrateAsync();
+            Assert.Empty(await db.Database.GetPendingMigrationsAsync());
+            Assert.Null(await DatabaseSafety.SchemaProblemAsync(db));
+            var patient = await db.Patients.SingleAsync();
+            Assert.Equal(("1", "Synthetic legacy mirror patient", 7), (patient.FileNumber, patient.FirstName, patient.Version));
+            Assert.Equal("1795172809252", await db.SyncStates.Where(s => s.Key == "apply.seq").Select(s => s.Value).SingleAsync());
+            Assert.Equal("2026-11-20T11:06:49.8327637Z", await db.SyncStates.Where(s => s.Key == "apply.lastAt").Select(s => s.Value).SingleAsync());
+            Assert.False(await db.SyncStates.AnyAsync(s => s.Key == "apply.sourceId"));
+        }
+        finally { await db.Database.EnsureDeletedAsync(); }
+    }
 
     [Fact]
     public async Task Records_survive_the_upgrade_and_a_hand_run_needs_the_backup_flag()
@@ -111,8 +169,12 @@ public sealed class MigrationSafetyTests
             Assert.Equal(0, await CountAsync(db, "VisitTokens"));
             Assert.Equal(0, await CountAsync(db, "Refractions"));
 
-            // Down is exercised for the record only: production goes back through the backup, because Down drops the new tables.
-            await migrator.MigrateAsync(BeforeNewFeatures);
+            // Queue-round migrations intentionally refuse a lossy Down. Preserve that protection;
+            // recovery uses the updater's verified backup rather than collapsing distinct rounds.
+            // Inspect the migration's actual operation builder before asking EF to acquire its
+            // server-wide lock. The provider leaks that lock when building a rejected Down.
+            Assert.Throws<NotSupportedException>(() =>
+                new AlShifa.Api.Infrastructure.Migrations.QueueRoundColumns().DownOperations);
             Assert.Equal(1, await CountAsync(db, "Patients"));
             Assert.Equal(2, await CountAsync(db, "Visits"));
             Assert.Equal(1, await CountAsync(db, "DiagnosticOrders"));

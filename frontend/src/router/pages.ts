@@ -34,7 +34,9 @@ export const pages = {
   directories: () => import('@/features/directories/DirectoryPage.vue'),
   doctors: () => import('@/features/users/DoctorsPage.vue'),
   staff: () => import('@/features/users/StaffPage.vue'),
+  staffProfile: () => import('@/features/users/StaffProfilePage.vue'),
   users: () => import('@/features/users/UsersPage.vue'),
+  chat: () => import('@/features/chat/ChatPage.vue'),
 }
 
 /** The pages each role opens all day. Their code is fetched while idle, so the first click is as fast as the rest. */

@@ -96,6 +96,5 @@ test('a double click on save creates one record and shows a busy button meanwhil
 
   expect(posts).toHaveLength(1)
   await page.getByLabel('جستجو', { exact: true }).fill(userName)
-  await page.getByRole('button', { name: 'جستجو' }).click()
   await expect(page.getByRole('row', { name: new RegExp(userName) })).toHaveCount(1)
 })

@@ -83,7 +83,8 @@ public sealed record CreateOpticalRxRequest(
 public sealed record OpticalRxDto(
     long Id, string RxNumber, long PatientId, string PatientFileNumber, string PatientName, long VisitId,
     string? SphereOd, string? CylinderOd, string? AxisOd, string? AddOd, string? SphereOs, string? CylinderOs, string? AxisOs, string? AddOs,
-    string? Pd, string? Notes, bool IsCancelled, DateTime CreatedAt, int Version, bool FromRefraction = false);
+    string? Pd, string? Notes, bool IsCancelled, DateTime CreatedAt, int Version, bool FromRefraction = false, int? QueueNumber = null,
+    string? OrderStatus = null);
 
 public sealed record CreateFollowUpRequest(long VisitId, DateOnly DueDate, [MaxLength(300)] string? Note);
 
@@ -97,6 +98,9 @@ public static class Amendments
     private const int Limit = 4000;
 
     public const string BeforeFinal = "ویرایش پیش از نهایی شدن";
+
+    /// <summary>A doctor's own correction of a final record, saved straight from the file with no form or stated reason.</summary>
+    public const string AfterFinal = "اصلاح مستقیم داکتر پس از نهایی شدن";
 
     public static void Add(AppDbContext db, string entity, long entityId, string field, string? oldValue, string? newValue, string reason, long userId) =>
         db.ClinicalAmendments.Add(new ClinicalAmendment
@@ -286,6 +290,7 @@ public static class ClinicalEndpoints
             var visit = await VisitService.LockAsync(db, visitId, ct);
             EnsureNotCancelled(visit);
             var consult = await db.Consultations.SingleOrDefaultAsync(c => c.VisitId == visitId, ct);
+            string? historyReason = null;
             if (consult is null)
             {
                 await access.EnsureResponsibleAsync(visitId, ct);
@@ -311,10 +316,9 @@ public static class ClinicalEndpoints
             {
                 db.Entry(consult).Property(c => c.Version).OriginalValue = request.Version ?? throw StaleScreen();
                 await access.EnsureResponsibleAsync(visitId, ct);
-                if (consult.FinalizedAt is not null)
-                {
-                    throw new AppException(StatusCodes.Status409Conflict, "already_finalized", "این معاینه نهایی شده است. برای تغییر، اصلاحیه ثبت کنید.");
-                }
+
+                // The doctor corrects a seen patient's file in place, final or not; what it said before is kept out of sight.
+                historyReason = await IsFinalAsync(db, visitId, ct) ? Amendments.AfterFinal : Amendments.BeforeFinal;
 
                 // Diagnoses live in their own table: without this, a save that changes only them would skip the version check.
                 db.Entry(consult).State = EntityState.Modified;
@@ -326,11 +330,25 @@ public static class ClinicalEndpoints
                 }
             }
 
+            if (historyReason is not null)
+            {
+                var oldDiagnoses = await db.Diagnoses.AsNoTracking().Where(d => d.ConsultationId == consult.Id).OrderBy(d => d.Id).Select(d => new { d.Eye, d.Text }).ToListAsync(ct);
+                Amendments.AddChanges(db, nameof(Consultation), consult.Id,
+                [
+                    (nameof(consult.FindingsOd), consult.FindingsOd, Text.Clean(request.FindingsOd)),
+                    (nameof(consult.FindingsOs), consult.FindingsOs, Text.Clean(request.FindingsOs)),
+                    (nameof(consult.TreatmentPlan), consult.TreatmentPlan, Text.Clean(request.TreatmentPlan)),
+                    (nameof(consult.ConfidentialNote), consult.ConfidentialNote, Text.Clean(request.ConfidentialNote)),
+                    ("Diagnoses", DescribeDiagnoses(oldDiagnoses.Select(d => (d.Eye, d.Text))),
+                        request.Diagnoses is null ? DescribeDiagnoses(oldDiagnoses.Select(d => (d.Eye, d.Text))) : DescribeDiagnoses(request.Diagnoses.Select(d => (d.Eye, d.Text.Trim())))),
+                ], historyReason, user.Id);
+            }
+
             consult.FindingsOd = Text.Clean(request.FindingsOd);
             consult.FindingsOs = Text.Clean(request.FindingsOs);
             consult.TreatmentPlan = Text.Clean(request.TreatmentPlan);
             consult.ConfidentialNote = Text.Clean(request.ConfidentialNote);
-            audit.Add("ConsultationSaved", "Visit", visitId.ToString());
+            audit.Add(historyReason == Amendments.AfterFinal ? "ConsultationAmended" : "ConsultationSaved", "Visit", visitId.ToString());
             await db.SaveChangesAsync(ct);
 
             if (request.Diagnoses is not null)
@@ -418,6 +436,53 @@ public static class ClinicalEndpoints
             return Results.NoContent();
         }).RequirePermission("consultation.edit");
 
+        // The chart page reports that it opened. The patient this doctor has called moves to "with the doctor", and a seen
+        // patient back from refraction or a test is marked as reviewed (the seen list drops its "result ready" mark).
+        // Reading another doctor's chart, or opening the same one again, changes nothing and never announces anyone.
+        consultations.MapPost("/{visitId:long}/start", async (long visitId, AppDbContext db, ClinicalAccess access, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>
+        {
+            var day = KabulClock.Today;
+            var key = Calls.DepartmentQueueService.Key(visitId, null);
+            var userId = user.Id;
+            var called = await db.QueueDeskLanes.AnyAsync(l => l.Day == day && l.Desk == Calls.CallDesk.Doctor && l.LaneId == userId && l.EntryKey == key, ct);
+            var current = await db.Visits.AsNoTracking().Where(v => v.Id == visitId).Select(v => (VisitStatus?)v.Status).SingleOrDefaultAsync(ct);
+            if (current != VisitStatus.ReadyForDoctor)
+            {
+                return Results.NoContent();
+            }
+
+            await using var tx = await db.BeginWorkflowTransactionAsync(ct);
+            var visit = await VisitService.LockAsync(db, visitId, ct);
+            if (visit.Status != VisitStatus.ReadyForDoctor || !VisitWorkflow.CanMove(visit.Status, VisitStatus.InConsultation))
+            {
+                return Results.NoContent();
+            }
+
+            var returned = await ReturnedUnreviewedAsync(db, visit, ct);
+            if (returned)
+            {
+                // Only the patient's own doctor reviews the result; a referral sent before any exam was saved belongs to its sender.
+                var responsible = await access.ResponsibleUserAsync(visitId, ct);
+                var mine = responsible == userId || (responsible is null
+                    && await db.VisitStatusHistory.AnyAsync(h => h.VisitId == visitId && h.ToStatus == VisitStatus.AwaitingDiagnostic && h.ChangedByUserId == userId, ct));
+                if (!mine)
+                {
+                    return Results.NoContent();
+                }
+            }
+            else if (!called)
+            {
+                return Results.NoContent();
+            }
+
+            MoveVisit(db, visit, VisitStatus.InConsultation, userId);
+            audit.Add(returned ? "DiagnosticResultReviewed" : "ConsultationStarted", "Visit", visitId.ToString());
+            outbox.Add("VisitStatusChanged", new { visitId }, VisitService.EventGroups);
+            await db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+            return Results.NoContent();
+        }).RequirePermission("consultation.edit");
+
         consultations.MapPost("/{visitId:long}/amend", async (long visitId, AmendRequest request, AppDbContext db, ClinicalAccess access, CurrentUser user, AuditService audit, CancellationToken ct) =>
         {
             if (!AmendableFields.Contains(request.Field))
@@ -487,7 +552,7 @@ public static class ClinicalEndpoints
         }).RequirePermission("clinicalrecord.view");
 
         // With done=true the list shows the patients this desk has already finished on that day, so they can be opened again.
-        app.MapGet("/api/clinical/worklist", async (string kind, bool? done, DateOnly? date, AppDbContext db, CurrentUser user, CancellationToken ct) =>
+        app.MapGet("/api/clinical/worklist", async (string kind, bool? done, DateOnly? date, AppDbContext db, CurrentUser user, Sync.SyncSwitch sync, CancellationToken ct) =>
         {
             var day = done == true ? date ?? KabulClock.Today : KabulClock.Today;
             var query = db.Visits.AsNoTracking().Where(v => v.VisitDate == day);
@@ -497,15 +562,37 @@ public static class ClinicalEndpoints
             }
             else if (kind == "doctor")
             {
-                query = done == true ? DoctorDone(db, query, user.Id) : DoctorQueue(db, query, user.Id);
+                // A past day also lists visits left open with this doctor: they are in no queue any more and would be lost.
+                // On the read-only online copy, an account that is not itself a doctor (management) sees every doctor's patients.
+                var everyone = sync.IsOnline && !await db.Staff.AnyAsync(s => s.IsDoctor && s.UserId == user.Id, ct);
+                query = everyone
+                    ? (done == true ? AllDoctorsSeen(db, query, day < KabulClock.Today) : AllDoctorsQueue(db, query))
+                    : done == true ? DoctorSeen(db, query, user.Id, day < KabulClock.Today) : DoctorQueue(db, query, user.Id);
             }
             else
             {
                 throw new AppException(StatusCodes.Status400BadRequest, "invalid_kind", "نوع فهرست معتبر نیست.");
             }
 
-            var rows = await VisitService.QueryRows(db, query.OrderBy(v => v.QueueNumber).Take(200)).ToListAsync(ct);
-            return Results.Ok(rows.Select(VisitService.ToRow).ToList());
+            // The doctor's seen list keeps plain card order, so a patient back from refraction stays where they were.
+            var ordered = kind == "doctor" && done == true
+                ? query.OrderBy(v => v.QueueShift == QueueShift.Afternoon).ThenBy(v => v.QueueNumber).ThenBy(v => v.Id)
+                : Calls.DepartmentQueueService.OrderVisits(db, query, kind == "doctor" ? Calls.CallDesk.Doctor : Calls.CallDesk.Vision);
+            var rows = await VisitService.QueryRows(db, ordered.Take(200)).ToListAsync(ct);
+            if (kind != "doctor") return Results.Ok(rows.Select(VisitService.ToRow).ToList());
+
+            var ids = rows.Select(r => r.Id).ToList();
+            if (done == true)
+            {
+                var back = (await db.DiagnosticOrders.AsNoTracking()
+                    .Where(o => o.VisitId != null && ids.Contains(o.VisitId.Value) && o.ReturnToDoctor && o.Status == DiagnosticStatus.ResultReady && o.Visit!.Status == VisitStatus.ReadyForDoctor)
+                    .Select(o => o.VisitId!.Value).Distinct().ToListAsync(ct)).ToHashSet();
+                return Results.Ok(rows.Select(r => VisitService.ToRow(r) with { ResultReady = back.Contains(r.Id) }).ToList());
+            }
+
+            var ready = await db.VisitStatusHistory.AsNoTracking().Where(h => ids.Contains(h.VisitId) && h.ToStatus == VisitStatus.ReadyForDoctor)
+                .GroupBy(h => h.VisitId).Select(g => new { VisitId = g.Key, At = g.Max(h => h.ChangedAt) }).ToDictionaryAsync(x => x.VisitId, x => x.At, ct);
+            return Results.Ok(rows.Select(r => VisitService.ToRow(r) with { ReadySince = ready.TryGetValue(r.Id, out var at) ? DateTime.SpecifyKind(at, DateTimeKind.Utc) : null }).ToList());
         }).RequirePermission("visits.view").WithTags("Clinical");
 
         // Dates and patient names only, so the list is safe for a doctor's dashboard.
@@ -573,17 +660,12 @@ public static class ClinicalEndpoints
         await db.Consultations.AnyAsync(c => c.VisitId == visitId && c.FinalizedAt != null, ct)
         || await db.Visits.AnyAsync(v => v.Id == visitId && v.Status == VisitStatus.Completed, ct);
 
-    /// <summary>The reason to record for a change, refusing a change to a final record that gives none.</summary>
-    public static async Task<string> AmendReasonAsync(AppDbContext db, long visitId, string? requested, CancellationToken ct)
-    {
-        var reason = Text.Clean(requested);
-        if (reason is null && await IsFinalAsync(db, visitId, ct))
-        {
-            throw new AppException(StatusCodes.Status409Conflict, "amend_reason_required", "این معاینه نهایی شده است. برای تغییر، دلیل اصلاح را بنویسید.");
-        }
+    /// <summary>The reason to record for a change. A final record no longer needs one typed: the change is kept with a standard note.</summary>
+    public static async Task<string> AmendReasonAsync(AppDbContext db, long visitId, string? requested, CancellationToken ct) =>
+        Text.Clean(requested) ?? (await IsFinalAsync(db, visitId, ct) ? Amendments.AfterFinal : Amendments.BeforeFinal);
 
-        return reason ?? Amendments.BeforeFinal;
-    }
+    private static string? DescribeDiagnoses(IEnumerable<(EyeSide Eye, string Text)> diagnoses) =>
+        string.Join("\n", diagnoses.Select(d => $"{d.Eye}: {d.Text}")) is { Length: > 0 } text ? text : null;
 
     /// <summary>Everyone bound for a doctor passes through here, whichever department the desk chose.</summary>
     public static IQueryable<Visit> VisionQueue(IQueryable<Visit> visits) =>
@@ -596,13 +678,54 @@ public static class ClinicalEndpoints
     /// A patient still waiting for Vision reaches the doctor only after it is complete.
     /// </summary>
     public static IQueryable<Visit> DoctorQueue(AppDbContext db, IQueryable<Visit> visits, long userId) =>
-        visits.Where(v =>
+        // Waiting means not seen yet. Opening the file alone keeps the patient here; a saved exam or a referral does not.
+        NotSeenByDoctor(db, visits).Where(v =>
             ((v.Doctor != null && v.Doctor.UserId != null && v.Doctor.UserId == userId)
                 || ((v.Doctor == null || v.Doctor.UserId == null)
                     && (db.Consultations.Any(c => c.VisitId == v.Id && c.AuthorUserId == userId)
+                        // Called and opened but nothing saved yet: the doctor who started it keeps the patient, or the visit is in no list.
+                        || db.VisitStatusHistory.Where(h => h.VisitId == v.Id && h.ToStatus == VisitStatus.InConsultation).OrderByDescending(h => h.Id).Select(h => (long?)h.ChangedByUserId).FirstOrDefault() == userId
                         || (!db.Consultations.Any(c => c.VisitId == v.Id) && (v.Department!.Code == "doctor" || v.Status == VisitStatus.ReadyForDoctor))))) &&
             v.Status != VisitStatus.Completed && v.Status != VisitStatus.Cancelled && v.Status != VisitStatus.AwaitingPayment &&
             v.Status != VisitStatus.Registered && v.Status != VisitStatus.Waiting && v.Status != VisitStatus.InPreExam);
+
+    /// <summary>Every doctor's waiting patients together: the union of <see cref="DoctorQueue"/> over all accounts.</summary>
+    public static IQueryable<Visit> AllDoctorsQueue(AppDbContext db, IQueryable<Visit> visits) =>
+        NotSeenByDoctor(db, visits).Where(v =>
+            (v.Doctor != null || v.Department!.Code == "doctor" || v.Status == VisitStatus.ReadyForDoctor || v.Status == VisitStatus.InConsultation) &&
+            v.Status != VisitStatus.Completed && v.Status != VisitStatus.Cancelled && v.Status != VisitStatus.AwaitingPayment &&
+            v.Status != VisitStatus.Registered && v.Status != VisitStatus.Waiting && v.Status != VisitStatus.InPreExam);
+
+    /// <summary>Every doctor's seen patients together: <see cref="DoctorSeen"/> without the account filter.</summary>
+    public static IQueryable<Visit> AllDoctorsSeen(AppDbContext db, IQueryable<Visit> visits, bool includeOpen) =>
+        visits.Where(v => v.Status != VisitStatus.Cancelled && v.Status != VisitStatus.AwaitingPayment
+                && (v.Status == VisitStatus.AwaitingDiagnostic || v.Status == VisitStatus.FollowUpRequired || v.Status == VisitStatus.Completed
+                    || db.Consultations.Any(c => c.VisitId == v.Id)
+                    || db.VisitStatusHistory.Any(h => h.VisitId == v.Id && h.ToStatus == VisitStatus.AwaitingDiagnostic)
+                    || (includeOpen && (v.Status == VisitStatus.ReadyForDoctor || v.Status == VisitStatus.InConsultation))))
+            .Where(v => v.Doctor != null || v.Department!.Code == "doctor" || db.Consultations.Any(c => c.VisitId == v.Id)
+                || db.VisitStatusHistory.Any(h => h.VisitId == v.Id && h.ToStatus == VisitStatus.AwaitingDiagnostic));
+
+    /// <summary>
+    /// The doctor has dealt with the visit: an exam saved, a referral sent (also once the patient is back), or the visit closed.
+    /// The same test as <see cref="DoctorQueue"/> leaves out and <see cref="DoctorSeen"/> takes in, so a patient is always in one of the two lists.
+    /// </summary>
+    public static IQueryable<Visit> NotSeenByDoctor(AppDbContext db, IQueryable<Visit> visits) =>
+        visits.Where(v => v.Status != VisitStatus.AwaitingDiagnostic && v.Status != VisitStatus.FollowUpRequired && v.Status != VisitStatus.Completed
+            && !db.Consultations.Any(c => c.VisitId == v.Id)
+            && !db.VisitStatusHistory.Any(h => h.VisitId == v.Id && h.ToStatus == VisitStatus.AwaitingDiagnostic));
+
+    /// <summary>The visits <see cref="NotSeenByDoctor"/> leaves out: what the reports count as examined.</summary>
+    public static IQueryable<Visit> SeenByDoctor(AppDbContext db, IQueryable<Visit> visits) =>
+        visits.Where(v => v.Status == VisitStatus.AwaitingDiagnostic || v.Status == VisitStatus.FollowUpRequired || v.Status == VisitStatus.Completed
+            || db.Consultations.Any(c => c.VisitId == v.Id)
+            || db.VisitStatusHistory.Any(h => h.VisitId == v.Id && h.ToStatus == VisitStatus.AwaitingDiagnostic));
+
+    /// <summary>A seen patient back from refraction or a test whose file the doctor has not opened since.</summary>
+    public static async Task<bool> ReturnedUnreviewedAsync(AppDbContext db, Visit visit, CancellationToken ct) =>
+        visit.Status == VisitStatus.ReadyForDoctor
+        && (await db.Consultations.AnyAsync(c => c.VisitId == visit.Id, ct)
+            || await db.VisitStatusHistory.AnyAsync(h => h.VisitId == visit.Id && h.ToStatus == VisitStatus.AwaitingDiagnostic, ct));
 
     /// <summary>Visits whose Vision is complete, whatever desk they have moved on to since.</summary>
     public static IQueryable<Visit> VisionDone(AppDbContext db, IQueryable<Visit> visits) =>
@@ -612,6 +735,22 @@ public static class ClinicalEndpoints
     public static IQueryable<Visit> DoctorDone(AppDbContext db, IQueryable<Visit> visits, long userId) =>
         visits.Where(v => v.Status == VisitStatus.Completed
             && ((v.Doctor != null && v.Doctor.UserId == userId) || db.Consultations.Any(c => c.VisitId == v.Id && c.AuthorUserId == userId)));
+
+    /// <summary>
+    /// The doctor's seen list for a day: every visit the doctor saved an exam for, referred or closed, open or not.
+    /// On a past day it also keeps those that reached the doctor and were never seen: they are in no queue any more and would be lost.
+    /// </summary>
+    public static IQueryable<Visit> DoctorSeen(AppDbContext db, IQueryable<Visit> visits, long userId, bool includeOpen) =>
+        visits.Where(v => v.Status != VisitStatus.Cancelled && v.Status != VisitStatus.AwaitingPayment
+                && (v.Status == VisitStatus.AwaitingDiagnostic || v.Status == VisitStatus.FollowUpRequired || v.Status == VisitStatus.Completed
+                    || db.Consultations.Any(c => c.VisitId == v.Id)
+                    || db.VisitStatusHistory.Any(h => h.VisitId == v.Id && h.ToStatus == VisitStatus.AwaitingDiagnostic)
+                    || (includeOpen && (v.Status == VisitStatus.ReadyForDoctor || v.Status == VisitStatus.InConsultation))))
+            .Where(v => (v.Doctor != null && v.Doctor.UserId == userId) || db.Consultations.Any(c => c.VisitId == v.Id && c.AuthorUserId == userId)
+                || ((v.Doctor == null || v.Doctor.UserId == null) && !db.Consultations.Any(c => c.VisitId == v.Id)
+                    && (db.VisitStatusHistory.Where(h => h.VisitId == v.Id && h.ToStatus == VisitStatus.InConsultation).OrderByDescending(h => h.Id).Select(h => (long?)h.ChangedByUserId).FirstOrDefault() == userId
+                        // Referred before any exam was saved: the doctor who sent the patient keeps them.
+                        || db.VisitStatusHistory.Any(h => h.VisitId == v.Id && h.ToStatus == VisitStatus.AwaitingDiagnostic && h.ChangedByUserId == userId))));
 
     private static void MoveVisit(AppDbContext db, Visit visit, VisitStatus to, long userId)
     {

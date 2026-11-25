@@ -184,6 +184,12 @@ Remove-Item C:\AlShifa\backup-staging\recovery -Recurse -Force
 
 روی لپ‌تاپ جایگزین: اول `install.ps1` را اجرا کنید، رمز چاپ‌شده را در یک فایل بدون خط اضافه بگذارید و همین مراحل را انجام دهید. گواهی جدید ساخته می‌شود و باید دوباره روی لپ‌تاپ کارمندان نصب شود.
 
+### خرابی فایل‌های دیتابیس (InnoDB)
+
+نشانه‌ها: `Assertion failure`، `Unable to read page`، `MY-011899`، `MY-013183` در `C:\AlShifa\logs\mysql.err`، یا `innodb_force_recovery` در `alshifa.ini`. از نسخه ۲۵ نوامبر ۲۰۲۶، `health-check.ps1` و بکاپ شبانه این نشانه‌ها را گزارش می‌کنند و Installer ارتقا را روی دیتابیس خراب اجرا نمی‌کند.
+
+ترمیم: `Rebuild-Database.bat` کنار Installer را اجرا کنید. برنامه را متوقف می‌کند، از دیتابیس فعلی Export می‌گیرد، پوشه `data` را به `data.damaged-<زمان>` منتقل می‌کند (پاک نمی‌شود)، پوشه تازه با همان حساب‌ها و رمزها می‌سازد، Import می‌کند، تعداد ردیف همه جدول‌ها و محتوای جدول‌های مالی، موجودی، کاربران و Sync را مقایسه می‌کند و `CHECK TABLE` می‌گیرد. اگر هر مرحله شکست بخورد، پوشه اصلی دقیقاً برمی‌گردد. اگر سرور خودش Export نمی‌دهد، فایل SQL قبلی را روی `Rebuild-Database.bat` بکشید؛ ردیف‌های پس از آن Export در آن نیستند. `innodb_force_recovery` را برای کار عادی روشن نگذارید.
+
 ## ۹. کارهای روزمره
 
 | کار | دستور (Administrator) |
@@ -192,6 +198,12 @@ Remove-Item C:\AlShifa\backup-staging\recovery -Recurse -Force
 | ری‌استارت امن برنامه | `Restart-Service AlShifaApi` (کاربران وارد می‌مانند؛ کاری که هنگام ری‌استارت در حال ذخیره باشد خطا می‌دهد و باید بررسی شود) |
 | خطاها | Event Viewer → Windows Logs → Application، منبع `AlShifa.Api` و `AlShifaBackup`. لاگ MySQL: `C:\AlShifa\logs\mysql.err` |
 | به‌روزرسانی (بیرون از ساعت کاری) | `<release>\scripts\update.ps1 -BackupDestination F:\AlShifaBackups` |
+
+### آپدیت خودکار از سرور آنلاین
+
+پس از نصب نخستین Setup.exe که `scripts\update-publisher.json` دارد، شفاخانه خودش ثبت می‌شود و دیگر کسی لازم نیست به آن سر بزند. وظیفه `AlShifa Update Check` هر ساعت `https://shafa.novatechsoft.com/updates/manifest.json` را می‌خواند، امضای RSA آن را با کلید عمومی ثبت‌شده بررسی می‌کند و بسته را دانلود می‌کند. نصب فقط بین 03:00 و 05:00 (پس از پشتیبان 02:00) و از راه همان `update.ps1` انجام می‌شود: پشتیبان، آزمایش بازیابی، Migration روی نسخه آزمایشی، نصب، بررسی سلامت و در صورت شکست بازگشت برنامه و دیتابیس. نسخه ناموفق حداکثر سه بار، با فاصله دست‌کم ۲۰ ساعت، دوباره تلاش می‌شود. مدیر می‌تواند از تنظیمات «نصب همین حالا» را بزند. لینک، پورت، گواهی، میان‌بر و تنظیمات `appsettings.Production.json` دست نمی‌خورند.
+
+انتشار (فقط کامپیوتر توسعه): ۱) Deploy آنلاین با `deploy-online-release.sh`، ۲) `deploy\windows\build-release.ps1`، ۳) `deploy\windows\publish-update.ps1 -Release <پوشه> -Server root@<سرور> -SshKey <کلید>`. سرور نسخه‌ای را که نسخه دیتابیس آن با نسخه آنلاین برابر نیست رد می‌کند، تا Sync پس از آپدیت قطع نشود. کلید خصوصی امضا در `%USERPROFILE%\.alshifa-publisher\update-private.xml` است و در Git نیست؛ یک نسخه آفلاین از آن نگه دارید.
 
 ### فراخوان صوتی و مجموعه صوتی
 

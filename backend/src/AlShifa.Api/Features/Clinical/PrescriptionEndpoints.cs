@@ -1,5 +1,6 @@
 using AlShifa.Api.Features.Auth;
 using AlShifa.Api.Features.Inventory;
+using AlShifa.Api.Features.Visits;
 using AlShifa.Api.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 
@@ -284,7 +285,17 @@ public static class PrescriptionEndpoints
                 query = query.Where(p => p.RxNumber.StartsWith(q) || p.Patient!.FileNumber.StartsWith(q) || p.Patient.FirstName.StartsWith(q));
             }
 
-            return Results.Ok(await QueryOpticalAsync(query.OrderByDescending(p => p.Id).Take(100), ct));
+            // Newest day first; within a day, by queue card. Old days must not mix into today's queue numbers.
+            var rows = await QueryOpticalAsync(query.OrderByDescending(p => p.Visit!.VisitDate).ThenBy(p => p.Visit!.QueueNumber == null)
+                .ThenBy(p => p.Visit!.QueueShift == QueueShift.Afternoon).ThenBy(p => p.Visit!.QueueNumber).ThenByDescending(p => p.Id).Take(100), ct);
+            // The optical desk sees at a glance which prescriptions already have a live order.
+            var ids = rows.Select(r => r.Id).ToList();
+            var orders = (await db.OpticalOrders.AsNoTracking()
+                    .Where(o => o.OpticalPrescriptionId != null && ids.Contains(o.OpticalPrescriptionId.Value) && o.Status != OpticalOrderStatus.Cancelled)
+                    .Select(o => new { o.Id, RxId = o.OpticalPrescriptionId!.Value, o.Status })
+                    .ToListAsync(ct))
+                .GroupBy(o => o.RxId).ToDictionary(g => g.Key, g => g.MaxBy(o => o.Id)!.Status.ToString());
+            return Results.Ok(rows.Select(r => r with { OrderStatus = orders.GetValueOrDefault(r.Id) }).ToList());
         }).RequirePermission("opticalrx.view");
 
         optical.MapPost("/", async (CreateOpticalRxRequest request, AppDbContext db, ClinicalAccess access, Idempotency idempotency, NumberService numbers, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>
@@ -411,6 +422,6 @@ public static class PrescriptionEndpoints
         query.AsNoTracking()
             .Select(p => new OpticalRxDto(
                 p.Id, p.RxNumber, p.PatientId, p.Patient!.FileNumber, (p.Patient.FirstName + " " + (p.Patient.LastName ?? "")).Trim(), p.VisitId,
-                p.SphereOd, p.CylinderOd, p.AxisOd, p.AddOd, p.SphereOs, p.CylinderOs, p.AxisOs, p.AddOs, p.Pd, p.Notes, p.IsCancelled, p.CreatedAt, p.Version, p.RefractionId != null))
+                p.SphereOd, p.CylinderOd, p.AxisOd, p.AddOd, p.SphereOs, p.CylinderOs, p.AxisOs, p.AddOs, p.Pd, p.Notes, p.IsCancelled, p.CreatedAt, p.Version, p.RefractionId != null, p.Visit!.QueueNumber))
             .ToListAsync(ct);
 }

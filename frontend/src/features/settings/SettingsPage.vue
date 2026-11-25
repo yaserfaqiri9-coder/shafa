@@ -1,6 +1,8 @@
 <script setup lang="ts">
+import { askConfirm } from '@/components/confirm'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { api, errorMessage, uploadFile } from '@/api/http'
+import UiInactiveToggle, { useInactiveFilter } from '@/components/UiInactiveToggle.vue'
 import UiModal from '@/components/UiModal.vue'
 import CallSettingsTab from '@/features/calls/CallSettingsTab.vue'
 import BackupSettingsTab from '@/features/settings/BackupSettingsTab.vue'
@@ -32,6 +34,15 @@ const loading = ref(true)
 const services = ref<ServiceRow[]>([])
 const tests = ref<TestRow[]>([])
 const registers = ref<RegisterRow[]>([])
+const serviceFilter = useInactiveFilter(services)
+const testFilter = useInactiveFilter(tests)
+const registerFilter = useInactiveFilter(registers)
+const shownServices = serviceFilter.shown
+const shownTests = testFilter.shown
+const shownRegisters = registerFilter.shown
+const showInactiveServices = serviceFilter.showInactive
+const showInactiveTests = testFilter.showInactive
+const showInactiveRegisters = registerFilter.showInactive
 const logoId = ref<number | null>(null)
 
 const tabs = [
@@ -39,6 +50,7 @@ const tabs = [
   { key: 'services', label: 'خدمات و تعرفه‌ها' },
   { key: 'tests', label: 'فهرست آزمایش‌ها' },
   { key: 'registers', label: 'صندوق‌ها' },
+  { key: 'queue', label: 'شماره نوبت' },
   { key: 'calls', label: 'فراخوان' },
   { key: 'backup', label: 'پشتیبان‌گیری' },
 ]
@@ -93,6 +105,7 @@ async function saveHospital() {
   }
 }
 
+
 async function uploadLogo(event: Event) {
   const file = (event.target as HTMLInputElement).files?.[0]
   if (!file) return
@@ -109,7 +122,7 @@ async function uploadLogo(event: Event) {
 }
 
 async function removeLogo() {
-  if (!logoId.value || !window.confirm('لوگو حذف شود؟')) return
+  if (!logoId.value || !(await askConfirm('لوگو حذف شود؟', { confirmLabel: 'حذف شود', danger: true }))) return
   try {
     await api(`/attachments/${logoId.value}`, { method: 'DELETE' })
     logoId.value = null
@@ -255,8 +268,16 @@ onMounted(load)
         </fieldset>
       </form>
 
+      <section v-else-if="tab === 'queue'">
+        <h2 class="h5">شماره‌های نوبت</h2>
+        <p class="text-muted">شماره کارت فیزیکی از ۱ تا ۱۰۰ در پذیرش دستی ثبت می‌شود. هر شماره در تمام بخش‌ها ثابت است و در همان نوبت دوباره استفاده نمی‌شود. نوبت چاشت از ساعت ۳ به وقت کابل دوباره از ۱ شروع می‌شود؛ مریض باقی‌ماندهٔ صبح پیش از مریضان چاشت در صف می‌ماند.</p>
+      </section>
+
       <template v-else-if="tab === 'services'">
-        <button v-if="canEdit()" type="button" class="btn btn-primary mb-3" @click="openService()">خدمت جدید</button>
+        <div class="d-flex align-items-center gap-3 mb-3">
+          <button v-if="canEdit()" type="button" class="btn btn-primary" @click="openService()">خدمت جدید</button>
+          <UiInactiveToggle v-model="showInactiveServices" :count="serviceFilter.inactiveCount.value" />
+        </div>
         <div v-if="unpriced.length" class="alert alert-warning" role="alert">
           تا قیمت این خدمات ثبت نشود، نوبت و درخواست مربوط ثبت نمی‌شود: {{ unpriced.join('، ') }}. مبلغ را مسئول مالی تعیین می‌کند.
         </div>
@@ -265,7 +286,7 @@ onMounted(load)
           <table class="xr-table">
             <thead><tr><th>کد</th><th>نام</th><th>قیمت فعلی</th><th>وضعیت</th><th v-if="canPrice() || canEdit()">عملیات</th></tr></thead>
             <tbody>
-              <tr v-for="row in services" :key="row.id">
+              <tr v-for="row in shownServices" :key="row.id">
                 <td><span class="ltr-num">{{ row.code }}</span></td>
                 <td>{{ row.name }}</td>
                 <td>
@@ -286,13 +307,16 @@ onMounted(load)
       </template>
 
       <template v-else-if="tab === 'tests'">
-        <button v-if="canEdit()" type="button" class="btn btn-primary mb-3" @click="openTest()">آزمایش جدید</button>
+        <div class="d-flex align-items-center gap-3 mb-3">
+          <button v-if="canEdit()" type="button" class="btn btn-primary" @click="openTest()">آزمایش جدید</button>
+          <UiInactiveToggle v-model="showInactiveTests" :count="testFilter.inactiveCount.value" />
+        </div>
         <p v-if="tests.length === 0" class="text-muted">آزمایشی تعریف نشده یا اجازه مشاهده ندارید.</p>
         <div v-else class="xr-table-wrap">
           <table class="xr-table">
             <thead><tr><th>نام</th><th>نوع</th><th>وضعیت</th><th v-if="canEdit()">عملیات</th></tr></thead>
             <tbody>
-              <tr v-for="row in tests" :key="row.id">
+              <tr v-for="row in shownTests" :key="row.id">
                 <td>{{ row.name }}</td>
                 <td>{{ kindLabels[row.kind] ?? row.kind }}</td>
                 <td><span class="xr-badge" :class="row.isActive ? 'xr-badge--green' : 'xr-badge--red'">{{ row.isActive ? 'فعال' : 'غیرفعال' }}</span></td>
@@ -317,13 +341,14 @@ onMounted(load)
         <form v-if="canEdit()" class="row g-2 mb-3" @submit.prevent="saveRegister">
           <div class="col-md-5"><input v-model="registerName" class="form-control" placeholder="نام صندوق جدید" aria-label="نام صندوق جدید" maxlength="100" required /></div>
           <div class="col-auto"><button type="submit" class="btn btn-primary">افزودن صندوق</button></div>
+          <div class="col-auto align-self-center"><UiInactiveToggle v-model="showInactiveRegisters" :count="registerFilter.inactiveCount.value" /></div>
         </form>
         <p v-if="registers.length === 0" class="text-muted">صندوقی نمایش داده نمی‌شود یا اجازه مشاهده ندارید.</p>
         <div v-else class="xr-table-wrap">
           <table class="xr-table">
             <thead><tr><th>نام</th><th>وضعیت</th><th v-if="canEdit()">عملیات</th></tr></thead>
             <tbody>
-              <tr v-for="row in registers" :key="row.id">
+              <tr v-for="row in shownRegisters" :key="row.id">
                 <td>{{ row.name }}</td>
                 <td><span class="xr-badge" :class="row.isActive ? 'xr-badge--green' : 'xr-badge--red'">{{ row.isActive ? 'فعال' : 'غیرفعال' }}</span></td>
                 <td v-if="canEdit()" class="text-nowrap">

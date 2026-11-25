@@ -1,6 +1,7 @@
 using AlShifa.Api.Features.Clinical;
 using AlShifa.Api.Features.Finance;
 using AlShifa.Api.Features.Inventory;
+using AlShifa.Api.Features.Sync;
 using AlShifa.Api.Features.Users;
 using AlShifa.Api.Infrastructure;
 using Microsoft.AspNetCore.Identity;
@@ -124,6 +125,45 @@ public static class Seeder
         }
 
         await db.SaveChangesAsync();
+    }
+
+    /// <summary>
+    /// Brings only the online SuperAdmin role's permissions up to the current policy matrix.
+    /// The online copy is seeded from the hospital and normally skips reference-data seeding;
+    /// this explicit operator action repairs a stale role without changing accounts or other roles.
+    /// </summary>
+    public static async Task<int> AddMissingOnlineSuperAdminPermissionsAsync(IServiceProvider services)
+    {
+        var sync = services.GetRequiredService<SyncSwitch>();
+        if (!sync.IsOnline)
+        {
+            throw new InvalidOperationException("SuperAdmin permission repair is allowed only on the online copy.");
+        }
+
+        sync.OperatorWrites = true;
+        var db = services.GetRequiredService<AppDbContext>();
+        var roles = services.GetRequiredService<RoleManager<AppRole>>();
+        return await AddMissingSuperAdminPermissionsAsync(db, roles);
+    }
+
+    public static async Task<int> AddMissingSuperAdminPermissionsAsync(AppDbContext db, RoleManager<AppRole> roles)
+    {
+        var role = await roles.FindByNameAsync(Roles.SuperAdmin)
+            ?? throw new InvalidOperationException("The online copy does not contain the SuperAdmin role.");
+        var existing = await db.RoleClaims
+            .Where(c => c.RoleId == role.Id && c.ClaimType == RolePermissions.ClaimType)
+            .Select(c => c.ClaimValue)
+            .ToListAsync();
+        var current = existing.ToHashSet(StringComparer.Ordinal);
+        var missing = RolePermissions.For(Roles.SuperAdmin).Where(p => !current.Contains(p)).ToArray();
+        db.RoleClaims.AddRange(missing.Select(permission => new IdentityRoleClaim<long>
+        {
+            RoleId = role.Id,
+            ClaimType = RolePermissions.ClaimType,
+            ClaimValue = permission,
+        }));
+        if (missing.Length > 0) await db.SaveChangesAsync();
+        return missing.Length;
     }
 
     /// <summary>Creates or resets a Super Admin. Production passwords come from the operator, never from source.</summary>

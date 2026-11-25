@@ -81,10 +81,16 @@ public sealed class OutboxDispatcher(IServiceScopeFactory scopes, IHubContext<Ev
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan Retention = TimeSpan.FromDays(7);
+    private static readonly TimeSpan CleanupInterval = TimeSpan.FromHours(1);
+    // Not at startup: a restart after a database failure must not immediately repeat the heaviest statement.
+    private static readonly TimeSpan FirstCleanupDelay = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan CleanupPause = TimeSpan.FromMilliseconds(200);
+    public const int CleanupBatch = 500;
+    private const int MaxCleanupBatches = 200;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var lastCleanup = DateTime.MinValue;
+        var nextCleanup = DateTime.UtcNow + FirstCleanupDelay;
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -93,12 +99,11 @@ public sealed class OutboxDispatcher(IServiceScopeFactory scopes, IHubContext<Ev
                 var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
                 await DispatchAsync(db, stoppingToken);
 
-                if (DateTime.UtcNow - lastCleanup > TimeSpan.FromHours(1))
+                if (DateTime.UtcNow >= nextCleanup)
                 {
-                    var cutoff = DateTime.UtcNow - Retention;
-                    await db.OutboxEvents.Where(e => e.ProcessedAt != null && e.ProcessedAt < cutoff).ExecuteDeleteAsync(stoppingToken);
-                    await db.IdempotencyRecords.Where(r => r.CreatedAt < cutoff).ExecuteDeleteAsync(stoppingToken);
-                    lastCleanup = DateTime.UtcNow;
+                    // Scheduled before running: a failing cleanup waits a full interval instead of repeating every second.
+                    nextCleanup = DateTime.UtcNow + CleanupInterval;
+                    await CleanupAsync(db, DateTime.UtcNow - Retention, stoppingToken);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -120,6 +125,77 @@ public sealed class OutboxDispatcher(IServiceScopeFactory scopes, IHubContext<Ev
                 return;
             }
         }
+    }
+
+    private async Task CleanupAsync(AppDbContext db, DateTime cutoff, CancellationToken ct)
+    {
+        try
+        {
+            var events = await PurgeOutboxAsync(db, cutoff, ct);
+            var records = await PurgeIdempotencyRecordsAsync(db, cutoff, ct);
+            if (events + records > 0)
+            {
+                logger.LogInformation("Retention cleanup removed {Events} outbox events and {Records} idempotency records older than {Cutoff:o}", events, records, cutoff);
+            }
+        }
+        catch (Exception e) when (!ct.IsCancellationRequested)
+        {
+            // Cleanup is housekeeping only; it must never take dispatch or the hospital down with it.
+            logger.LogWarning(e, "Retention cleanup failed; it is retried in {Interval}", CleanupInterval);
+        }
+    }
+
+    /// <summary>
+    /// Removes expired replay records in small batches walked by primary key. A single DELETE ... WHERE CreatedAt &lt; x has no index to use:
+    /// it scans and locks the whole table in one transaction, blocking every new save that needs an idempotency row, and leaves a large undo
+    /// history for purge. Here each batch reads at most <see cref="CleanupBatch"/> rows and deletes them by key in its own short statement.
+    /// Only rows older than the 7-day retention are removed, so a retried request inside that window still replays its stored response.
+    /// </summary>
+    public static async Task<int> PurgeIdempotencyRecordsAsync(AppDbContext db, DateTime cutoff, CancellationToken ct)
+    {
+        var deleted = 0;
+        long after = 0;
+        for (var round = 0; round < MaxCleanupBatches; round++)
+        {
+            var batch = await db.IdempotencyRecords.AsNoTracking().Where(r => r.Id > after).OrderBy(r => r.Id).Take(CleanupBatch)
+                .Select(r => new { r.Id, r.CreatedAt }).ToListAsync(ct);
+            // Ids grow with time; stopping at the first row inside retention never removes a live one.
+            var expired = batch.TakeWhile(r => r.CreatedAt < cutoff).Select(r => r.Id).ToList();
+            if (expired.Count > 0)
+            {
+                deleted += await db.IdempotencyRecords.Where(r => expired.Contains(r.Id)).ExecuteDeleteAsync(ct);
+            }
+
+            if (expired.Count < CleanupBatch) break;
+            after = expired[^1];
+            await Task.Delay(CleanupPause, ct);
+        }
+
+        return deleted;
+    }
+
+    /// <summary>Same batching as <see cref="PurgeIdempotencyRecordsAsync"/>. Undelivered events are never removed.</summary>
+    public static async Task<int> PurgeOutboxAsync(AppDbContext db, DateTime cutoff, CancellationToken ct)
+    {
+        var deleted = 0;
+        long after = 0;
+        for (var round = 0; round < MaxCleanupBatches; round++)
+        {
+            var batch = await db.OutboxEvents.AsNoTracking().Where(e => e.Id > after).OrderBy(e => e.Id).Take(CleanupBatch)
+                .Select(e => new { e.Id, e.CreatedAt, e.ProcessedAt }).ToListAsync(ct);
+            var old = batch.TakeWhile(e => e.CreatedAt < cutoff).ToList();
+            var expired = old.Where(e => e.ProcessedAt != null && e.ProcessedAt < cutoff).Select(e => e.Id).ToList();
+            if (expired.Count > 0)
+            {
+                deleted += await db.OutboxEvents.Where(e => expired.Contains(e.Id)).ExecuteDeleteAsync(ct);
+            }
+
+            if (old.Count < CleanupBatch) break;
+            after = old[^1].Id;
+            await Task.Delay(CleanupPause, ct);
+        }
+
+        return deleted;
     }
 
     private async Task DispatchAsync(AppDbContext db, CancellationToken ct)

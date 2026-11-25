@@ -1,5 +1,7 @@
 # Local authority and online command queue
 
+> Protocol 2 safety update (2026-11-21): automatic mirror reset is prohibited. Existing populated mirrors need reviewed source enrollment, and old/new protocol pairs refuse replication. Independent writable databases are not supported by the current topology. See [implementation and acceptance status](automation-implementation-status.md) before deployment or activation.
+
 The hospital database is authoritative. LAN clients use the published PWA and the hospital API without external internet. A disconnected phone cannot write without reaching the hospital server; patient data is not cached in the service worker.
 
 `Sync:Url` and `Sync:Key` enable the existing signed replication worker (five minutes by default). Local capture stays on even while the destination is unconfigured. `SyncChanges` commits with every tracked business write; the worker removes entries only after the online acknowledgement. Existing snapshot, schema checks, attachment verification and retry behavior are retained.

@@ -35,6 +35,12 @@ let backupTimer: ReturnType<typeof setInterval> | undefined
 // The online copy shows how fresh its data is, since it only changes when the hospital server sends.
 const onlineCopy = computed(() => auth.user?.online === true)
 const mirrorUpdatedAt = ref<string | null>(null)
+const systemNeedsAttention = computed(() => (mounted.value && !liveConnected.value) || !!backupProblem.value || stationNeedsClick.value)
+function closeSystemDock(event: KeyboardEvent) {
+  const dock = event.currentTarget as HTMLDetailsElement
+  dock.open = false
+  dock.querySelector('summary')?.focus()
+}
 let mirrorTimer: ReturnType<typeof setInterval> | undefined
 
 async function checkMirror() {
@@ -122,7 +128,12 @@ onBeforeUnmount(() => {
     />
     <div class="layout__main" :inert="mobileMenu && sidebarOpen" :class="{ 'layout__main--menu-open': mobileMenu && sidebarOpen }">
       <AppHeader @toggle-sidebar="sidebarOpen = !sidebarOpen" />
-      <main class="layout__content">
+      <details class="system-dock" :class="{ 'system-dock--attention': systemNeedsAttention }" @keydown.esc="closeSystemDock">
+        <summary aria-label="وضعیت سیستم و درخواست‌های آنلاین">
+          <i class="ri-information-line" aria-hidden="true"></i><span>وضعیت سیستم</span>
+          <span v-if="systemNeedsAttention" class="system-dock__badge" role="status">نیاز به توجه</span>
+        </summary>
+        <div class="system-dock__panel">
         <div v-if="onlineCopy" class="alert alert-info" role="status">
           <i class="ri-eye-line" aria-hidden="true"></i>
           نسخه آنلاین: ثبت عملیات پس از تأیید سرور محلی قطعی می‌شود.
@@ -136,6 +147,10 @@ onBeforeUnmount(() => {
         </div>
         <div v-if="stationNeedsClick" class="alert alert-warning" role="status">این رایانه مرکز پخش صوت است. برای فعال‌شدن صدا یک بار روی صفحه کلیک کنید.</div>
         <OnlineCommandsPanel v-if="onlineCopy" />
+          <p v-if="!onlineCopy && !systemNeedsAttention" class="system-dock__healthy" role="status">سرویس در دسترس است.</p>
+        </div>
+      </details>
+      <main class="layout__content">
         <RouterView />
       </main>
       <AppFooter />
@@ -144,6 +159,15 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.system-dock{position:fixed;inset-inline-end:18px;bottom:16px;z-index:1040;direction:rtl;color:#45566a;font-size:12px}
+.system-dock>summary{display:flex;align-items:center;gap:7px;list-style:none;cursor:pointer;min-height:36px;padding:6px 12px;border:1px solid #d9e5e9;border-radius:20px;background:#fff;box-shadow:0 2px 10px #24344712;user-select:none}
+.system-dock>summary::-webkit-details-marker{display:none}.system-dock>summary>i{font-size:17px;color:#079bad}.system-dock>summary:focus-visible{outline:2px solid #079bad;outline-offset:3px}
+.system-dock__badge{font-size:10px;border-radius:10px;padding:2px 6px;background:#fff3d6;color:#866108}.system-dock--attention>summary{border-color:#eadbb7}
+.system-dock__panel{position:absolute;inset-inline-end:0;bottom:calc(100% + 10px);width:min(440px,calc(100vw - 28px));max-height:65dvh;overflow:auto;padding:14px;border:1px solid #dfe8ed;border-radius:14px;background:#fff;box-shadow:0 8px 32px #24344726;line-height:1.9}
+.system-dock__panel>.alert{padding:10px 12px;margin:0 0 10px;font-size:12px;border-radius:8px}.system-dock__panel>.card{margin-bottom:0!important;box-shadow:none;font-size:12px}.system-dock__panel>.card>summary{padding:10px!important;font-weight:600}.system-dock__panel>.card code{overflow-wrap:anywhere}.system-dock__healthy{margin:0;color:#267d5e}
+@media(max-width:767.98px){.system-dock{bottom:12px;inset-inline-end:12px}.system-dock>summary{min-height:44px}.system-dock__panel{max-height:60dvh}}
+@media print{.system-dock{display:none!important}}
+
 .layout {
   --xr-sidebar-current: var(--xr-sidebar-width);
   height: 100dvh;

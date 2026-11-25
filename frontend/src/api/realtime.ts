@@ -40,6 +40,9 @@ export function connectRealtime() {
     .build()
 
   connection.on('event', (event: { type: string; payload?: string }) => notify(event.type, event.payload))
+  connection.on('chatMessage', (message: { senderUserId: number; recipientUserId: number }) =>
+    notify('chatMessage', JSON.stringify(message)),
+  )
   connection.onreconnecting(() => (liveConnected.value = false))
   connection.onreconnected(() => {
     liveConnected.value = true

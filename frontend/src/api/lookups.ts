@@ -35,8 +35,8 @@ export const departmentOptions = () => cached<LookupRow[]>('/lookups/departments
 export const doctorOptions = () => cached<LookupRow[]>('/lookups/doctors').then(toOptions)
 
 export const testOptions = () =>
-  cached<(LookupRow & { isActive: boolean; kind: string })[]>('/diagnostic-tests').then((rows) =>
-    rows.filter((t) => t.isActive).map((t) => ({ value: t.id, label: t.name, kind: t.kind })),
+  api<(LookupRow & { isActive: boolean; kind: string; serviceId: number | null })[]>('/diagnostic-tests').then((rows) =>
+    rows.filter((t) => t.isActive).map((t) => ({ value: t.id, label: t.name, kind: t.kind, serviceId: t.serviceId })),
   )
 
 /** Departments and doctors are worth warming before the first form needs them. */

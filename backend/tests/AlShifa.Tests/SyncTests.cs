@@ -39,6 +39,8 @@ public sealed class SyncFixture : IAsyncLifetime
 
     public WebApplicationFactory<Program> Mirror { get; private set; } = null!;
 
+    public string PreviousSchema { get; private set; } = "";
+
     public WebApplicationFactory<Program> Local { get; private set; } = null!;
 
     /// <summary>Simulates the hospital's internet: off throws before anything is sent, LoseAnswer applies the batch online but loses the reply.</summary>
@@ -65,11 +67,18 @@ public sealed class SyncFixture : IAsyncLifetime
             GRANT UPDATE (AccessFailedCount, LockoutEnd, ConcurrencyStamp) ON alshifa_mirror_test.AspNetUsers TO '{ReadOnlyUser}'@'localhost';
             """);
 
+        // As in production after deploying online ahead of the hospital: the previous hospital version is still accepted.
+        await using (var schema = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>().UseMySQL(MirrorDb).Options))
+        {
+            PreviousSchema = schema.Database.GetMigrations().SkipLast(1).Last();
+        }
+
         Mirror = new App(MirrorReadOnlyDb, new()
         {
             ["Mirror:Enabled"] = "true",
             ["Mirror:SyncKey"] = Key,
             ["Mirror:SyncConnection"] = MirrorDb,
+            ["Mirror:AcceptedSourceSchemas:0"] = PreviousSchema,
         });
         _ = Mirror.Server;
 
@@ -78,6 +87,9 @@ public sealed class SyncFixture : IAsyncLifetime
             ["Sync:Url"] = "https://online.test",
             ["Sync:Key"] = Key,
             ["Sync:IntervalMinutes"] = "600",
+            // Tests drive every run themselves. The hosted loop would otherwise start after 20 s and race a test's
+            // own run for the same online command (the interval is clamped to 5 minutes, so 600 does not stop it).
+            ["Sync:StartDelaySeconds"] = "86400",
         }, services => services.AddHttpClient(SyncWorker.HttpClientName)
             .ConfigurePrimaryHttpMessageHandler(() => new FlakyHandler(Network, Mirror.Server.CreateHandler())));
         _ = Local.Server;
@@ -159,6 +171,16 @@ public sealed class SyncFixture : IAsyncLifetime
 
     private static async Task RootSqlAsync(string sql)
     {
+        var isolatedAdmin = Environment.GetEnvironmentVariable("ALSHIFA_TEST_ADMIN_DB");
+        if (!string.IsNullOrWhiteSpace(isolatedAdmin))
+        {
+            var isolated = new MySqlConnectionStringBuilder(isolatedAdmin) { Database = "" };
+            await using var admin = new MySqlConnection(isolated.ConnectionString);
+            await admin.OpenAsync();
+            foreach (var statement in sql.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                await using (var command = new MySqlCommand(statement, admin)) { await command.ExecuteNonQueryAsync(); }
+            return;
+        }
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir is not null && !File.Exists(Path.Combine(dir.FullName, ".tools", "dev-secrets.json")))
         {
@@ -206,6 +228,7 @@ public sealed class FlakyNetwork
     public bool LoseAnswer { get; set; }
 
     public bool DropCommandResultOnce { get; set; }
+    public bool LegacyProtocolState { get; set; }
 }
 
 public sealed class FlakyHandler(FlakyNetwork network, HttpMessageHandler inner) : DelegatingHandler(inner)
@@ -223,6 +246,12 @@ public sealed class FlakyHandler(FlakyNetwork network, HttpMessageHandler inner)
             throw new HttpRequestException("Result delivery interrupted after the local commit");
         }
         var response = await base.SendAsync(request, ct);
+        if (network.LegacyProtocolState && request.RequestUri!.AbsolutePath.EndsWith("/mirror/state"))
+        {
+            var state = await response.Content.ReadFromJsonAsync<MirrorState>(cancellationToken: ct);
+            response.Content.Dispose();
+            response.Content = JsonContent.Create(state! with { ProtocolVersion = 1 });
+        }
         if (network.LoseAnswer && request.RequestUri!.AbsolutePath.EndsWith("/mirror/apply"))
         {
             throw new HttpRequestException("Connection reset while reading the answer");
@@ -234,6 +263,54 @@ public sealed class FlakyHandler(FlakyNetwork network, HttpMessageHandler inner)
 
 public sealed class SyncTests(SyncFixture sync) : IClassFixture<SyncFixture>
 {
+    [Fact]
+    public async Task Physical_cards_attendance_and_current_patient_survive_offline_and_lost_sync_reply()
+    {
+        await sync.SyncAsync();
+        var day = KabulClock.Today.AddDays(40);
+        const string entry = "v:987654321";
+        using var scope = sync.Local.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        db.QueueCards.Add(new() { Day = day, Number = 100 });
+        db.QueueAttendances.Add(new() { Day = day, Desk = AlShifa.Api.Features.Calls.CallDesk.Vision, EntryKey = entry, Present = false, UpdatedAt = DateTime.UtcNow });
+        db.QueueDeskLanes.Add(new() { Day = day, Desk = AlShifa.Api.Features.Calls.CallDesk.Vision, LaneId = 0, EntryKey = entry });
+        sync.Network.Offline = true;
+        try {
+            await db.SaveChangesAsync();
+            await Assert.ThrowsAsync<HttpRequestException>(sync.SyncAsync);
+            Assert.True(await db.QueueCards.AnyAsync(c => c.Day == day && c.Number == 100));
+        } finally { sync.Network.Offline = false; }
+        sync.Network.LoseAnswer = true;
+        try { await Assert.ThrowsAsync<HttpRequestException>(sync.SyncAsync); }
+        finally { sync.Network.LoseAnswer = false; }
+        await sync.SyncAsync();
+        await using (var mirror = sync.MirrorData()) {
+            Assert.Single(await mirror.QueueCards.Where(c => c.Day == day && c.Number == 100).ToListAsync());
+            Assert.False((await mirror.QueueAttendances.SingleAsync(a => a.Day == day && a.EntryKey == entry)).Present);
+            Assert.Equal(entry, (await mirror.QueueDeskLanes.SingleAsync(l => l.Day == day)).EntryKey);
+        }
+        (await db.QueueAttendances.SingleAsync(a => a.Day == day && a.EntryKey == entry)).Present = true;
+        (await db.QueueDeskLanes.SingleAsync(l => l.Day == day)).EntryKey = null;
+        await db.SaveChangesAsync();
+        await sync.SyncAsync();
+        await using var verified = sync.MirrorData();
+        Assert.True((await verified.QueueAttendances.SingleAsync(a => a.Day == day && a.EntryKey == entry)).Present);
+        Assert.Null((await verified.QueueDeskLanes.SingleAsync(l => l.Day == day)).EntryKey);
+    }
+
+    [Fact]
+    public async Task A_legacy_online_service_cannot_bypass_source_ownership_guards()
+    {
+        sync.Network.LegacyProtocolState = true;
+        try
+        {
+            var refused = await Assert.ThrowsAsync<InvalidOperationException>(() => sync.SyncAsync());
+            Assert.Contains("sync_protocol_mismatch", refused.Message);
+        }
+        finally { sync.Network.LegacyProtocolState = false; }
+        await sync.SyncAsync();
+    }
+
     private async Task<(HttpClient Online, HttpClient Local)> OnlineUserAsync(string role)
     {
         var name = "cmd_" + Guid.NewGuid().ToString("N")[..16];
@@ -464,6 +541,16 @@ public sealed class SyncTests(SyncFixture sync) : IClassFixture<SyncFixture>
         // Everything can be read.
         Assert.Equal(HttpStatusCode.OK, (await client.GetAsync($"/api/patients/{patient.Id}")).StatusCode);
         Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/reports/dashboard")).StatusCode);
+
+        // Management, not a doctor itself, reads every doctor's lists and any patient's history online.
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/clinical/worklist?kind=doctor")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/clinical/worklist?kind=doctor&done=true")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync($"/api/clinical/patients/{patient.Id}/history")).StatusCode);
+        // At the hospital the care-relationship rule is unchanged.
+        var localDirector = SyncFixture.Client(sync.Local);
+        Assert.True((await localDirector.PostAsJsonAsync("/api/auth/login", new LoginRequest(director, ApiFixture.TestPassword))).IsSuccessStatusCode);
+        await ApiFixture.RefreshCsrfAsync(localDirector);
+        Assert.Equal(HttpStatusCode.Forbidden, (await localDirector.GetAsync($"/api/clinical/patients/{patient.Id}/history")).StatusCode);
         var status = await client.GetFromJsonAsync<SyncStatusDto>("/api/sync/status");
         Assert.Equal("mirror", status!.Mode);
         Assert.NotNull(status.LastSuccessAt);
@@ -548,7 +635,50 @@ public sealed class SyncTests(SyncFixture sync) : IClassFixture<SyncFixture>
     }
 
     [Fact]
-    public async Task Online_copy_with_foreign_rows_or_lost_batches_is_rebuilt_from_the_hospital()
+    public async Task Online_copy_one_version_ahead_keeps_accepting_the_previous_hospital_version()
+    {
+        await sync.SyncAsync();
+        await using var online = sync.MirrorData();
+        var own = SyncSchema.SchemaVersion(online);
+        var sequence = await online.SyncStates.AsNoTracking().Where(s => s.Key == "apply.seq").Select(s => s.Value).SingleAsync();
+        var source = sync.Local.Services.GetRequiredService<InstallationIdentity>().Id.ToString();
+        var client = SyncFixture.Client(sync.Mirror);
+        async Task<HttpResponseMessage> Signed(HttpMethod method, string path, byte[] body)
+        {
+            var time = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+            var request = new HttpRequestMessage(method, path);
+            if (body.Length > 0) request.Content = new ByteArrayContent(body);
+            request.Headers.Add(SyncSignature.TimeHeader, time);
+            request.Headers.Add(SyncSignature.SignatureHeader, SyncSignature.Sign(SyncFixture.Key, time, method.Method, path, body));
+            return await client.SendAsync(request);
+        }
+        byte[] Batch(string schema, long seq) => JsonSerializer.SerializeToUtf8Bytes(new SyncBatch(schema, seq, DateTime.UtcNow, [], SourceId: source), JsonSerializerOptions.Web);
+
+        try
+        {
+            // The hospital still on the previous version sends its batch; it is applied, and the online copy then reports
+            // that version back, which is what the previous version compares with its own.
+            Assert.Equal(HttpStatusCode.OK, (await Signed(HttpMethod.Post, "/api/sync/mirror/apply", Batch(sync.PreviousSchema, long.Parse(sequence) + 1))).StatusCode);
+            var state = await (await Signed(HttpMethod.Get, "/api/sync/mirror/state", [])).Content.ReadFromJsonAsync<MirrorState>();
+            Assert.Equal(sync.PreviousSchema, state!.Schema);
+            Assert.Contains(own, state.AcceptedSchemas!);
+
+            // Any other version is still refused before anything is written.
+            Assert.Equal(HttpStatusCode.Conflict, (await Signed(HttpMethod.Post, "/api/sync/mirror/apply", Batch("20200101000000_Unknown", long.Parse(sequence) + 2))).StatusCode);
+        }
+        finally
+        {
+            await online.Database.ExecuteSqlInterpolatedAsync($"UPDATE SyncStates SET `Value`={sequence} WHERE `Key`='apply.seq'");
+        }
+
+        // The upgraded hospital reads AcceptedSchemas, continues, and the online copy reports its own version again.
+        await sync.SyncAsync();
+        var after = await (await Signed(HttpMethod.Get, "/api/sync/mirror/state", [])).Content.ReadFromJsonAsync<MirrorState>();
+        Assert.Equal(own, after!.Schema);
+    }
+
+    [Fact]
+    public async Task Divergent_history_stops_without_erasing_either_database()
     {
         var desk = await sync.LocalLoginAsync(Roles.Receptionist);
         var patient = await CreatePatientAsync(desk, "بازسازی");
@@ -556,22 +686,67 @@ public sealed class SyncTests(SyncFixture sync) : IClassFixture<SyncFixture>
 
         await using var online = sync.MirrorData();
         var accounts = await online.Users.CountAsync();
+        var previousSequence = await online.SyncStates.AsNoTracking().Where(s => s.Key == "apply.seq").Select(s => s.Value).SingleAsync();
 
         // Rows the hospital never sent (a test run against the online copy, or a hospital database restored from a backup)
         // and a batch number this hospital never used.
         await online.Database.ExecuteSqlRawAsync("INSERT INTO Departments (Code, Name, IsActive, Version) VALUES ('ZZTEST', 'Test row', 1, 1)");
         await online.Database.ExecuteSqlRawAsync("UPDATE SyncStates SET `Value`='99999999999999' WHERE `Key`='apply.seq'");
-        await sync.SyncAsync();
-        Assert.False(await online.Departments.AnyAsync(d => d.Code == "ZZTEST"));
-        Assert.True(await online.Patients.AnyAsync(p => p.Id == patient.Id));
-        Assert.Equal(accounts, await online.Users.CountAsync());
+        try
+        {
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => sync.SyncAsync());
+            Assert.Contains("sync_reconciliation_required", error.Message);
+            Assert.True(await online.Departments.AnyAsync(d => d.Code == "ZZTEST"));
+            Assert.True(await online.Patients.AnyAsync(p => p.Id == patient.Id));
 
-        // The online copy loses data it had confirmed (restored from an older backup): everything is sent again.
-        await online.Database.ExecuteSqlRawAsync($"DELETE FROM Patients WHERE Id={patient.Id}");
-        await online.Database.ExecuteSqlRawAsync("UPDATE SyncStates SET `Value`='1' WHERE `Key`='apply.seq'");
+            Assert.Equal(accounts, await online.Users.CountAsync());
+            await online.Database.ExecuteSqlRawAsync("UPDATE SyncStates SET `Value`='1' WHERE `Key`='apply.seq'");
+            await Assert.ThrowsAsync<InvalidOperationException>(() => sync.SyncAsync());
+            Assert.True(await online.Patients.AnyAsync(p => p.Id == patient.Id));
+        }
+        finally
+        {
+            await online.Database.ExecuteSqlInterpolatedAsync($"UPDATE SyncStates SET `Value`={previousSequence} WHERE `Key`='apply.seq'");
+            await online.Database.ExecuteSqlRawAsync("DELETE FROM Departments WHERE Code='ZZTEST'");
+        }
         await sync.SyncAsync();
-        Assert.Equal(1, await online.Patients.CountAsync(p => p.Id == patient.Id));
-        await AssertNothingPendingAsync();
+    }
+
+    [Fact]
+    public async Task Another_installation_and_reset_cannot_overwrite_the_bound_mirror()
+    {
+        await sync.SyncAsync();
+        await using var db = sync.MirrorData();
+        var schema = SyncSchema.SchemaVersion(db);
+        var before = await db.Patients.CountAsync();
+        var users = await db.Users.CountAsync();
+        var other = new SyncBatch(schema, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 10000, DateTime.UtcNow, [], SourceId: Guid.NewGuid().ToString());
+        var conflict = await Assert.ThrowsAsync<AppException>(() => MirrorApply.ApplyAsync(db, SyncFixture.MirrorDb, other, CancellationToken.None));
+        Assert.Contains("authoritative source", conflict.Message);
+        await Assert.ThrowsAsync<AppException>(() => MirrorApply.ApplyAsync(db, SyncFixture.MirrorDb, other with { Reset = true }, CancellationToken.None));
+        Assert.Equal(before, await db.Patients.CountAsync());
+        Assert.Equal(users, await db.Users.CountAsync());
+    }
+
+    [Fact]
+    public async Task Sync_checkbox_retains_offline_work_and_restricts_changes_to_settings_editors()
+    {
+        var admin = await sync.LocalLoginAsync(Roles.SuperAdmin);
+        var desk = await sync.LocalLoginAsync(Roles.Receptionist);
+        Assert.Equal(HttpStatusCode.Forbidden, (await desk.PutAsJsonAsync("/api/sync/enabled", new { enabled = false })).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await admin.PutAsJsonAsync("/api/sync/enabled", new { enabled = false })).StatusCode);
+        try
+        {
+            var patient = await CreatePatientAsync(desk, "Offline checkbox test");
+            await sync.SyncAsync();
+            await using var online = sync.MirrorData();
+            Assert.False(await online.Patients.AnyAsync(p => p.Id == patient.Id));
+            Assert.Equal(HttpStatusCode.Conflict, (await admin.PostAsync("/api/sync/run", null)).StatusCode);
+            Assert.Equal(HttpStatusCode.OK, (await admin.PutAsJsonAsync("/api/sync/enabled", new { enabled = true })).StatusCode);
+            await sync.SyncAsync();
+            Assert.True(await online.Patients.AnyAsync(p => p.Id == patient.Id));
+        }
+        finally { await admin.PutAsJsonAsync("/api/sync/enabled", new { enabled = true }); }
     }
 
     [Fact]
@@ -601,6 +776,9 @@ public sealed class SyncTests(SyncFixture sync) : IClassFixture<SyncFixture>
     [Fact]
     public async Task The_timed_sync_keeps_running_after_a_round_and_never_stops_the_application()
     {
+        // Only the worker under observation may send during this scheduling test.
+        // The fixture's default worker otherwise starts after 20 seconds and masks the retry interval.
+        await sync.Local.Services.GetRequiredService<SyncWorker>().StopAsync(CancellationToken.None);
         var desk = await sync.LocalLoginAsync(Roles.Receptionist);
         var patient = await CreatePatientAsync(desk, "زمان‌بندی");
 
@@ -620,12 +798,39 @@ public sealed class SyncTests(SyncFixture sync) : IClassFixture<SyncFixture>
 
             Assert.True(await online.Patients.AnyAsync(p => p.Id == patient.Id));
 
+            // A failed automatic round must retry on its timer after internet recovery.
+            // This deliberately waits for the production scheduler rather than manually calling RunOnce.
+            sync.Network.Offline = true;
+            var pendingPatient = await CreatePatientAsync(desk, "Synthetic scheduled offline recovery");
+            // A previous test can leave an error in this shared fixture. Observe
+            // this worker's failed round before restoring the network; otherwise
+            // the wake request can run only after recovery and bypass the timer.
+            await LocalAsync(db => db.SyncStates.Where(s => s.Key == "push.lastError").ExecuteDeleteAsync());
+            worker.RequestRun();
+            var failed = false;
+            for (var i = 0; i < 100 && !failed; i++)
+            {
+                using var scope = services.CreateScope();
+                failed = await SyncWorker.GetStateAsync(scope.ServiceProvider.GetRequiredService<AppDbContext>(), "push.lastError", default) is not null;
+                if (!failed) await Task.Delay(100);
+            }
+            Assert.True(failed);
+            Assert.False(await online.Patients.AnyAsync(p => p.Id == pendingPatient.Id));
+            sync.Network.Offline = false;
+            var recovery = System.Diagnostics.Stopwatch.StartNew();
+            while (recovery.Elapsed < TimeSpan.FromSeconds(90) && !await online.Patients.AnyAsync(p => p.Id == pendingPatient.Id))
+                await Task.Delay(500);
+            Assert.True(await online.Patients.AnyAsync(p => p.Id == pendingPatient.Id));
+            Assert.True(recovery.Elapsed >= TimeSpan.FromSeconds(40));
+            Assert.Equal(1, await online.Patients.CountAsync(p => p.Id == pendingPatient.Id));
+
             // After the round it waits for the next one instead of failing.
             await Task.Delay(1000);
             Assert.False(worker.ExecuteTask!.IsCompleted, worker.ExecuteTask.Exception?.ToString());
         }
         finally
         {
+            sync.Network.Offline = false;
             await worker.StopAsync(CancellationToken.None);
         }
 

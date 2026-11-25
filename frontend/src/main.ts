@@ -10,6 +10,7 @@ import 'bootstrap/dist/css/bootstrap.rtl.min.css'
 import 'remixicon/fonts/remixicon.css'
 import '@/design/tokens.css'
 import '@/design/base.css'
+import '@/design/worklist.css'
 
 import App from './App.vue'
 import { setUnauthorizedHandler } from './api/http'

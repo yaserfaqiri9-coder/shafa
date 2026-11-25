@@ -17,7 +17,7 @@ namespace AlShifa.Tests;
 [Collection("api")]
 public sealed class FinalReadinessTests(ApiFixture api)
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } };
 
     private static string Name(string prefix) => $"{prefix}_{Guid.NewGuid():N}"[..20];
 
@@ -75,6 +75,9 @@ public sealed class FinalReadinessTests(ApiFixture api)
     private static async Task<List<VisitRow>> QueueAsync(HttpClient doctor) =>
         (await doctor.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=doctor", JsonOptions))!;
 
+    private static async Task<List<VisitRow>> SeenAsync(HttpClient doctor) =>
+        (await doctor.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=doctor&done=true", JsonOptions))!;
+
     private static SaveConsultationRequest Exam(int? version = null) =>
         new("یافته", null, null, null, [new DiagnosisInput(EyeSide.OD, "تشخیص")], version);
 
@@ -121,7 +124,9 @@ public sealed class FinalReadinessTests(ApiFixture api)
         var consult = await Read<ConsultationDto>(await taker.PutAsJsonAsync($"/api/consultations/{visit.Id}", Exam()));
         var claimed = await taker.GetFromJsonAsync<VisitRow>($"/api/visits/{visit.Id}", JsonOptions);
         Assert.Equal(takerStaff, claimed!.DoctorStaffId);
-        Assert.Contains(await QueueAsync(taker), v => v.Id == visit.Id);
+        // Seen once the exam is saved: on the taker's seen list, in nobody's queue.
+        Assert.Contains(await SeenAsync(taker), v => v.Id == visit.Id);
+        Assert.DoesNotContain(await QueueAsync(taker), v => v.Id == visit.Id);
         Assert.DoesNotContain(await QueueAsync(other), v => v.Id == visit.Id);
 
         var tests = await taker.GetFromJsonAsync<JsonElement>("/api/diagnostic-tests");
@@ -130,12 +135,14 @@ public sealed class FinalReadinessTests(ApiFixture api)
         await api.PayFeeAsync(await api.OrderFeeAsync(patient.FileNumber, order.TestName));
 
         // Waiting at refraction it is still this doctor's patient, and it returns to this doctor alone.
-        Assert.Contains(await QueueAsync(taker), v => v.Id == visit.Id && v.Status == nameof(VisitStatus.AwaitingDiagnostic));
+        Assert.Contains(await SeenAsync(taker), v => v.Id == visit.Id && v.Status == nameof(VisitStatus.AwaitingDiagnostic) && !v.ResultReady);
         await Read<RefractionDto>(await triage.PutAsJsonAsync($"/api/refractions/{visit.Id}", new SaveRefractionRequest("6/18", null, null, null, null, null, null, null, null, [], null)));
         Assert.Equal(HttpStatusCode.NoContent, (await triage.PostAsync($"/api/refractions/{visit.Id}/complete", null)).StatusCode);
 
-        Assert.Contains(await QueueAsync(taker), v => v.Id == visit.Id && v.Status == nameof(VisitStatus.ReadyForDoctor));
+        Assert.Contains(await SeenAsync(taker), v => v.Id == visit.Id && v.Status == nameof(VisitStatus.ReadyForDoctor) && v.ResultReady);
+        Assert.DoesNotContain(await QueueAsync(taker), v => v.Id == visit.Id);
         Assert.DoesNotContain(await QueueAsync(other), v => v.Id == visit.Id);
+        Assert.DoesNotContain(await SeenAsync(other), v => v.Id == visit.Id);
         Assert.Equal(consult.Id, (await taker.GetFromJsonAsync<ChartDto>($"/api/consultations/{visit.Id}/chart", JsonOptions))!.Consultation!.Id);
     }
 

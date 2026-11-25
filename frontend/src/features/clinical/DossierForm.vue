@@ -35,13 +35,13 @@ export interface RxLine {
 </script>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { askConfirm } from '@/components/confirm'
+import { computed, reactive } from 'vue'
 import ShamsiDateInput from '@/components/ShamsiDateInput.vue'
 import { formatDate, todayIso } from '@/utils/date'
 import DrugPicker from './DrugPicker.vue'
-import { patientName, type Patient } from '@/features/patients/types'
+import { patientAge, patientName, type Patient } from '@/features/patients/types'
 import { visitStatusLabels, visitStatusTones } from '@/features/visits/types'
-import { quantity } from '@/utils/money'
 import { commonDiagnoses, doseOptions, durationOptions, prescriptionFormOf, type DrugOption } from './doctorShortcuts'
 import {
   anteriorRows,
@@ -106,8 +106,21 @@ const fundusRows = [
   ...posteriorRows.filter((row) => !['Fundus', 'Dilatation', 'DilateTime', 'Method'].includes(row.code)).map((row) => ({ ...row, short: row.code })),
 ]
 
-/** A value written before the lists existed stays selectable, so opening a record never changes it. */
-const choices = (options: string[], current: string | undefined) => (current && !options.includes(current) ? [current, ...options] : options)
+/** A value written before the lists existed stays editable, so opening a record never changes it. */
+const manualChoice = '__manual__'
+const manualFields = reactive(new Set<string>())
+const choiceKey = (eye: string, code: string) => `${eye}:${code}`
+const isManualChoice = (options: string[], current: string | undefined, key: string) => manualFields.has(key) || (!!current && !options.includes(current))
+const choiceValue = (options: string[], current: string | undefined, key: string) => (isManualChoice(options, current, key) ? manualChoice : current ?? '')
+function setChoice(eye: EyeFindings, code: string, options: string[], key: string, value: string) {
+  if (value === manualChoice) {
+    manualFields.add(key)
+    return
+  }
+  manualFields.delete(key)
+  eye.values[code] = value
+}
+const choices = (options: string[]) => options
 
 const eyes = computed(() => [
   { code: 'OD' as const, findings: props.exam.od },
@@ -165,12 +178,12 @@ function toggleMethod(method: string) {
 }
 
 /** Writes the right eye's findings into the left. Asks first when that would replace something already chosen. */
-function copyOdToOs() {
+async function copyOdToOs() {
   const od = props.exam.od.values
   const os = props.exam.os.values
   const codes = [...slitRows, ...fundusRows, ...posteriorRows].map((row) => row.code).filter((code) => od[code]?.trim())
   const replaced = codes.filter((code) => os[code]?.trim() && os[code] !== od[code])
-  if (replaced.length && !window.confirm(`${replaced.length} یافته چشم چپ (OS) تغییر می‌کند. ادامه داده شود؟`)) return
+  if (replaced.length && !(await askConfirm(`${replaced.length} یافته چشم چپ (OS) تغییر می‌کند. ادامه داده شود؟`, { confirmLabel: 'ادامه' }))) return
   for (const code of codes) os[code] = od[code]
 }
 
@@ -222,7 +235,7 @@ const sides = computed(() => [
           <div class="id__line"><b>F/Name:</b> <span dir="auto">{{ patient?.fatherName }}</span></div>
           <div class="id__line id__row">
             <span><b>Sex:</b> M <i class="tick" :class="{ 'tick--on': gender === 'Male' }"></i> F <i class="tick" :class="{ 'tick--on': gender === 'Female' }"></i></span>
-            <span><b>Age:</b> <template v-if="patient?.ageYears != null">{{ quantity(patient.ageYears) }} <span dir="rtl">ساله</span></template></span>
+            <span><b>Age:</b> <span v-if="patient" dir="rtl">{{ patientAge(patient) }}</span></span>
             <span class="id__addr"><b>Add:</b> <span dir="auto">{{ patient?.address }}</span></span>
           </div>
           <div class="id__line"><b>Occupation:</b> <span dir="auto">{{ patient?.occupation }}</span></div>
@@ -306,9 +319,11 @@ const sides = computed(() => [
             <tr v-for="row in slitRows" :key="row.code">
               <th class="dark italic" :title="row.label">{{ row.short }}</th>
               <td v-for="eye in eyes" :key="eye.code">
-                <select v-model="eye.findings.values[row.code]" class="cell cell--pick" :disabled="!examEditable" :aria-label="`${row.label} ${eye.code}`">
+                <input v-if="isManualChoice(row.options, eye.findings.values[row.code], choiceKey(eye.code, row.code))" v-model="eye.findings.values[row.code]" class="cell cell--manual" dir="auto" maxlength="100" autocomplete="off" :disabled="!examEditable" :aria-label="`${row.label} ${eye.code} - مقدار دستی`" placeholder="" @click.stop @mousedown.stop />
+                <select v-else :value="choiceValue(row.options, eye.findings.values[row.code], choiceKey(eye.code, row.code))" class="cell cell--pick" :disabled="!examEditable" :aria-label="`${row.label} ${eye.code}`" @change="setChoice(eye.findings, row.code, row.options, choiceKey(eye.code, row.code), ($event.target as HTMLSelectElement).value)">
                   <option value=""></option>
-                  <option v-for="option in choices(row.options, eye.findings.values[row.code])" :key="option" :value="option">{{ option }}</option>
+                  <option v-for="option in choices(row.options)" :key="option" :value="option">{{ option }}</option>
+                  <option :value="manualChoice">سایر / تایپ دستی</option>
                 </select>
               </td>
             </tr>
@@ -357,7 +372,7 @@ const sides = computed(() => [
           </div>
           <div class="fundus__grid">
             <!-- Each fundus drawing is a button: a click opens the fundus choices, and the choice is written under it. -->
-            <label v-for="eye in eyes" :key="eye.code" class="eye" :class="[`eye--${eye.code.toLowerCase()}`, { 'eye--set': eye.findings.values.Fundus, 'eye--locked': !examEditable }]">
+            <div v-for="eye in eyes" :key="eye.code" class="eye" :class="[`eye--${eye.code.toLowerCase()}`, { 'eye--set': eye.findings.values.Fundus, 'eye--locked': !examEditable }]">
               <svg viewBox="0 0 230 110" aria-hidden="true">
                 <g fill="none" stroke="currentColor" stroke-width="1.2" :transform="eye.code === 'OS' ? 'translate(230 0) scale(-1 1)' : undefined">
                   <circle cx="55" cy="55" r="50" />
@@ -370,21 +385,27 @@ const sides = computed(() => [
               </svg>
               <span class="eye__code">{{ eye.code }}</span>
               <span class="eye__value">{{ eye.findings.values.Fundus || (examEditable ? 'برای انتخاب کلیک کنید' : '') }}</span>
-              <select v-model="eye.findings.values.Fundus" class="eye__select" :disabled="!examEditable" :aria-label="`فوندوس ${eye.code}`">
+              <input v-if="isManualChoice(fundusOptions, eye.findings.values.Fundus, choiceKey(eye.code, 'Fundus'))" v-model="eye.findings.values.Fundus" class="cell cell--manual eye__manual eye__manual--fundus" dir="auto" maxlength="100" autocomplete="off" :disabled="!examEditable" :aria-label="`فوندوس ${eye.code} - مقدار دستی`" placeholder="" @click.stop @mousedown.stop />
+              <select v-else :value="choiceValue(fundusOptions, eye.findings.values.Fundus, choiceKey(eye.code, 'Fundus'))" class="eye__select" :disabled="!examEditable" :aria-label="`فوندوس ${eye.code}`" @change="setChoice(eye.findings, 'Fundus', fundusOptions, choiceKey(eye.code, 'Fundus'), ($event.target as HTMLSelectElement).value)">
                 <option value=""></option>
-                <option v-for="option in choices(fundusOptions, eye.findings.values.Fundus)" :key="option" :value="option">{{ option }}</option>
+                <option v-for="option in choices(fundusOptions)" :key="option" :value="option">{{ option }}</option>
+                <option :value="manualChoice">سایر / تایپ دستی</option>
               </select>
-            </label>
+            </div>
             <table class="grid grid--entry fundus__table">
               <thead><tr><th class="dark"></th><th class="dark">OD</th><th class="dark">OS</th></tr></thead>
               <tbody>
                 <tr v-for="row in fundusRows" :key="row.code">
                   <th class="dark italic" :title="row.label">{{ row.short }}</th>
                   <td v-for="eye in eyes" :key="eye.code">
-                    <select v-if="row.options.length" v-model="eye.findings.values[row.code]" class="cell cell--pick" :disabled="!examEditable" :aria-label="`${row.label} ${eye.code}`">
+                    <template v-if="row.options.length">
+                    <input v-if="isManualChoice(row.options, eye.findings.values[row.code], choiceKey(eye.code, row.code))" v-model="eye.findings.values[row.code]" class="cell cell--manual" dir="auto" maxlength="100" autocomplete="off" :disabled="!examEditable" :aria-label="`${row.label} ${eye.code} - مقدار دستی`" placeholder="" @click.stop @mousedown.stop />
+                    <select v-else :value="choiceValue(row.options, eye.findings.values[row.code], choiceKey(eye.code, row.code))" class="cell cell--pick" :disabled="!examEditable" :aria-label="`${row.label} ${eye.code}`" @change="setChoice(eye.findings, row.code, row.options, choiceKey(eye.code, row.code), ($event.target as HTMLSelectElement).value)">
                       <option value=""></option>
-                      <option v-for="option in choices(row.options, eye.findings.values[row.code])" :key="option" :value="option">{{ option }}</option>
+                      <option v-for="option in choices(row.options)" :key="option" :value="option">{{ option }}</option>
+                      <option :value="manualChoice">سایر / تایپ دستی</option>
                     </select>
+                    </template>
                     <input v-else v-model="eye.findings.values[row.code]" class="cell" dir="auto" maxlength="100" autocomplete="off" :disabled="!examEditable" :aria-label="`${row.label} ${eye.code}`" />
                   </td>
                 </tr>
@@ -701,6 +722,12 @@ const sides = computed(() => [
   border-bottom: 1px dotted #555;
 }
 
+.cell--manual {
+  min-height: 28px;
+  border-bottom: 1px dotted #555;
+  background: #fffdf2;
+}
+
 .cell--drug {
   font-size: 15px;
   font-weight: 700;
@@ -820,6 +847,21 @@ const sides = computed(() => [
   height: 100%;
   opacity: 0;
   cursor: inherit;
+}
+
+.eye__manual {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  min-height: 28px;
+  background: #fffdf2;
+}
+
+.eye__manual--fundus {
+  position: absolute;
+  inset: 46% 4px auto;
+  width: calc(100% - 8px);
+  text-align: center;
 }
 
 .side {
@@ -998,8 +1040,8 @@ const sides = computed(() => [
 }
 
 .chip--on {
-  border-color: #1f2328;
-  background: #1f2328;
+  border-color: var(--xr-primary-strong);
+  background: var(--xr-primary-strong);
   color: #fff;
 }
 

@@ -5,8 +5,6 @@ defineProps<{ title: string; size?: 'lg' | 'xl' }>()
 const emit = defineEmits<{ close: [] }>()
 
 const panel = ref<HTMLElement | null>(null)
-const dirty = ref(false)
-const confirming = ref(false)
 const titleId = useId()
 
 const focusable = 'a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)'
@@ -16,15 +14,9 @@ function isSaving() {
   return !!panel.value?.querySelector('button[type="submit"]:disabled')
 }
 
-/** A dialog that moved on to a result or a warning has no edits left to lose. */
-function hasOpenForm() {
-  return !!panel.value?.querySelector('form input, form select, form textarea')
-}
-
 function requestClose() {
   if (isSaving()) return
-  if (dirty.value && hasOpenForm()) confirming.value = true
-  else emit('close')
+  emit('close')
 }
 
 function onClick(event: MouseEvent) {
@@ -35,8 +27,7 @@ function onClick(event: MouseEvent) {
 function onKeydown(event: KeyboardEvent) {
   if (event.key === 'Escape') {
     event.stopPropagation()
-    if (confirming.value) confirming.value = false
-    else requestClose()
+    requestClose()
     return
   }
   if (event.key !== 'Tab' || !panel.value) return
@@ -79,19 +70,12 @@ onBeforeUnmount(() => {
   <Teleport to="body">
     <div class="xr-modal" role="dialog" aria-modal="true" :aria-labelledby="titleId">
       <div class="xr-modal__backdrop" @click="requestClose"></div>
-      <div ref="panel" class="xr-modal__panel" :class="size && `xr-modal__panel--${size}`" tabindex="-1" @input="dirty = true" @change="dirty = true" @click="onClick">
+      <div ref="panel" class="xr-modal__panel" :class="size && `xr-modal__panel--${size}`" tabindex="-1" @click="onClick">
         <div class="xr-modal__header">
           <h2 :id="titleId" class="xr-modal__title">{{ title }}</h2>
           <button type="button" class="btn-close m-0" aria-label="بستن" @click="requestClose"></button>
         </div>
         <div class="xr-modal__body"><slot /></div>
-        <div v-if="confirming" class="xr-modal__confirm" role="alert">
-          <span>تغییرات ذخیره نشده‌اند. بدون ذخیره بسته شود؟</span>
-          <div class="d-flex gap-2">
-            <button type="button" class="btn btn-soft" @click="confirming = false">ادامه ویرایش</button>
-            <button type="button" class="btn btn-danger" @click="$emit('close')">بستن بدون ذخیره</button>
-          </div>
-        </div>
       </div>
     </div>
   </Teleport>

@@ -1,4 +1,6 @@
 using System.ComponentModel.DataAnnotations;
+using AlShifa.Api.Features.Clinical;
+using AlShifa.Api.Features.Inventory;
 using AlShifa.Api.Features.Auth;
 using AlShifa.Api.Features.Reports;
 using AlShifa.Api.Features.Visits;
@@ -12,13 +14,18 @@ public sealed record SaveServiceRequest([Required, MaxLength(150)] string Name, 
 
 public sealed record EditServiceRequest([Required, MaxLength(150)] string Name, bool IsActive);
 
-public sealed record ServiceRow(int Id, string Code, string Name, string? DepartmentName, bool IsActive, decimal? CurrentPrice);
+public sealed record ServiceRow(int Id, string Code, string Name, string? DepartmentName, bool IsActive, decimal? CurrentPrice, bool IsSurgical = false, bool HasDiagnosticTest = false);
 
 public sealed record CreateInvoiceRequest(long? PatientId, long? VisitId, [Required, MinLength(1)] InvoiceLineInput[] Items);
 
 public sealed record InvoiceLineInput(int ServiceId, [Range(0.001, 100000)] decimal Quantity);
 
-public sealed record DiscountRequest([Range(0.01, 100000000)] decimal Amount, [Required, MinLength(3), MaxLength(300)] string Reason, int Version);
+public enum DiscountMode { Amount, Percent }
+
+/// <summary>For percent discounts Amount is the percentage, otherwise it is Afghanis.</summary>
+public sealed record DiscountRequest([Range(0.01, 100000000)] decimal Amount, [Required, MinLength(3), MaxLength(300)] string Reason, int Version, DiscountMode Mode = DiscountMode.Amount);
+
+public sealed record SettlementDiscount([Range(0.01, 100000000)] decimal Amount, DiscountMode Mode);
 
 public sealed record VoidRequest([Required, MaxLength(300)] string Reason, int Version);
 
@@ -31,6 +38,9 @@ public sealed record CorrectExpenseRequest([Required, MaxLength(100)] string Cat
 /// <param name="InvoiceVersion">The version on the cashier's screen; a change since then means the amount was decided on old figures.</param>
 public sealed record PaymentRequest(long InvoiceId, [Range(0.01, 100000000)] decimal Amount, PaymentMethod Method, [MaxLength(100)] string? Reference, int? InvoiceVersion = null);
 
+/// <summary>Cashier settlement deliberately has no payment-method choice: it records the cash actually received after an optional authorised discount.</summary>
+public sealed record CashierSettlementRequest(long InvoiceId, [Range(0.01, 100000000)] decimal Amount, int InvoiceVersion, SettlementDiscount? Discount = null);
+
 public sealed record RefundRequest(long PaymentId, [Range(0.01, 100000000)] decimal Amount, [Required, MinLength(3), MaxLength(300)] string Reason);
 
 public sealed record OpenSessionRequest(int RegisterId, [Range(0, 100000000)] decimal OpeningAmount);
@@ -41,12 +51,13 @@ public sealed record CreateExpenseRequest([Required, MaxLength(100)] string Cate
 
 /// <param name="Description">What the first line charges for, so the cashier sees what the patient is paying for.</param>
 /// <param name="ItemCount">The lines on the invoice, counting that first one.</param>
-public sealed record InvoiceRow(long Id, string InvoiceNumber, long? PatientId, string? PatientFileNumber, string? PatientName, long? VisitId, string Status, decimal Total, decimal Discount, decimal Paid, decimal Refunded, decimal Balance, DateTime CreatedAt, int Version, string? Description, int ItemCount);
+public sealed record InvoiceRow(long Id, string InvoiceNumber, long? PatientId, string? PatientFileNumber, string? PatientName, long? VisitId, string Status, decimal Total, decimal Discount, decimal Paid, decimal Refunded, decimal Balance, DateTime CreatedAt, int Version, string? Description, int ItemCount, int? QueueNumber = null, string? Section = null);
 
 public sealed record InvoiceItemRow(long Id, string Description, decimal Quantity, decimal UnitPrice, decimal LineTotal, bool IsVoid, int? ServiceId = null);
 
 /// <param name="QueueNumber">The number a visit fee earned, for the cashier to give the patient. Null until the fee is settled, and on any other invoice.</param>
-public sealed record PaymentRow(long Id, string ReceiptNumber, long InvoiceId, string InvoiceNumber, decimal Amount, string Method, string? Reference, decimal Refunded, DateTime CreatedAt, string? ReceivedBy, int? QueueNumber);
+public sealed record PaymentRow(long Id, string ReceiptNumber, long InvoiceId, string InvoiceNumber, decimal Amount, string Method, string? Reference, decimal Refunded, DateTime CreatedAt, string? ReceivedBy, int? QueueNumber, QueueShift? QueueShift, int? QueueRound,
+    string? PatientName = null, string? Description = null, int ItemCount = 0, string? Section = null);
 
 public sealed record DiscountHistoryRow(string? Details, string? ByUser, DateTime CreatedAt);
 
@@ -82,7 +93,8 @@ public static class FinanceEndpoints
                 .OrderBy(s => s.Name)
                 .Select(s => new ServiceRow(
                     s.Id, s.Code, s.Name, s.Department != null ? s.Department.Name : null, s.IsActive,
-                    db.ServicePrices.Where(p => p.ServiceId == s.Id && p.EffectiveFrom <= now).OrderByDescending(p => p.EffectiveFrom).ThenByDescending(p => p.Id).Select(p => (decimal?)p.Price).FirstOrDefault()))
+                    db.ServicePrices.Where(p => p.ServiceId == s.Id && p.EffectiveFrom <= now).OrderByDescending(p => p.EffectiveFrom).ThenByDescending(p => p.Id).Select(p => (decimal?)p.Price).FirstOrDefault(),
+                    (s.Department != null && s.Department.Code == "surgery") || (db.SurgeryPackages.Any(p => p.ServiceId == s.Id) || db.OperationDefinitions.Any(o => o.ServiceId == s.Id)), db.DiagnosticTests.Any(t => t.ServiceId == s.Id)))
                 .ToListAsync(ct);
             return Results.Ok(rows);
         }).RequireAuthorization();
@@ -204,7 +216,11 @@ public static class FinanceEndpoints
             }
 
             var total = await query.CountAsync(ct);
-            var rows = await Project(query.OrderByDescending(i => i.Id).Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
+            // Newest first, like every other list; the Backend still picks the next patient for the cashier call.
+            var ordered = query.OrderByDescending(i => i.Id);
+            var rows = await Project(ordered.Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
+            var sections = await SectionsAsync(db, rows.Select(r => r.Id).ToList(), ct);
+            rows = rows.Select(r => r with { Section = sections.GetValueOrDefault(r.Id) }).ToList();
             return Results.Ok(new PagedResult<InvoiceRow>(rows, total, page, pageSize));
         }).RequirePermission("invoices.view");
 
@@ -298,9 +314,8 @@ public static class FinanceEndpoints
             return Results.NoContent();
         }).RequirePermission("invoices.approve");
 
-        group.MapPost("/{id:long}/discount", async (long id, DiscountRequest request, AppDbContext db, InvoiceService invoices, VisitFeeService visitFees, LedgerService ledger, AuditService audit, Outbox outbox, CancellationToken ct) =>
+        group.MapPost("/{id:long}/discount", async (long id, DiscountRequest request, AppDbContext db, InvoiceService invoices, VisitFeeService visitFees, LedgerService ledger, StockService stock, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>
         {
-            Money.EnsureCents(request.Amount);
             await using var tx = await db.BeginWorkflowTransactionAsync(ct);
             var fee = await visitFees.LockFeeOfInvoiceAsync(id, ct);
             var invoice = await invoices.LockAsync(id, ct);
@@ -314,29 +329,19 @@ public static class FinanceEndpoints
                 throw new AppException(StatusCodes.Status409Conflict, "invoice_void", "این فاکتور باطل شده است.");
             }
 
-            if (request.Amount > InvoiceService.Balance(invoice))
-            {
-                throw new AppException(StatusCodes.Status409Conflict, "discount_too_large", "تخفیف از مانده فاکتور بیشتر است.");
-            }
+            var amount = DiscountAmount(invoice, request.Amount, request.Mode);
 
             // A discount may lower the visit fee but never waive it.
-            if (invoice.Total - invoice.Discount - request.Amount <= 0 && fee is not null)
+            if (invoice.Total - invoice.Discount - amount <= 0 && fee is not null)
             {
                 throw new AppException(StatusCodes.Status409Conflict, "visit_fee_no_exemption", "فیس ویزیت معافیت ندارد. تخفیف نمی‌تواند تمام مبلغ را حذف کند.");
             }
 
-            invoice.Discount += request.Amount;
-            InvoiceService.UpdateStatus(invoice);
-            var audited = await db.AuditLogs.CountAsync(a => a.Action == "InvoiceDiscount" && a.EntityId == id.ToString(), ct);
-            audit.Add("InvoiceDiscount", "Invoice", id.ToString(), $"{request.Amount:F2}: {request.Reason}");
-            ledger.Post($"Discount{audited + 1}", "Invoice", id, request.Reason,
-                (Accounts.Discounts, request.Amount, 0),
-                (Accounts.Receivable, 0, request.Amount));
-            outbox.Add("InvoiceIssued", new { invoiceId = id }, Groups.Cashier, Groups.Finance, Groups.Reception);
-            await db.SaveChangesAsync(ct);
+            await ApplyDiscountAsync(invoice, amount, request.Amount, request.Mode, request.Reason, db, ledger, audit, outbox, ct);
 
             // A discount can finish a fee that was part paid at the cashier, and a settled fee earns its number.
             await visitFees.IssueNumberIfSettledAsync(fee, invoice, ct);
+            await OperationCatalog.ConsumePaidAsync(invoice, db, stock, ledger, user, audit, outbox, ct);
             await tx.CommitAsync(ct);
             return Results.NoContent();
         }).RequirePermission("invoices.approve");
@@ -420,6 +425,49 @@ public static class FinanceEndpoints
         && !await db.DiagnosticOrders.AnyAsync(o => o.InvoiceId == id, ct)
         && !await db.Sales.AnyAsync(s => s.InvoiceId == id, ct);
 
+    /// <summary>One invoice has one approved discount. The stored amount remains the accounting truth; the source mode/value are retained in its audit history.</summary>
+    public static decimal DiscountAmount(Invoice invoice, decimal enteredAmount, DiscountMode mode)
+    {
+        Money.EnsureCents(enteredAmount);
+        if (invoice.Status == InvoiceStatus.Void)
+        {
+            throw new AppException(StatusCodes.Status409Conflict, "invoice_void", "این فاکتور باطل شده است.");
+        }
+        if (invoice.Discount > 0)
+        {
+            throw new AppException(StatusCodes.Status409Conflict, "discount_already_applied", "برای این فاکتور قبلاً تخفیف ثبت شده است.");
+        }
+
+        var amount = mode switch
+        {
+            DiscountMode.Amount => enteredAmount,
+            DiscountMode.Percent when enteredAmount <= 100 => decimal.Round(invoice.Total * enteredAmount / 100, 2, MidpointRounding.AwayFromZero),
+            DiscountMode.Percent => throw new AppException(StatusCodes.Status400BadRequest, "invalid_discount_percent", "فیصدی تخفیف باید حداکثر ۱۰۰ باشد."),
+            _ => throw new AppException(StatusCodes.Status400BadRequest, "invalid_discount_mode", "نوع تخفیف معتبر نیست."),
+        };
+
+        if (amount <= 0 || amount > InvoiceService.Balance(invoice))
+        {
+            throw new AppException(StatusCodes.Status409Conflict, "discount_too_large", "تخفیف از مانده فاکتور بیشتر است.");
+        }
+        return amount;
+    }
+
+    public static async Task ApplyDiscountAsync(Invoice invoice, decimal calculatedAmount, decimal enteredAmount, DiscountMode mode, string reason, AppDbContext db, LedgerService ledger, AuditService audit, Outbox outbox, CancellationToken ct)
+    {
+        var cleanReason = reason.Trim();
+        invoice.Discount = calculatedAmount;
+        InvoiceService.UpdateStatus(invoice);
+        var audited = await db.AuditLogs.CountAsync(a => a.Action == "InvoiceDiscount" && a.EntityId == invoice.Id.ToString(), ct);
+        var entered = mode == DiscountMode.Percent ? $"{enteredAmount:F2}%" : $"{enteredAmount:F2} AFN";
+        audit.Add("InvoiceDiscount", "Invoice", invoice.Id.ToString(), $"{mode}: {entered} => {calculatedAmount:F2} AFN; {cleanReason}");
+        ledger.Post($"Discount{audited + 1}", "Invoice", invoice.Id, cleanReason,
+            (Accounts.Discounts, calculatedAmount, 0),
+            (Accounts.Receivable, 0, calculatedAmount));
+        outbox.Add("InvoiceIssued", new { invoiceId = invoice.Id }, Groups.Cashier, Groups.Finance, Groups.Reception, Groups.Lab, Groups.Surgery);
+        await db.SaveChangesAsync(ct);
+    }
+
     private static void MapPayments(IEndpointRouteBuilder app)
     {
         var group = app.MapGroup("/api/payments").WithTags("Finance");
@@ -445,6 +493,8 @@ public static class FinanceEndpoints
 
             var total = await query.CountAsync(ct);
             var rows = await QueryPayments(db, query.OrderByDescending(p => p.Id).Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
+            var sections = await SectionsAsync(db, rows.Select(r => r.InvoiceId).Distinct().ToList(), ct, withVoid: true);
+            rows = rows.Select(r => r with { Section = sections.GetValueOrDefault(r.InvoiceId) }).ToList();
             return Results.Ok(new PagedResult<PaymentRow>(rows, total, page, pageSize));
         }).RequirePermission("payments.view");
 
@@ -456,6 +506,39 @@ public static class FinanceEndpoints
                 await visitFees.IssueNumberIfSettledAsync(fee, await invoices.LockAsync(request.InvoiceId, ct), ct);
                 var row = await QueryPayments(db, db.Payments.Where(p => p.Id == payment.Id)).SingleAsync(ct);
                 return (StatusCodes.Status201Created, row);
+            }, ct)).RequirePermission("payments.create");
+
+        // Discount and cash receipt are one idempotent cashier action.  A stale screen cannot discount once and pay another amount later.
+        group.MapPost("/settle", async (CashierSettlementRequest request, AppDbContext db, Idempotency idempotency, InvoiceService invoices, VisitFeeService visitFees, LedgerService ledger, StockService stock, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>
+            await idempotency.RunAsync(request, async () =>
+            {
+                // RunAsync already owns the transaction that commits the discount, the payment and the idempotency record together.
+                var fee = await visitFees.LockFeeOfInvoiceAsync(request.InvoiceId, ct, forPayment: true);
+                var invoice = await invoices.LockAsync(request.InvoiceId, ct);
+                if (invoice.Version != request.InvoiceVersion)
+                {
+                    throw new DbUpdateConcurrencyException();
+                }
+
+                if (request.Discount is { } discount)
+                {
+                    var amount = DiscountAmount(invoice, discount.Amount, discount.Mode);
+                    if (invoice.Total - invoice.Discount - amount <= 0 && fee is not null)
+                    {
+                        throw new AppException(StatusCodes.Status409Conflict, "visit_fee_no_exemption", "فیس ویزیت معافیت ندارد. تخفیف نمی‌تواند تمام مبلغ را حذف کند.");
+                    }
+                    await ApplyDiscountAsync(invoice, amount, discount.Amount, discount.Mode, "تخفیف صندوق هنگام دریافت", db, ledger, audit, outbox, ct);
+                }
+
+                // ReceiveAsync owns the payment lock. Detach this earlier validation lock so EF does not track two
+                // instances of the same invoice while the transaction still protects the row in MySQL.
+                db.Entry(invoice).State = EntityState.Detached;
+                var payment = await invoices.ReceiveAsync(new PaymentRequest(request.InvoiceId, request.Amount, PaymentMethod.Cash, null), fullOnly: false, ct);
+                // ReceiveAsync keeps its locking invoice instance tracked. Reuse it instead of issuing a second
+                // FOR UPDATE query, which EF Core rejects as two instances with the same primary key.
+                var settledInvoice = db.ChangeTracker.Entries<Invoice>().Single(e => e.Entity.Id == request.InvoiceId).Entity;
+                await visitFees.IssueNumberIfSettledAsync(fee, settledInvoice, ct);
+                return (StatusCodes.Status201Created, await QueryPayments(db, db.Payments.Where(p => p.Id == payment.Id)).SingleAsync(ct));
             }, ct)).RequirePermission("payments.create");
 
         app.MapPost("/api/refunds", async (RefundRequest request, AppDbContext db, Idempotency idempotency, InvoiceService invoices, VisitFeeService visitFees, NumberService numbers, LedgerService ledger, CurrentUser user, AuditService audit, CancellationToken ct) =>
@@ -650,6 +733,8 @@ public static class FinanceEndpoints
             Permission.Require(http, "expenses.create");
             await using var tx = await db.BeginWorkflowTransactionAsync(ct);
             await CancelExpenseAsync(id, request.Version, request.Reason.Trim(), db, ledger, audit, ct);
+            if (await db.Expenses.AnyAsync(e => e.Id == id && e.StaffId != null, ct))
+                throw new AppException(409, "staff_expense", "پرداخت کارمند را لغو کنید و پرداخت درست را از پروفایل او ثبت کنید.");
             var replacement = await RecordExpenseAsync(request.Category, request.Description, request.Amount, request.ExpenseDate, db, numbers, ledger, user, audit, ct);
             audit.Add("ExpenseCorrected", "Expense", id.ToString(), $"{replacement.ExpenseNumber}: {request.Reason.Trim()}");
             await db.SaveChangesAsync(ct);
@@ -696,18 +781,60 @@ public static class FinanceEndpoints
         await db.SaveChangesAsync(ct);
     }
 
+    /// <summary>
+    /// The departments each invoice charges for, so the cashier sees what the money is for.
+    /// Same rules as the department revenue report: pharmacy and optical by revenue account, then the line's source, then the service's department.
+    /// </summary>
+    /// <param name="withVoid">For receipts: a line voided after payment, by a return or refund, still says what the money was for.</param>
+    private static async Task<Dictionary<long, string>> SectionsAsync(AppDbContext db, List<long> invoiceIds, CancellationToken ct, bool withVoid = false)
+    {
+        if (invoiceIds.Count == 0) return [];
+        var items = await (
+            from item in db.InvoiceItems.AsNoTracking()
+            where invoiceIds.Contains(item.InvoiceId) && (withVoid || !item.IsVoid)
+            join service in db.Services.AsNoTracking() on item.ServiceId equals (int?)service.Id into services
+            from service in services.DefaultIfEmpty()
+            join department in db.Departments.AsNoTracking() on service.DepartmentId equals (int?)department.Id into departments
+            from department in departments.DefaultIfEmpty()
+            join token in db.VisitTokens.AsNoTracking() on new { item.SourceType, item.SourceId } equals new { SourceType = (string?)nameof(VisitToken), SourceId = (long?)token.Id } into tokens
+            from token in tokens.DefaultIfEmpty()
+            join visit in db.Visits.AsNoTracking() on new { item.SourceType, item.SourceId } equals new { SourceType = (string?)nameof(Visit), SourceId = (long?)visit.Id } into visits
+            from visit in visits.DefaultIfEmpty()
+            join diagnostic in db.DiagnosticOrders.AsNoTracking() on new { item.SourceType, item.SourceId } equals new { SourceType = (string?)nameof(DiagnosticOrder), SourceId = (long?)diagnostic.Id } into diagnostics
+            from diagnostic in diagnostics.DefaultIfEmpty()
+            orderby item.Id
+            select new
+            {
+                item.InvoiceId,
+                Name = item.RevenueAccount == Accounts.PharmacyRevenue ? "دواخانه"
+                    : item.RevenueAccount == Accounts.OpticalRevenue ? "عینک"
+                    : item.SourceType == nameof(SurgeryCase) ? "عملیات"
+                    : diagnostic != null ? (diagnostic.Test!.Kind == DiagnosticKind.Lab ? "آزمایشگاه" : diagnostic.Test.Kind == DiagnosticKind.Refraction ? "رفرکشن" : "عکس‌برداری")
+                    : token != null ? token.Department!.Name
+                    : visit != null ? visit.Department!.Name
+                    : department.Name,
+            }).ToListAsync(ct);
+        return items.Where(i => !string.IsNullOrWhiteSpace(i.Name)).GroupBy(i => i.InvoiceId)
+            .ToDictionary(g => g.Key, g => string.Join("، ", g.Select(i => i.Name).Distinct()));
+    }
+
     private static IQueryable<InvoiceRow> Project(IQueryable<Invoice> invoices) => invoices.Select(i => new InvoiceRow(
         i.Id, i.InvoiceNumber, i.PatientId, i.Patient != null ? i.Patient.FileNumber : null,
         i.Patient != null ? (i.Patient.FirstName + " " + (i.Patient.LastName ?? "")).Trim() : null,
         i.VisitId, i.Status.ToString(), i.Total, i.Discount, i.Paid, i.Refunded, i.Status == InvoiceStatus.Void ? 0 : i.Total - i.Discount - i.Paid, i.CreatedAt, i.Version,
         i.Items.Where(x => !x.IsVoid).OrderBy(x => x.Id).Select(x => x.Description).FirstOrDefault(),
-        i.Items.Count(x => !x.IsVoid)));
+        i.Items.Count(x => !x.IsVoid), i.Visit != null ? i.Visit.QueueNumber : null));
 
     private static IQueryable<PaymentRow> QueryPayments(AppDbContext db, IQueryable<Payment> payments) =>
         from p in payments
         join u in db.Users on p.ReceivedByUserId equals u.Id
         select new PaymentRow(p.Id, p.ReceiptNumber, p.InvoiceId, p.Invoice!.InvoiceNumber, p.Amount, p.Method.ToString(), p.Reference, p.Refunded, p.CreatedAt, u.FullName,
-            db.VisitTokens.Where(t => t.InvoiceId == p.InvoiceId).Select(t => t.QueueNumber).FirstOrDefault());
+            db.VisitTokens.Where(t => t.InvoiceId == p.InvoiceId).Select(t => t.QueueNumber).FirstOrDefault(),
+            db.VisitTokens.Where(t => t.InvoiceId == p.InvoiceId).Select(t => (QueueShift?)t.QueueShift).FirstOrDefault(),
+            db.VisitTokens.Where(t => t.InvoiceId == p.InvoiceId).Select(t => (int?)t.QueueRound).FirstOrDefault(),
+            p.Invoice.Patient != null ? (p.Invoice.Patient.FirstName + " " + (p.Invoice.Patient.LastName ?? "")).Trim() : null,
+            p.Invoice.Items.OrderBy(x => x.Id).Select(x => x.Description).FirstOrDefault(),
+            p.Invoice.Items.Count());
 
     internal static IQueryable<SessionRow> QuerySessions(AppDbContext db, IQueryable<CashSession> sessions) =>
         from s in sessions

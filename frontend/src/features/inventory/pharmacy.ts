@@ -1,6 +1,7 @@
 /** Shapes of /api/pharmacy: a prescription as the pharmacy sees it, with its bills and the patient's decisions. */
 
 export interface PharmacyRxRow {
+  queueNumber?: number | null
   id: number
   rxNumber: string
   patientId: number
@@ -79,6 +80,7 @@ export interface PharmacyRxDetail {
 }
 
 export interface PharmacyQueueBill {
+  queueNumber?: number | null
   saleId: number
   saleNumber: string
   prescriptionId: number | null

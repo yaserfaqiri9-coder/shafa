@@ -7,19 +7,19 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AlShifa.Api.Features.Visits;
 
-public sealed record CreateVisitTokenRequest(int DepartmentId, long? DoctorStaffId);
+public sealed record CreateVisitTokenRequest(int DepartmentId, long? DoctorStaffId, [property: Required, Range(1, 100)] int? QueueNumber = null);
 
 public sealed record CancelTokenRequest(int Version);
 
 public sealed record VisitTokenRow(
-    long Id, int? QueueNumber, DateOnly TokenDate, int DepartmentId, string DepartmentName, long? DoctorStaffId, string? DoctorName,
+    long Id, int? QueueNumber, DateOnly TokenDate, QueueShift QueueShift, int QueueRound, int DepartmentId, string DepartmentName, long? DoctorStaffId, string? DoctorName,
     long InvoiceId, string InvoiceNumber, decimal Total, decimal Discount, decimal Balance, int InvoiceVersion, bool Paid, int Version);
 
-public sealed record CreateAdmissionRequest(long PatientId, int DepartmentId, long? DoctorStaffId, [MaxLength(300)] string? Reason, int? ServiceId = null);
+public sealed record CreateAdmissionRequest(long PatientId, int DepartmentId, long? DoctorStaffId, [MaxLength(300)] string? Reason, int? ServiceId = null, [property: Required, Range(1, 100)] int? QueueNumber = null);
 
 /// <summary>One visit at the desk: who, where it stands, what is owed and the number it earned.</summary>
 public sealed record AdmissionRow(
-    long VisitId, string VisitNumber, int? QueueNumber, long PatientId, string PatientFileNumber, string PatientName,
+    long VisitId, string VisitNumber, int? QueueNumber, QueueShift QueueShift, int QueueRound, long PatientId, string PatientFileNumber, string PatientName,
     string DepartmentName, string? DoctorName, string Status, DateOnly VisitDate, long InvoiceId, string InvoiceNumber,
     decimal Total, decimal Discount, decimal Balance, int InvoiceVersion, bool Paid, string? ReceiptNumber);
 
@@ -30,9 +30,9 @@ public sealed record LockedFee(VisitToken Token, Visit? Visit);
 /// Admission reserves a number; settlement activates the visit without replacing it. Legacy tokens and recovery
 /// can still issue a missing number when settling the fee. Lock order: visit, token, invoice.
 /// </summary>
-public sealed class VisitFeeService(AppDbContext db, DbContextOptions<AppDbContext> options, NumberService numbers, InvoiceService invoices, CurrentUser user, AuditService audit, Outbox outbox)
+public sealed class VisitFeeService(AppDbContext db, DbContextOptions<AppDbContext> options, QueueNumberService queueNumbers, InvoiceService invoices, CurrentUser user, AuditService audit, Outbox outbox)
 {
-    public async Task<VisitToken> CreateTokenAsync(int departmentId, long? doctorStaffId, long? patientId, CancellationToken ct, long? visitId = null)
+    public async Task<VisitToken> CreateTokenAsync(int departmentId, long? doctorStaffId, long? patientId, CancellationToken ct, long? visitId = null, int? queueNumber = null)
     {
         if (!await db.Departments.AnyAsync(d => d.Id == departmentId && d.IsActive, ct))
         {
@@ -44,12 +44,16 @@ public sealed class VisitFeeService(AppDbContext db, DbContextOptions<AppDbConte
             throw new AppException(StatusCodes.Status400BadRequest, "unknown_doctor", "داکتر انتخاب‌شده معتبر نیست.");
         }
 
+        var shift = QueueShifts.Current;
+        var card = visitId is null ? await queueNumbers.ReserveAsync(KabulClock.Today, shift, queueNumber, ct) : (int?)null;
         var service = await VisitFeeServiceAsync(db, ct);
         var price = await VisitFeePriceAsync(db, service, ct);
         var invoice = await invoices.CreateAsync(patientId, visitId, ct);
         var token = new VisitToken
         {
             TokenDate = KabulClock.Today,
+            QueueNumber = card,
+            QueueShift = shift,
             DepartmentId = departmentId,
             DoctorStaffId = doctorStaffId,
             InvoiceId = invoice.Id,
@@ -106,7 +110,7 @@ public sealed class VisitFeeService(AppDbContext db, DbContextOptions<AppDbConte
     }
 
     /// <summary>Reserve a missing number on an older admission without collecting money or activating clinical work.</summary>
-    public async Task<AdmissionRow> ReserveNumberAsync(long visitId, CancellationToken ct)
+    public async Task<AdmissionRow> ReserveNumberAsync(long visitId, CancellationToken ct, int? queueNumber = null)
     {
         var (fee, invoice) = await LockVisitFeeAsync(visitId, ct);
         var visit = fee.Visit!;
@@ -116,10 +120,27 @@ public sealed class VisitFeeService(AppDbContext db, DbContextOptions<AppDbConte
         }
         if (fee.Token.QueueNumber is null)
         {
-            fee.Token.QueueNumber = visit.QueueNumber ?? (int)await numbers.NextAsync(VisitService.QueueNumberScope, visit.VisitDate.ToString("yyyyMMdd"), ct);
+            var shift = visit.QueueNumber is null ? QueueShifts.Current : visit.QueueShift;
+            if (visit.QueueNumber is { } existingNumber)
+            {
+                fee.Token.QueueNumber = existingNumber;
+                fee.Token.QueueRound = visit.QueueRound;
+            }
+            else
+            {
+                fee.Token.QueueNumber = await queueNumbers.ReserveAsync(visit.VisitDate, shift, queueNumber, ct);
+                fee.Token.QueueRound = 1;
+            }
+            fee.Token.QueueShift = visit.QueueShift = shift;
             audit.Add("QueueNumberIssued", "VisitToken", fee.Token.Id.ToString(), fee.Token.QueueNumber.ToString());
         }
+        else
+        {
+            fee.Token.QueueShift = visit.QueueShift;
+        }
         visit.QueueNumber = fee.Token.QueueNumber;
+        visit.QueueRound = fee.Token.QueueRound;
+        if (InvoiceService.IsSettled(invoice)) await IssueNumberIfSettledAsync(fee, invoice, ct);
         await db.SaveChangesAsync(ct);
         return await LoadLockedAdmissionAsync(fee, invoice, ct);
     }
@@ -134,15 +155,19 @@ public sealed class VisitFeeService(AppDbContext db, DbContextOptions<AppDbConte
         var (token, visit) = fee;
         if (token.QueueNumber is null)
         {
-            var today = KabulClock.Today;
-            token.QueueNumber = (int)await numbers.NextAsync(VisitService.QueueNumberScope, today.ToString("yyyyMMdd"), ct);
-            token.TokenDate = today;
-            audit.Add("QueueNumberIssued", "VisitToken", token.Id.ToString(), token.QueueNumber.ToString());
+            // Payment must never invent or replace the physical card number.
+            if (visit?.QueueNumber is { } existing) {
+                token.QueueNumber = existing;
+                token.QueueShift = visit.QueueShift;
+                token.QueueRound = visit.QueueRound;
+            } else throw new AppException(StatusCodes.Status409Conflict, "queue_number_required", "پذیرش باید ابتدا شماره کارت فیزیکی این مراجعه را ثبت کند.");
         }
 
         if (visit is { Status: VisitStatus.AwaitingPayment })
         {
             visit.QueueNumber = token.QueueNumber;
+            visit.QueueShift = token.QueueShift;
+            visit.QueueRound = token.QueueRound;
             db.VisitStatusHistory.Add(new VisitStatusHistory { VisitId = visit.Id, FromStatus = visit.Status, ToStatus = VisitStatus.Waiting, ChangedByUserId = user.Id });
             visit.Status = VisitStatus.Waiting;
             audit.Add("VisitStatusChanged", "Visit", visit.Id.ToString(), nameof(VisitStatus.Waiting));
@@ -204,7 +229,7 @@ public sealed class VisitFeeService(AppDbContext db, DbContextOptions<AppDbConte
         from v in visits
         join t in db.VisitTokens on v.Id equals t.VisitId
         select new AdmissionRow(
-            v.Id, v.VisitNumber, v.QueueNumber, v.PatientId, v.Patient!.FileNumber, (v.Patient.FirstName + " " + (v.Patient.LastName ?? "")).Trim(),
+            v.Id, v.VisitNumber, v.QueueNumber, v.QueueShift, v.QueueRound, v.PatientId, v.Patient!.FileNumber, (v.Patient.FirstName + " " + (v.Patient.LastName ?? "")).Trim(),
             v.Department!.Name, v.Doctor != null ? v.Doctor.FullName : null, v.Status.ToString(), v.VisitDate, t.InvoiceId, t.Invoice!.InvoiceNumber,
             t.Invoice.Total, t.Invoice.Discount, t.Invoice.Total - t.Invoice.Discount - t.Invoice.Paid, t.Invoice.Version,
             t.Invoice.Status != InvoiceStatus.Void && t.Invoice.Total - t.Invoice.Discount <= t.Invoice.Paid - t.Invoice.Refunded,
@@ -300,10 +325,10 @@ public static class ReceptionFeeEndpoints
             return Results.Ok(row);
         }).RequirePermission("visitfees.create");
 
-        admissions.MapPost("/{visitId:long}/reserve-number", async (long visitId, AppDbContext db, VisitFeeService visitFees, CancellationToken ct) =>
+        admissions.MapPost("/{visitId:long}/reserve-number", async (long visitId, AssignQueueNumberRequest request, AppDbContext db, VisitFeeService visitFees, CancellationToken ct) =>
         {
             await using var tx = await db.BeginWorkflowTransactionAsync(ct);
-            var row = await visitFees.ReserveNumberAsync(visitId, ct);
+            var row = await visitFees.ReserveNumberAsync(visitId, ct, request.QueueNumber);
             await tx.CommitAsync(ct);
             return Results.Ok(row);
         }).RequirePermission("visitfees.create").RequirePermission("visits.print");
@@ -335,7 +360,7 @@ public static class ReceptionFeeEndpoints
         tokens.MapPost("/", async (CreateVisitTokenRequest request, AppDbContext db, Idempotency idempotency, VisitFeeService visitFees, CancellationToken ct) =>
             await idempotency.RunAsync(request, async () =>
             {
-                var token = await visitFees.CreateTokenAsync(request.DepartmentId, request.DoctorStaffId, null, ct);
+                var token = await visitFees.CreateTokenAsync(request.DepartmentId, request.DoctorStaffId, null, ct, queueNumber: request.QueueNumber);
                 return (StatusCodes.Status201Created, await Rows(db.VisitTokens.AsNoTracking().Where(t => t.Id == token.Id)).SingleAsync(ct));
             }, ct)).RequirePermission("visitfees.create");
 
@@ -364,7 +389,7 @@ public static class ReceptionFeeEndpoints
     }
 
     private static IQueryable<VisitTokenRow> Rows(IQueryable<VisitToken> tokens) => tokens.Select(t => new VisitTokenRow(
-        t.Id, t.QueueNumber, t.TokenDate, t.DepartmentId, t.Department!.Name, t.DoctorStaffId, t.Doctor != null ? t.Doctor.FullName : null,
+        t.Id, t.QueueNumber, t.TokenDate, t.QueueShift, t.QueueRound, t.DepartmentId, t.Department!.Name, t.DoctorStaffId, t.Doctor != null ? t.Doctor.FullName : null,
         t.InvoiceId, t.Invoice!.InvoiceNumber, t.Invoice.Total, t.Invoice.Discount, t.Invoice.Total - t.Invoice.Discount - t.Invoice.Paid, t.Invoice.Version,
         t.Invoice.Status != InvoiceStatus.Void && t.Invoice.Total - t.Invoice.Discount <= t.Invoice.Paid - t.Invoice.Refunded, t.Version));
 }

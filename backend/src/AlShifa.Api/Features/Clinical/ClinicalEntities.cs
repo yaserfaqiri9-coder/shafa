@@ -499,6 +499,9 @@ public class SurgeryCase
 
     public SurgeryPackage? Package { get; set; }
 
+    public int? OperationDefinitionId { get; set; }
+    public OperationDefinition? OperationDefinition { get; set; }
+
     /// <summary>Set once the supplies used have left stock. Recorded only once; a mistake is reversed from the stock page.</summary>
     public DateTime? SuppliesRecordedAt { get; set; }
 

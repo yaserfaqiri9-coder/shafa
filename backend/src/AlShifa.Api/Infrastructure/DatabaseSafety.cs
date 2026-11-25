@@ -10,6 +10,20 @@ namespace AlShifa.Api.Infrastructure;
 /// </summary>
 public static partial class DatabaseSafety
 {
+    /// <summary>
+    /// When MySQL is down or restarting, a request waits at most a few seconds for a connection and then reports the outage,
+    /// instead of leaving every screen spinning. The pool stays below the server's max_connections (100), so backups,
+    /// maintenance and the updater can always still connect. Values set explicitly in the connection string are kept.
+    /// </summary>
+    public static string WithBoundedWaits(string connectionString)
+    {
+        var builder = new MySqlConnectionStringBuilder(connectionString);
+        var defaults = new MySqlConnectionStringBuilder();
+        if (builder.ConnectionTimeout == defaults.ConnectionTimeout) builder.ConnectionTimeout = 10;
+        if (builder.MaximumPoolSize == defaults.MaximumPoolSize) builder.MaximumPoolSize = 80;
+        return builder.ConnectionString;
+    }
+
     /// <summary>Passed by update.ps1 once its backup has been made and verified.</summary>
     public const string BackupTakenFlag = "--backup-taken";
 

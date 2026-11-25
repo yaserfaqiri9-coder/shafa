@@ -19,6 +19,7 @@ const form = reactive({
   gender: 'Male',
   birthDate: null as string | null,
   estimatedAge: null as number | null,
+  estimatedAgeMonths: null as number | null,
   phone: '',
   address: '',
   occupation: '',
@@ -35,7 +36,12 @@ const today = todayIso()
 async function save(confirmNotDuplicate = false) {
   saving.value = true
   error.value = ''
-  const body = { ...form, estimatedAge: form.birthDate ? null : form.estimatedAge || null, confirmNotDuplicate }
+  const body = {
+    ...form,
+    estimatedAge: form.birthDate ? null : Number.isInteger(form.estimatedAge) ? form.estimatedAge : null,
+    estimatedAgeMonths: form.birthDate || !Number.isInteger(form.estimatedAgeMonths) ? null : form.estimatedAgeMonths,
+    confirmNotDuplicate,
+  }
   try {
     const saved = await api<Patient>('/patients', { method: 'POST', body, idempotencyKey: confirmNotDuplicate ? confirmKey : key })
     emit('chosen', saved.id)
@@ -86,8 +92,13 @@ async function save(confirmNotDuplicate = false) {
           </select>
         </div>
         <div class="col-md-4 col-sm-6">
-          <label class="form-label" for="q-age">سن تخمینی</label>
+          <label class="form-label" for="q-age">سن تخمینی (سال)</label>
           <input id="q-age" v-model.number="form.estimatedAge" class="form-control" type="number" min="0" max="130" :disabled="!!form.birthDate" />
+        </div>
+        <div class="col-md-4 col-sm-6">
+          <label class="form-label" for="q-age-months">ماه (برای نوزاد)</label>
+          <input id="q-age-months" v-model.number="form.estimatedAgeMonths" class="form-control" type="number" min="0" max="11" :disabled="!!form.birthDate" />
+          <small class="text-muted">برای نوزاد ۵ ماهه، سال را صفر و ماه را ۵ وارد کنید.</small>
         </div>
         <div class="col-md-4 col-sm-6">
           <ShamsiDateInput v-model="form.birthDate" label="یا تاریخ تولد" :max="today" />

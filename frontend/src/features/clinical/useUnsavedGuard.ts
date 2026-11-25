@@ -1,3 +1,4 @@
+import { askConfirm } from '@/components/confirm'
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 
@@ -36,7 +37,7 @@ export function useUnsavedGuard(source: object) {
   })
   onBeforeUnmount(() => window.removeEventListener('beforeunload', warnOnClose))
 
-  onBeforeRouteLeave(() => !dirty.value || window.confirm('تغییرات ذخیره نشده‌اند. از این صفحه خارج شوید؟'))
+  onBeforeRouteLeave(async () => !dirty.value || await askConfirm('تغییرات ذخیره نشده‌اند. از این صفحه خارج شوید؟', { title: 'تغییرات ذخیره نشده', confirmLabel: 'خروج بدون ذخیره', danger: true }))
 
   return { dirty, markSaved, applying }
 }

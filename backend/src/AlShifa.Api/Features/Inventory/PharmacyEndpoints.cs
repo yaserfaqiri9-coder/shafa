@@ -4,6 +4,7 @@ using AlShifa.Api.Features.Auth;
 using AlShifa.Api.Features.Clinical;
 using AlShifa.Api.Features.Finance;
 using AlShifa.Api.Features.Patients;
+using AlShifa.Api.Features.Visits;
 using AlShifa.Api.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 
@@ -14,7 +15,7 @@ public sealed record PharmacyPatientHit(long Id, string FileNumber, string Name,
 public sealed record PharmacyPatient(long Id, string FileNumber, string Name, string? FatherName, string? Phone, string Gender, int? Age);
 
 /// <param name="Stage">Where the prescription stands at the pharmacy, read from its decision, bills and deliveries.</param>
-public sealed record PharmacyRxRow(long Id, string RxNumber, long PatientId, string PatientName, string? FatherName, string FileNumber, string? DoctorName, long VisitId, DateTime CreatedAt, DateOnly? ValidUntil, string Status, string PharmacyStatus, string Stage, int Version);
+public sealed record PharmacyRxRow(long Id, string RxNumber, long PatientId, string PatientName, string? FatherName, string FileNumber, string? DoctorName, long VisitId, DateTime CreatedAt, DateOnly? ValidUntil, string Status, string PharmacyStatus, string Stage, int Version, int? QueueNumber = null);
 
 /// <param name="Stock">Available, Short (less than remaining), Out (none usable), NotStocked (no product of that exact name).</param>
 public sealed record PharmacyRxItem(long Id, string DrugName, string? Dose, string? Route, string? Duration, string? Instructions,
@@ -27,7 +28,7 @@ public sealed record PharmacyRxEvent(string Status, string? Note, string? UserNa
 
 public sealed record PharmacyRxDetail(PharmacyRxRow Prescription, string? Notes, bool Expired, PharmacyPatient Patient, IReadOnlyList<PharmacyRxItem> Items, IReadOnlyList<PharmacyBill> Bills, IReadOnlyList<PharmacyRxEvent> Events);
 
-public sealed record PharmacyQueueBill(long SaleId, string SaleNumber, long? PrescriptionId, string? RxNumber, long? PatientId, string? PatientName, string? FileNumber, string InvoiceNumber, decimal Total, decimal Balance, DateTime CreatedAt, bool ReservationExpired, int Version);
+public sealed record PharmacyQueueBill(long SaleId, string SaleNumber, long? PrescriptionId, string? RxNumber, long? PatientId, string? PatientName, string? FileNumber, string InvoiceNumber, decimal Total, decimal Balance, DateTime CreatedAt, bool ReservationExpired, int Version, int? QueueNumber = null);
 
 public sealed record PharmacyQueues(IReadOnlyList<PharmacyRxRow> New, IReadOnlyList<PharmacyQueueBill> AwaitingPayment, IReadOnlyList<PharmacyQueueBill> ReadyToDeliver, IReadOnlyList<PharmacyRxRow> Partial, IReadOnlyList<PharmacyRxRow> NeedsDoctor);
 
@@ -158,7 +159,7 @@ public static class PharmacyEndpoints
                 .Where(p => p.CreatedAt >= since && p.Status == PrescriptionStatus.Issued
                     && (p.PharmacyStatus == PharmacyRxStatus.AwaitingVisit || p.PharmacyStatus == PharmacyRxStatus.AwaitingDecision)
                     && !db.Sales.Any(s => s.PrescriptionId == p.Id && !s.IsReturned && s.DeliveredAt == null))
-                .OrderByDescending(p => p.Id).Take(100), ct);
+                .OrderBy(p => p.Visit!.QueueNumber == null).ThenBy(p => p.Visit!.QueueShift == QueueShift.Afternoon).ThenBy(p => p.Visit!.QueueNumber).ThenBy(p => p.Id).Take(100), ct);
             // A partly handed-over prescription whose rest the patient buys outside or leaves for now has left the pharmacy's work list.
             // A new bill for it sets the decision back to AwaitingDecision, so it returns here on its own.
             var partial = await RowsAsync(db, open.Where(p => p.Status == PrescriptionStatus.PartiallyDispensed
@@ -173,7 +174,7 @@ public static class PharmacyEndpoints
                 {
                     Row = new PharmacyQueueBill(s.Id, s.SaleNumber, s.PrescriptionId, s.Prescription != null ? s.Prescription.RxNumber : null, s.PatientId,
                         s.Patient != null ? (s.Patient.FirstName + " " + (s.Patient.LastName ?? "")).Trim() : null, s.Patient != null ? s.Patient.FileNumber : null,
-                        s.Invoice!.InvoiceNumber, s.Invoice.Total - s.Invoice.Discount, s.Invoice.Total - s.Invoice.Discount - s.Invoice.Paid, s.CreatedAt, s.CreatedAt < cutoff, s.Version),
+                        s.Invoice!.InvoiceNumber, s.Invoice.Total - s.Invoice.Discount, s.Invoice.Total - s.Invoice.Discount - s.Invoice.Paid, s.CreatedAt, s.CreatedAt < cutoff, s.Version, s.Invoice.Visit != null ? s.Invoice.Visit.QueueNumber : null),
                     Paid = s.Invoice.Status != InvoiceStatus.Void && s.Invoice.Total - s.Invoice.Discount <= s.Invoice.Paid - s.Invoice.Refunded,
                 })
                 .Take(300)
@@ -244,7 +245,7 @@ public static class PharmacyEndpoints
             .Select(p => new
             {
                 p.Id, p.RxNumber, p.PatientId, p.Patient!.FirstName, p.Patient.LastName, p.Patient.FatherName, p.Patient.FileNumber, p.VisitId, p.CreatedAt, p.ValidUntil,
-                p.Status, p.PharmacyStatus, p.Version,
+                p.Status, p.PharmacyStatus, p.Version, p.Visit!.QueueNumber,
                 Doctor = db.Users.Where(u => u.Id == p.DoctorUserId).Select(u => u.FullName).FirstOrDefault(),
                 Unpaid = db.Sales.Any(s => s.PrescriptionId == p.Id && !s.IsReturned && s.DeliveredAt == null && !(s.Invoice!.Status != InvoiceStatus.Void && s.Invoice.Total - s.Invoice.Discount <= s.Invoice.Paid - s.Invoice.Refunded)),
                 Ready = db.Sales.Any(s => s.PrescriptionId == p.Id && !s.IsReturned && s.DeliveredAt == null && s.Invoice!.Status != InvoiceStatus.Void && s.Invoice.Total - s.Invoice.Discount <= s.Invoice.Paid - s.Invoice.Refunded),
@@ -252,7 +253,7 @@ public static class PharmacyEndpoints
             .ToListAsync(ct);
 
         return rows.Select(r => new PharmacyRxRow(r.Id, r.RxNumber, r.PatientId, $"{r.FirstName} {r.LastName}".Trim(), r.FatherName, r.FileNumber, r.Doctor, r.VisitId, r.CreatedAt, r.ValidUntil,
-            r.Status.ToString(), r.PharmacyStatus.ToString(), Stage(r.Status, r.PharmacyStatus, r.Unpaid, r.Ready, r.ValidUntil), r.Version)).ToList();
+            r.Status.ToString(), r.PharmacyStatus.ToString(), Stage(r.Status, r.PharmacyStatus, r.Unpaid, r.Ready, r.ValidUntil), r.Version, r.QueueNumber)).ToList();
     }
 
     /// <summary>One label for the list. The data behind it stays separate: clinical status, decision, bills and deliveries.</summary>

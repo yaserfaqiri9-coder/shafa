@@ -2,7 +2,8 @@
 param(
     [string]$Root = 'C:\AlShifa',
     # Without it, the local address this installation was given is read from its settings. The installer may have chosen another port.
-    [string]$HealthUrl
+    [string]$HealthUrl,
+    [switch]$Maintenance
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,6 +32,16 @@ try {
     Report 'API and database' $false "$_"
 }
 
+try {
+    . (Join-Path $PSScriptRoot 'common.ps1')
+    . (Join-Path $PSScriptRoot 'db-integrity.ps1')
+    $ErrorActionPreference = 'Stop'
+    $integrity = @(Test-AlShifaDatabaseIntegrity $Root)
+    Report 'Database integrity' ($integrity.Count -eq 0) $(if ($integrity.Count) { ($integrity | Select-Object -First 3) -join ' | ' } else { 'no corruption in the MySQL log, recovery mode off' })
+} catch {
+    Report 'Database integrity' $false "$_"
+}
+
 $drive = Get-PSDrive ([IO.Path]::GetPathRoot($Root).Substring(0, 1))
 $freeGb = [Math]::Round($drive.Free / 1GB, 1)
 Report 'Disk space' ($freeGb -ge 10) "$freeGb GB free"
@@ -57,7 +68,7 @@ try {
 }
 
 $appConfig = Get-Content (Join-Path $Root 'app\appsettings.Production.json') -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
-if ($appConfig.LanAccess.Mode -eq 'PublicDns01') {
+if ($appConfig.LanAccess.Mode -eq 'PublicDns01' -and -not $Maintenance) {
     try {
         & (Join-Path $PSScriptRoot 'test-lan-access.ps1') -Root $Root
         Report 'Trusted LAN' $true $appConfig.LanAccess.Url

@@ -1,5 +1,6 @@
 using AlShifa.Api.Features.Clinical;
 using AlShifa.Api.Features.Calls;
+using AlShifa.Api.Features.Chat;
 using AlShifa.Api.Features.Finance;
 using AlShifa.Api.Features.Inventory;
 using AlShifa.Api.Features.Patients;
@@ -24,9 +25,16 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
 
     public DbSet<Department> Departments => Set<Department>();
     public DbSet<Staff> Staff => Set<Staff>();
+    public DbSet<StaffSalaryTerm> StaffSalaryTerms => Set<StaffSalaryTerm>();
+    public DbSet<OperationDefinition> OperationDefinitions => Set<OperationDefinition>();
+    public DbSet<OperationPackage> OperationPackages => Set<OperationPackage>();
+    public DbSet<SurgerySupplyPlan> SurgerySupplyPlans => Set<SurgerySupplyPlan>();
     public DbSet<Patient> Patients => Set<Patient>();
     public DbSet<PatientChangeLog> PatientChangeLogs => Set<PatientChangeLog>();
     public DbSet<Visit> Visits => Set<Visit>();
+    public DbSet<QueueCard> QueueCards => Set<QueueCard>();
+    public DbSet<QueueAttendance> QueueAttendances => Set<QueueAttendance>();
+    public DbSet<QueueDeskLane> QueueDeskLanes => Set<QueueDeskLane>();
     public DbSet<VisitToken> VisitTokens => Set<VisitToken>();
     public DbSet<VisitStatusHistory> VisitStatusHistory => Set<VisitStatusHistory>();
     public DbSet<Appointment> Appointments => Set<Appointment>();
@@ -68,12 +76,14 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
     public DbSet<StockLocation> StockLocations => Set<StockLocation>();
     public DbSet<StockBatch> StockBatches => Set<StockBatch>();
     public DbSet<StockMovement> StockMovements => Set<StockMovement>();
+    public DbSet<StockAdjustment> StockAdjustments => Set<StockAdjustment>();
     public DbSet<Supplier> Suppliers => Set<Supplier>();
     public DbSet<Purchase> Purchases => Set<Purchase>();
     public DbSet<Sale> Sales => Set<Sale>();
     public DbSet<OpticalOrder> OpticalOrders => Set<OpticalOrder>();
     public DbSet<Attachment> Attachments => Set<Attachment>();
     public DbSet<PatientCall> PatientCalls => Set<PatientCall>();
+    public DbSet<ChatMessage> ChatMessages => Set<ChatMessage>();
 
     protected override void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
     {
@@ -106,6 +116,9 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
         }
 
         b.Entity<SyncState>().HasKey(x => x.Key);
+        b.Entity<QueueCard>().HasKey(x => new { x.Day, x.Number });
+        b.Entity<QueueAttendance>().HasKey(x => new { x.Day, x.Desk, x.EntryKey });
+        b.Entity<QueueDeskLane>().HasKey(x => new { x.Day, x.Desk, x.LaneId });
         b.Entity<SyncCommand>().HasIndex(x => new { x.StatusCode, x.CreatedAt });
         b.Entity<SyncCommand>().HasIndex(x => new { x.UserId, x.CreatedAt });
 
@@ -143,7 +156,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
             // By name alone EF would not link Doctor to DoctorStaffId: it would add an empty column of its own and no visit would have a doctor.
             e.HasOne(x => x.Doctor).WithMany().HasForeignKey(x => x.DoctorStaffId).OnDelete(DeleteBehavior.Restrict);
             e.HasIndex(x => x.VisitNumber).IsUnique();
-            e.HasIndex(x => new { x.VisitDate, x.DepartmentId, x.QueueNumber }).IsUnique();
+            e.HasIndex(x => new { x.VisitDate, x.QueueShift, x.QueueRound, x.DepartmentId, x.QueueNumber })
+                .HasDatabaseName("IX_Visits_QueueDay_Shift_Round_Department_Number").IsUnique();
             e.HasIndex(x => new { x.PatientId, x.VisitDate });
             e.HasIndex(x => new { x.VisitDate, x.Status });
 
@@ -162,7 +176,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
             e.HasIndex(x => x.TokenDate);
 
             // The sequence is the first guard and this the last: a number announced over the speaker must mean one patient.
-            e.HasIndex(x => new { x.TokenDate, x.QueueNumber }).IsUnique();
+            e.HasIndex(x => new { x.TokenDate, x.QueueShift, x.QueueRound, x.QueueNumber }).IsUnique();
             e.HasOne(x => x.Doctor).WithMany().HasForeignKey(x => x.DoctorStaffId);
         });
 
@@ -198,6 +212,16 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
         });
 
         b.Entity<OutboxEvent>().HasIndex(x => x.ProcessedAt);
+
+        b.Entity<ChatMessage>(e =>
+        {
+            e.HasIndex(x => new { x.SenderUserId, x.RecipientUserId, x.Id });
+            e.HasIndex(x => new { x.RecipientUserId, x.SenderUserId, x.Id });
+            e.HasIndex(x => new { x.SenderUserId, x.ClientMessageId }).IsUnique();
+            e.HasOne<AppUser>().WithMany().HasForeignKey(x => x.SenderUserId).OnDelete(DeleteBehavior.Restrict);
+            e.HasOne<AppUser>().WithMany().HasForeignKey(x => x.RecipientUserId).IsRequired(false).OnDelete(DeleteBehavior.Restrict);
+            e.Property(x => x.Content).HasColumnType("varchar(2000)");
+        });
 
         b.Entity<IdempotencyRecord>(e =>
         {
@@ -309,6 +333,14 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
             e.HasIndex(x => x.CreatedAt);
         });
 
+        b.Entity<StockAdjustment>(e =>
+        {
+            e.Property(x => x.PreviousQuantity).HasPrecision(18, 3);
+            e.Property(x => x.NewQuantity).HasPrecision(18, 3);
+            e.HasIndex(x => new { x.BatchId, x.Id });
+            e.HasIndex(x => x.CreatedAt);
+        });
+
         b.Entity<Purchase>(e =>
         {
             e.Property(x => x.Version).IsConcurrencyToken();
@@ -410,6 +442,21 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
         });
 
         b.Entity<DiagnosticResult>().HasIndex(x => x.OrderId).IsUnique();
+
+        b.Entity<StaffSalaryTerm>().HasIndex(x => new { x.StaffId, x.EffectiveFrom }).IsUnique();
+        b.Entity<StaffSalaryTerm>().HasOne(x => x.Staff).WithMany().HasForeignKey(x => x.StaffId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<Expense>().HasOne(x => x.Staff).WithMany().HasForeignKey(x => x.StaffId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<OperationDefinition>().Property(x => x.Version).IsConcurrencyToken();
+        b.Entity<OperationDefinition>().HasOne(x => x.Service).WithMany().HasForeignKey(x => x.ServiceId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<OperationDefinition>().HasMany(x => x.Packages).WithOne().HasForeignKey(x => x.OperationDefinitionId);
+        b.Entity<OperationPackage>().HasIndex(x => new { x.OperationDefinitionId, x.PackageId }).IsUnique();
+        b.Entity<OperationPackage>().Property(x => x.Quantity).HasPrecision(18, 3);
+        b.Entity<SurgerySupplyPlan>().Property(x => x.Quantity).HasPrecision(18, 3);
+        b.Entity<OperationPackage>().HasOne(x => x.Package).WithMany().HasForeignKey(x => x.PackageId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<SurgerySupplyPlan>().HasOne(x => x.SurgeryCase).WithMany().HasForeignKey(x => x.SurgeryCaseId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<SurgerySupplyPlan>().HasOne(x => x.Product).WithMany().HasForeignKey(x => x.ProductId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<SurgerySupplyPlan>().HasOne(x => x.Location).WithMany().HasForeignKey(x => x.LocationId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<SurgeryCase>().HasOne(x => x.OperationDefinition).WithMany().HasForeignKey(x => x.OperationDefinitionId).OnDelete(DeleteBehavior.Restrict);
 
         b.Entity<SurgeryCase>(e =>
         {

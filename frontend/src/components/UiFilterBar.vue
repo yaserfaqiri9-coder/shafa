@@ -64,7 +64,7 @@ const search = defineModel<string>('search')
   padding: 12px 16px;
   border-radius: 10px;
   background: var(--xr-surface);
-  box-shadow: 0 1px 2px rgba(31, 42, 68, 0.05), 0 4px 16px rgba(31, 42, 68, 0.06);
+  box-shadow: var(--xr-shadow-card);
 }
 
 .fbar--flat {
@@ -92,9 +92,9 @@ const search = defineModel<string>('search')
 .fbar__title {
   margin: 0;
   overflow: hidden;
-  color: #1f2a44;
-  font-size: 18px;
-  font-weight: 700;
+  color: var(--xr-text);
+  font-size: 20px;
+  font-weight: 800;
   line-height: 1.5;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -111,34 +111,41 @@ h2.fbar__title {
   line-height: 1.5;
 }
 
-/* Search as a quiet underline with its icon, the way a filter reads rather than a form field. */
+/* The same search field as every work list: a boxed field with the magnifier inside it. */
 .fbar__search {
+  position: relative;
   display: flex;
-  flex: 1 1 220px;
+  flex: 1 1 260px;
   align-items: center;
-  gap: 8px;
-  max-width: 380px;
-  min-height: 36px;
-  padding-inline: 2px;
-  border-bottom: 1px solid #d9dfe8;
-  color: var(--xr-text-soft);
-  transition: border-color 0.15s ease;
+  max-width: 460px;
+  margin: 0;
+  color: #9ca3af;
 }
 
-.fbar__search:focus-within {
-  border-color: var(--xr-primary);
-  color: var(--xr-primary);
+.fbar__search > i {
+  position: absolute;
+  inset-inline-start: 14px;
+  font-size: 18px;
+  pointer-events: none;
 }
 
 .fbar__input {
   flex: 1;
   min-width: 0;
-  padding: 6px 0;
-  border: 0;
+  min-height: 42px;
+  padding-block: 8px;
+  padding-inline: 42px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
   outline: 0;
-  background: transparent;
+  background: #fff;
   color: var(--xr-text);
-  font-size: 13.5px;
+  font-size: 14px;
+}
+
+.fbar__input:focus {
+  border-color: var(--xr-primary);
+  box-shadow: 0 0 0 3px rgba(8, 127, 140, .15);
 }
 
 .fbar__input::placeholder {
@@ -156,7 +163,7 @@ h2.fbar__title {
 .fbar__filters :deep(.form-control),
 .fbar__filters :deep(.form-select) {
   width: auto;
-  min-height: 36px;
+  min-height: 42px;
   padding-block: 4px;
   font-size: 13.5px;
 }

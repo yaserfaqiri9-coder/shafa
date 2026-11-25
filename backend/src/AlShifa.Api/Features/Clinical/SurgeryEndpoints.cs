@@ -1,13 +1,15 @@
 using System.ComponentModel.DataAnnotations;
 using AlShifa.Api.Features.Auth;
 using AlShifa.Api.Features.Finance;
+using AlShifa.Api.Features.Inventory;
 using AlShifa.Api.Features.Visits;
 using AlShifa.Api.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 
 namespace AlShifa.Api.Features.Clinical;
 
-public sealed record CreateSurgeryRequest(long VisitId, [Required, MaxLength(200)] string SurgeryType, EyeSide Eye, int? ServiceId = null, int? PackageId = null);
+public sealed record CreateSurgeryRequest(long VisitId, [Required, MaxLength(200)] string SurgeryType, EyeSide Eye, int? ServiceId = null, int? PackageId = null, int? OperationDefinitionId = null,
+    [Range(0.01, 100000000)] decimal? Amount = null, SettlementDiscount? Discount = null);
 
 public sealed record SaveSurgeryRequest(
     DateTime? ScheduledAt,
@@ -22,7 +24,7 @@ public sealed record SaveSurgeryRequest(
 
 public sealed record ChangeSurgeryStatusRequest(SurgeryStatus Status, int Version);
 
-public sealed record SurgeryRow(long Id, string CaseNumber, long PatientId, string PatientFileNumber, string PatientName, long VisitId, string SurgeryType, string Eye, DateTime? ScheduledAt, string Status, int Version, IReadOnlyList<string> NextStatuses);
+public sealed record SurgeryRow(long Id, string CaseNumber, long PatientId, string PatientFileNumber, string PatientName, long VisitId, string SurgeryType, string Eye, DateTime? ScheduledAt, string Status, int Version, IReadOnlyList<string> NextStatuses, int? QueueNumber = null);
 
 public sealed record SurgeryDetail(SurgeryRow Case, string? PreOpChecks, bool ConsentRecorded, string? OperationReport, string? PostOpStatus, int? PackageId = null, string? PackageName = null, DateTime? SuppliesRecordedAt = null);
 
@@ -44,7 +46,7 @@ public static class SurgeryEndpoints
     {
         var group = app.MapGroup("/api/surgeries").WithTags("Surgery");
 
-        group.MapGet("/", async (AppDbContext db, SurgeryStatus? status, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
+        group.MapGet("/", async (AppDbContext db, SurgeryStatus? status, bool? open, DateOnly? date, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
         {
             pageSize = Math.Clamp(pageSize, 1, 100);
             page = Math.Max(page, 1);
@@ -55,8 +57,32 @@ public static class SurgeryEndpoints
                 query = query.Where(c => c.Status == s);
             }
 
+            // The desk's lists stay small: open cases, or the cases finished on one day.
+            if (open == true)
+            {
+                query = query.Where(c => c.Status != SurgeryStatus.Completed && c.Status != SurgeryStatus.FollowUp && c.Status != SurgeryStatus.Closed && c.Status != SurgeryStatus.Cancelled);
+            }
+            else if (open == false)
+            {
+                query = query.Where(c => c.Status == SurgeryStatus.Completed || c.Status == SurgeryStatus.FollowUp || c.Status == SurgeryStatus.Closed);
+            }
+
+            if (date is { } day)
+            {
+                var (from, to) = DiagnosticEndpoints.KabulDay(day);
+                query = query.Where(c => c.ScheduledAt != null ? c.ScheduledAt >= from && c.ScheduledAt < to : c.Visit!.VisitDate == day);
+            }
+
             var total = await query.CountAsync(ct);
-            var rows = await Project(query.OrderByDescending(c => c.Id).Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
+            if (open == false)
+            {
+                var done = await Project(query.OrderByDescending(c => c.Id).Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
+                return Results.Ok(new PagedResult<SurgeryRow>(done.Select(ToRow).ToList(), total, page, pageSize));
+            }
+
+            var rows = await Project(query.OrderByDescending(c => c.Status == SurgeryStatus.InProgress)
+                .ThenBy(c => db.QueueAttendances.Any(a => a.Day == c.Visit!.VisitDate && a.Desk == Calls.CallDesk.Surgery && a.EntryKey == "v:" + c.VisitId && !a.Present))
+                .ThenBy(c => c.Visit!.QueueShift == QueueShift.Afternoon).ThenBy(c => c.Visit!.QueueNumber).ThenBy(c => c.Id).Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
             return Results.Ok(new PagedResult<SurgeryRow>(rows.Select(ToRow).ToList(), total, page, pageSize));
         }).RequirePermission("surgery.view");
 
@@ -69,14 +95,23 @@ public static class SurgeryEndpoints
             return Results.Ok(new SurgeryDetail(ToRow(row), surgery.PreOpChecks, surgery.ConsentRecorded, surgery.OperationReport, surgery.PostOpStatus, surgery.PackageId, packageName, surgery.SuppliesRecordedAt));
         }).RequirePermission("surgery.edit");
 
-        group.MapPost("/", async (CreateSurgeryRequest request, AppDbContext db, ClinicalAccess access, Idempotency idempotency, NumberService numbers, InvoiceService invoices, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>
+        group.MapPost("/", async (CreateSurgeryRequest request, AppDbContext db, ClinicalAccess access, Idempotency idempotency, NumberService numbers, InvoiceService invoices, LedgerService ledger, StockService stock, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>
             await idempotency.RunAsync(request, async () =>
             {
                 var patientId = await ClinicalEndpoints.PatientOfVisitAsync(db, request.VisitId, ct);
                 await access.EnsureResponsibleAsync(request.VisitId, ct);
 
                 // A package brings its own fee: the patient pays the package and nothing more for its supplies.
-                var serviceIdOrPackage = request.ServiceId;
+                OperationDefinition? operation = null;
+                if (request.OperationDefinitionId is { } operationId)
+                {
+                    operation = await db.OperationDefinitions.Include(o => o.Packages).ThenInclude(p => p.Package).ThenInclude(p => p!.Items)
+                        .SingleOrDefaultAsync(o => o.Id == operationId && o.IsActive, ct)
+                        ?? throw new AppException(400, "unknown_operation", "عملیات انتخاب‌شده فعال نیست.");
+                    if (request.ServiceId is not null || request.PackageId is not null) throw new AppException(400, "invalid_operation", "فقط عملیات تعریف‌شده را انتخاب کنید.");
+                    if (operation.Packages.Any(p => !p.Package!.IsActive)) throw new AppException(409, "inactive_package", "یکی از پکیج‌های عملیات غیرفعال است.");
+                }
+                var serviceIdOrPackage = operation?.ServiceId ?? request.ServiceId;
                 if (request.PackageId is { } packageId)
                 {
                     serviceIdOrPackage = await db.SurgeryPackages.Where(p => p.Id == packageId && p.IsActive).Select(p => (int?)p.ServiceId).SingleOrDefaultAsync(ct)
@@ -94,7 +129,9 @@ public static class SurgeryEndpoints
                     throw new AppException(StatusCodes.Status400BadRequest, "unknown_service", "خدمت انتخاب‌شده معتبر نیست.");
                 }
 
-                var price = await FinanceEndpoints.CurrentPriceAsync(db, serviceId, ct);
+                var tariff = await FinanceEndpoints.CurrentPriceAsync(db, serviceId, ct);
+                var price = request.Amount ?? tariff;
+                Money.EnsureCents(price);
                 if (price <= 0)
                 {
                     throw new AppException(StatusCodes.Status409Conflict, "no_price", "برای این خدمت قیمت تعیین نشده است.");
@@ -105,7 +142,8 @@ public static class SurgeryEndpoints
                     CaseNumber = await numbers.NextNumberAsync("surgery", ct),
                     PatientId = patientId,
                     VisitId = request.VisitId,
-                    SurgeryType = request.SurgeryType.Trim(),
+                    SurgeryType = operation?.Name ?? request.SurgeryType.Trim(),
+                    OperationDefinitionId = operation?.Id,
                     Eye = request.Eye,
                     ResponsibleUserId = user.Id,
                     PackageId = request.PackageId,
@@ -113,13 +151,32 @@ public static class SurgeryEndpoints
                 db.SurgeryCases.Add(surgery);
                 await db.SaveChangesAsync(ct);
 
-                audit.Add("SurgeryProposed", "SurgeryCase", surgery.Id.ToString());
+                if (operation is not null)
+                {
+                    var plan = operation.Packages.SelectMany(p => p.Package!.Items.Select(i => new { i.ProductId, p.Package.LocationId, Quantity = i.Quantity * p.Quantity }))
+                        .GroupBy(p => new { p.ProductId, p.LocationId });
+                    foreach (var line in plan)
+                    {
+                        var quantity = line.Sum(p => p.Quantity);
+                        if (quantity <= 0 || decimal.Round(quantity, 3) != quantity)
+                            throw new AppException(400, "invalid_package_quantity", "مقدار مصرف پکیج باید با دقت سه رقم اعشار قابل ثبت باشد.");
+                        db.SurgerySupplyPlans.Add(new SurgerySupplyPlan { SurgeryCaseId = surgery.Id, ProductId = line.Key.ProductId, LocationId = line.Key.LocationId, Quantity = line.Sum(p => p.Quantity) });
+                    }
+                }
+                audit.Add("SurgeryProposed", "SurgeryCase", surgery.Id.ToString(), $"Amount: {price:F2}; tariff: {tariff:F2}");
                 outbox.Add("SurgeryScheduled", new { surgeryId = surgery.Id }, Groups.Surgery, Groups.Doctor);
                 await db.SaveChangesAsync(ct);
 
                 // Its own invoice, so its payment can be checked on its own.
                 var invoice = await invoices.CreateAsync(patientId, request.VisitId, ct);
                 await invoices.AddLineAsync(invoice, new ChargeLine(surgery.SurgeryType, 1, price, Accounts.ServiceRevenue, serviceId, nameof(SurgeryCase), surgery.Id), ct);
+                if (request.Discount is { } discount)
+                {
+                    var amount = FinanceEndpoints.DiscountAmount(invoice, discount.Amount, discount.Mode);
+                    await FinanceEndpoints.ApplyDiscountAsync(invoice, amount, discount.Amount, discount.Mode, "تخفیف داکتر هنگام تجویز عملیات", db, ledger, audit, outbox, ct);
+                }
+
+                await OperationCatalog.ConsumePaidAsync(invoice, db, stock, ledger, user, audit, outbox, ct);
 
                 var row = await Project(db.SurgeryCases.Where(c => c.Id == surgery.Id)).SingleAsync(ct);
                 return (StatusCodes.Status201Created, ToRow(row));
@@ -242,12 +299,12 @@ public static class SurgeryEndpoints
         }).RequireAuthorization();
     }
 
-    private sealed record Projection(long Id, string CaseNumber, long PatientId, string FileNumber, string FirstName, string? LastName, long VisitId, string SurgeryType, EyeSide Eye, DateTime? ScheduledAt, SurgeryStatus Status, int Version);
+    private sealed record Projection(long Id, string CaseNumber, long PatientId, string FileNumber, string FirstName, string? LastName, long VisitId, string SurgeryType, EyeSide Eye, DateTime? ScheduledAt, SurgeryStatus Status, int Version, int? QueueNumber);
 
     private static IQueryable<Projection> Project(IQueryable<SurgeryCase> cases) => cases.Select(c => new Projection(
-        c.Id, c.CaseNumber, c.PatientId, c.Patient!.FileNumber, c.Patient.FirstName, c.Patient.LastName, c.VisitId, c.SurgeryType, c.Eye, c.ScheduledAt, c.Status, c.Version));
+        c.Id, c.CaseNumber, c.PatientId, c.Patient!.FileNumber, c.Patient.FirstName, c.Patient.LastName, c.VisitId, c.SurgeryType, c.Eye, c.ScheduledAt, c.Status, c.Version, c.Visit!.QueueNumber));
 
     private static SurgeryRow ToRow(Projection c) => new(
         c.Id, c.CaseNumber, c.PatientId, c.FileNumber, $"{c.FirstName} {c.LastName}".Trim(), c.VisitId, c.SurgeryType, c.Eye.ToString(), c.ScheduledAt, c.Status.ToString(), c.Version,
-        Allowed[c.Status].Select(s => s.ToString()).ToList());
+        Allowed[c.Status].Select(s => s.ToString()).ToList(), c.QueueNumber);
 }

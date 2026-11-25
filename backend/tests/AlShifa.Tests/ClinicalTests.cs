@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using AlShifa.Api.Features.Auth;
 using AlShifa.Api.Features.Clinical;
+using AlShifa.Api.Features.Finance;
 using AlShifa.Api.Features.Inventory;
 using AlShifa.Api.Features.Patients;
 using AlShifa.Api.Features.Users;
@@ -14,7 +15,7 @@ using Microsoft.Extensions.DependencyInjection;
 namespace AlShifa.Tests;
 
 [Collection("api")]
-public sealed class ClinicalTests(ApiFixture api)
+public sealed class ClinicalTests(ApiFixture api) : PhysicalQueueTestScope(api)
 {
     private static string Name(string prefix) => $"{prefix}_{Guid.NewGuid():N}"[..20];
 
@@ -39,7 +40,7 @@ public sealed class ClinicalTests(ApiFixture api)
         return JsonSerializer.Deserialize<T>(text, JsonOptions)!;
     }
 
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } };
 
     /// <summary>A patient with an open visit in the given department, as reception would create it.</summary>
     private async Task<(PatientDto Patient, VisitRow Visit)> NewVisitAsync(string department = "داکتر")
@@ -76,12 +77,84 @@ public sealed class ClinicalTests(ApiFixture api)
     }
 
     [Fact]
+    public async Task Tariff_service_can_be_ordered_without_a_separate_test_and_reuses_the_link()
+    {
+        var admin = await UserAsync(Roles.SuperAdmin);
+        var (patient, visit) = await NewVisitAsync();
+        var serviceId = await NewSurgeryServiceAsync();
+        var request = new CreateDiagnosticOrderRequest(patient.Id, visit.Id, 0, null, ServiceId: serviceId);
+        var responses = await Task.WhenAll(admin.SendAsync(Post("/api/diagnostic-orders", request)), admin.SendAsync(Post("/api/diagnostic-orders", request)));
+        var first = await ReadCreated<DiagnosticOrderDto>(responses[0]);
+        var second = await ReadCreated<DiagnosticOrderDto>(responses[1]);
+        Assert.Equal(first.TestId, second.TestId);
+        Assert.Equal("Lab", first.Kind);
+        using var scope = api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.Equal(1, await db.DiagnosticTests.CountAsync(t => t.ServiceId == serviceId));
+        var order = await db.DiagnosticOrders.SingleAsync(o => o.Id == first.Id);
+        Assert.NotNull(order.InvoiceId);
+        Assert.Equal(1000m, (await db.Invoices.SingleAsync(i => i.Id == order.InvoiceId)).Total);
+    }
+
+    [Fact]
+    public async Task Doctor_discount_is_stored_with_the_diagnostic_and_custom_surgery_charge()
+    {
+        var admin = await UserAsync(Roles.SuperAdmin);
+        var (patient, visit) = await NewVisitAsync();
+        var serviceId = await NewSurgeryServiceAsync();
+        var test = await admin.PostAsJsonAsync("/api/diagnostic-tests", new SaveTestRequest(Name("imaging"), true, serviceId, DiagnosticKind.Imaging));
+        Assert.Equal(HttpStatusCode.Created, test.StatusCode);
+        var testId = JsonDocument.Parse(await test.Content.ReadAsStringAsync()).RootElement.GetProperty("id").GetInt32();
+
+        var doctor = await UserAsync(Roles.Doctor);
+        var order = await ReadCreated<DiagnosticOrderDto>(await doctor.SendAsync(Post("/api/diagnostic-orders",
+            new CreateDiagnosticOrderRequest(patient.Id, visit.Id, testId, null, Discount: new SettlementDiscount(10, DiscountMode.Percent)))));
+        var surgery = await ReadCreated<SurgeryRow>(await doctor.SendAsync(Post("/api/surgeries",
+            new CreateSurgeryRequest(visit.Id, "custom", EyeSide.OD, ServiceId: serviceId, Amount: 750, Discount: new SettlementDiscount(50, DiscountMode.Amount)))));
+
+        using var scope = api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var diagnosticOrder = await db.DiagnosticOrders.SingleAsync(o => o.Id == order.Id);
+        var diagnosticInvoice = await db.Invoices.SingleAsync(i => i.Id == diagnosticOrder.InvoiceId);
+        var surgeryInvoice = await db.InvoiceItems.Where(i => i.SourceType == nameof(SurgeryCase) && i.SourceId == surgery.Id).Select(i => i.Invoice!).SingleAsync();
+        Assert.Equal(1000m, diagnosticInvoice.Total);
+        Assert.Equal(100m, diagnosticInvoice.Discount);
+        Assert.Equal(750m, surgeryInvoice.Total);
+        Assert.Equal(50m, surgeryInvoice.Discount);
+    }
+
+    [Fact]
+    public async Task A_visit_left_open_yesterday_is_listed_with_that_days_seen_patients()
+    {
+        var (_, visit) = await NewVisitAsync("معاینه ابتدایی");
+        var triage = await UserAsync(Roles.Triage);
+        Assert.True((await triage.PutAsJsonAsync($"/api/pre-examinations/{visit.Id}", new SavePreExamRequest("تاری دید", null, "6/9", "6/12", "15", "16", null, null, null))).IsSuccessStatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await triage.PostAsync($"/api/pre-examinations/{visit.Id}/complete", null)).StatusCode);
+        var doctor = await UserAsync(Roles.Doctor);
+        Assert.True((await doctor.PutAsJsonAsync($"/api/consultations/{visit.Id}",
+            new SaveConsultationRequest(null, null, "پلان", null, [new DiagnosisInput(EyeSide.Both, "Dry eye")], null))).IsSuccessStatusCode);
+
+        var yesterday = KabulClock.Today.AddDays(-1);
+        using (var scope = api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            await db.Visits.Where(v => v.Id == visit.Id).ExecuteUpdateAsync(u => u.SetProperty(v => v.VisitDate, yesterday));
+        }
+
+        Assert.DoesNotContain((await doctor.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=doctor", JsonOptions))!, v => v.Id == visit.Id);
+        var seen = await doctor.GetFromJsonAsync<List<VisitRow>>($"/api/clinical/worklist?kind=doctor&done=true&date={yesterday:yyyy-MM-dd}", JsonOptions);
+        Assert.Contains(seen!, v => v.Id == visit.Id && v.Status == nameof(VisitStatus.InConsultation));
+        // Today's seen list stays completed visits only: open ones are still in the queue.
+        Assert.DoesNotContain((await doctor.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=doctor&done=true", JsonOptions))!, v => v.Id == visit.Id);
+    }
+
+    [Fact]
     public async Task Pre_exam_reaches_the_doctor_and_moves_the_visit()
     {
         var (_, visit) = await NewVisitAsync("معاینه ابتدایی");
         var triage = await UserAsync(Roles.Triage);
 
-        var worklist = await triage.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=triage");
+        var worklist = await triage.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=triage", JsonOptions);
         Assert.Contains(worklist!, v => v.Id == visit.Id);
 
         var saved = await triage.PutAsJsonAsync($"/api/pre-examinations/{visit.Id}",
@@ -89,12 +162,16 @@ public sealed class ClinicalTests(ApiFixture api)
         Assert.Equal(HttpStatusCode.OK, saved.StatusCode);
 
         Assert.Equal(HttpStatusCode.NoContent, (await triage.PostAsync($"/api/pre-examinations/{visit.Id}/complete", null)).StatusCode);
-        Assert.DoesNotContain((await triage.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=triage"))!, v => v.Id == visit.Id);
-        Assert.Contains((await triage.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=triage&done=true"))!, v => v.Id == visit.Id);
+        Assert.DoesNotContain((await triage.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=triage", JsonOptions))!, v => v.Id == visit.Id);
+        Assert.Contains((await triage.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=triage&done=true", JsonOptions))!, v => v.Id == visit.Id);
 
         var doctor = await UserAsync(Roles.Doctor);
-        var queue = await doctor.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=doctor");
+        var queue = await doctor.GetFromJsonAsync<List<VisitRow>>("/api/clinical/worklist?kind=doctor", JsonOptions);
         Assert.Contains(queue!, v => v.Id == visit.Id && v.Status == nameof(VisitStatus.ReadyForDoctor) && v.VisionComplete);
+        // Waiting is shown from the moment the patient became ready for the doctor, not from the morning desk.
+        var row = Assert.Single(queue!, v => v.Id == visit.Id);
+        Assert.NotNull(row.ReadySince);
+        Assert.True(row.ReadySince >= row.CreatedAt);
 
         var chart = await doctor.GetFromJsonAsync<ChartDto>($"/api/consultations/{visit.Id}/chart", JsonOptions);
         Assert.Equal("6/9", chart!.PreExam!.VisualAcuityOd);
@@ -221,6 +298,7 @@ public sealed class ClinicalTests(ApiFixture api)
         var lab = await UserAsync(Roles.Lab);
         var queue = await lab.GetFromJsonAsync<PagedResult<DiagnosticOrderDto>>("/api/diagnostic-orders?status=Requested");
         Assert.Contains(queue!.Items, o => o.Id == order.Id);
+        Assert.Contains((await lab.GetFromJsonAsync<PagedResult<DiagnosticOrderDto>>("/api/diagnostic-orders?open=true&pageSize=100"))!.Items, o => o.Id == order.Id);
         Assert.Equal(HttpStatusCode.Forbidden, (await lab.GetAsync($"/api/consultations/{visit.Id}/chart")).StatusCode);
 
         Assert.Equal(HttpStatusCode.NoContent, (await lab.PostAsJsonAsync($"/api/diagnostic-orders/{order.Id}/start", new ChangeOrderStatusRequest(order.Version))).StatusCode);
@@ -233,6 +311,12 @@ public sealed class ClinicalTests(ApiFixture api)
 
         var again = await lab.PostAsJsonAsync($"/api/diagnostic-orders/{order.Id}/result", new SaveResultRequest("نتیجه دوم", seen.Version));
         Assert.Equal(HttpStatusCode.Conflict, again.StatusCode);
+
+        // The desk loads only open work, or one day's results: never the whole history.
+        async Task<List<long>> Ids(string query) => (await lab.GetFromJsonAsync<PagedResult<DiagnosticOrderDto>>($"/api/diagnostic-orders?{query}&pageSize=100"))!.Items.Select(o => o.Id).ToList();
+        Assert.DoesNotContain(order.Id, await Ids("open=true"));
+        Assert.Contains(order.Id, await Ids($"open=false&date={KabulClock.Today:yyyy-MM-dd}"));
+        Assert.DoesNotContain(order.Id, await Ids($"open=false&date={KabulClock.Today.AddDays(-1):yyyy-MM-dd}"));
     }
 
     [Fact]
@@ -270,6 +354,9 @@ public sealed class ClinicalTests(ApiFixture api)
         var team = await UserAsync(Roles.Surgery);
         var list = await team.GetFromJsonAsync<PagedResult<SurgeryRow>>("/api/surgeries");
         Assert.Contains(list!.Items, c => c.Id == surgery.Id);
+        // A proposed case is open work; the finished list does not carry it.
+        Assert.Contains((await team.GetFromJsonAsync<PagedResult<SurgeryRow>>("/api/surgeries?open=true&pageSize=100"))!.Items, c => c.Id == surgery.Id);
+        Assert.DoesNotContain((await team.GetFromJsonAsync<PagedResult<SurgeryRow>>($"/api/surgeries?open=false&date={KabulClock.Today:yyyy-MM-dd}&pageSize=100"))!.Items, c => c.Id == surgery.Id);
 
         var early = await team.PostAsJsonAsync($"/api/surgeries/{surgery.Id}/status", new ChangeSurgeryStatusRequest(SurgeryStatus.Scheduled, surgery.Version));
         Assert.Contains("schedule_required", await early.Content.ReadAsStringAsync());
@@ -286,31 +373,49 @@ public sealed class ClinicalTests(ApiFixture api)
     }
 
     [Fact]
-    public async Task Finalized_consultation_changes_only_through_a_recorded_amendment()
+    public async Task Finalized_consultation_is_corrected_in_place_and_the_change_is_kept_in_history()
     {
         var (_, visit) = await NewVisitAsync();
         var doctor = await UserAsync(Roles.Doctor);
 
-        var saved = await doctor.PutAsJsonAsync($"/api/consultations/{visit.Id}", new SaveConsultationRequest("یافته اول", null, "پلان اول", null, null, null));
+        var saved = await doctor.PutAsJsonAsync($"/api/consultations/{visit.Id}", new SaveConsultationRequest("یافته اول", null, "پلان اول", null, [new DiagnosisInput(EyeSide.OD, "تشخیص اول")], null));
         var dto = (await saved.Content.ReadFromJsonAsync<ConsultationDto>())!;
 
         var finalized = await doctor.PostAsJsonAsync($"/api/consultations/{visit.Id}/finalize", new FinalizeRequest(dto.Version, CloseVisit: true));
         Assert.True(finalized.IsSuccessStatusCode, await finalized.Content.ReadAsStringAsync());
         dto = (await finalized.Content.ReadFromJsonAsync<ConsultationDto>())!;
 
-        var direct = await doctor.PutAsJsonAsync($"/api/consultations/{visit.Id}", new SaveConsultationRequest("تغییر مستقیم", null, null, null, null, dto.Version));
-        Assert.Equal(HttpStatusCode.Conflict, direct.StatusCode);
-        Assert.Contains("already_finalized", await direct.Content.ReadAsStringAsync());
-
-        var amend = await doctor.PostAsJsonAsync($"/api/consultations/{visit.Id}/amend", new AmendRequest("TreatmentPlan", "پلان اصلاح‌شده", "اشتباه در ثبت", dto.Version));
-        Assert.Equal(HttpStatusCode.NoContent, amend.StatusCode);
+        // No form and no reason: the doctor saves the file as it stands, and the old text is kept out of sight.
+        var direct = await doctor.PutAsJsonAsync($"/api/consultations/{visit.Id}",
+            new SaveConsultationRequest("یافته اول", "یافته چپ تازه", "پلان اصلاح‌شده", null, [new DiagnosisInput(EyeSide.OS, "تشخیص اصلاح‌شده")], dto.Version));
+        Assert.Equal(HttpStatusCode.OK, direct.StatusCode);
+        var corrected = (await direct.Content.ReadFromJsonAsync<ConsultationDto>())!;
+        Assert.NotNull(corrected.FinalizedAt);
 
         var chart = await doctor.GetFromJsonAsync<ChartDto>($"/api/consultations/{visit.Id}/chart", JsonOptions);
         Assert.Equal("پلان اصلاح‌شده", chart!.Consultation!.TreatmentPlan);
-        var amendment = Assert.Single(chart.Amendments);
-        Assert.Equal("پلان اول", amendment.OldValue);
-        Assert.Equal("اشتباه در ثبت", amendment.Reason);
+        Assert.Equal("تشخیص اصلاح‌شده", Assert.Single(chart.Consultation.Diagnoses).Text);
+        Assert.Equal(3, chart.Amendments.Count);
+        Assert.All(chart.Amendments, a => Assert.Equal(Amendments.AfterFinal, a.Reason));
+        Assert.Contains(chart.Amendments, a => a.Field == "TreatmentPlan" && a.OldValue == "پلان اول" && a.NewValue == "پلان اصلاح‌شده");
+        Assert.Contains(chart.Amendments, a => a.Field == "FindingsOs" && a.OldValue == null && a.NewValue == "یافته چپ تازه");
+        Assert.Contains(chart.Amendments, a => a.Field == "Diagnoses" && a.OldValue == "OD: تشخیص اول" && a.NewValue == "OS: تشخیص اصلاح‌شده");
+        // Unchanged fields leave no trace, the visit stays closed, and there is still one file for the visit.
+        Assert.DoesNotContain(chart.Amendments, a => a.Field == "FindingsOd");
         Assert.Equal(nameof(VisitStatus.Completed), chart.Visit.Status);
+        using (var scope = api.Services.CreateScope())
+        {
+            Assert.Equal(1, await scope.ServiceProvider.GetRequiredService<AppDbContext>().Consultations.CountAsync(c => c.VisitId == visit.Id));
+        }
+
+        // A page opened before the correction cannot overwrite it.
+        var stale = await doctor.PutAsJsonAsync($"/api/consultations/{visit.Id}", new SaveConsultationRequest("کهنه", null, null, null, null, dto.Version));
+        Assert.Equal(HttpStatusCode.Conflict, stale.StatusCode);
+
+        // Another doctor cannot change it.
+        var other = await UserAsync(Roles.Doctor);
+        var refused = await other.PutAsJsonAsync($"/api/consultations/{visit.Id}", new SaveConsultationRequest("دیگری", null, null, null, null, corrected.Version));
+        Assert.Equal(HttpStatusCode.Forbidden, refused.StatusCode);
     }
 
     [Fact]

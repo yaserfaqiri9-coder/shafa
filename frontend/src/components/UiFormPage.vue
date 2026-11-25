@@ -1,7 +1,9 @@
 <script setup lang="ts">
+import { watch } from 'vue'
 import type { RouteLocationRaw } from 'vue-router'
+import { useNotifications } from '@/stores/notifications'
 
-defineProps<{
+const props = defineProps<{
   title: string
   backTo: RouteLocationRaw
   backLabel: string
@@ -14,6 +16,10 @@ defineProps<{
   done?: boolean
 }>()
 defineEmits<{ submit: [] }>()
+
+const { notify } = useNotifications()
+watch(() => props.notice, (value) => { if (value) notify.success(value) })
+watch(() => props.error, (value) => { if (value) notify.danger(value) })
 </script>
 
 <template>

@@ -7,7 +7,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AlShifa.Api.Features.Clinical;
 
-public sealed record CreateDiagnosticOrderRequest(long PatientId, long? VisitId, int TestId, [MaxLength(500)] string? Note, bool ReturnToDoctor = true);
+public sealed record CreateDiagnosticOrderRequest(long PatientId, long? VisitId, int TestId, [MaxLength(500)] string? Note, bool ReturnToDoctor = true, int? ServiceId = null, SettlementDiscount? Discount = null);
 
 public sealed record ChangeOrderStatusRequest(int Version);
 
@@ -21,11 +21,11 @@ public sealed record SaveTestRequest([Required, MaxLength(150)] string Name, boo
 
 public sealed record DiagnosticProjection(
     long Id, string OrderNumber, long PatientId, string FileNumber, string FirstName, string? LastName, long? VisitId, int TestId, string TestName,
-    string? Note, DiagnosticStatus Status, DateTime CreatedAt, int Version, string? ResultText, DateTime? PerformedAt, DiagnosticKind Kind, bool ReturnToDoctor, bool? Paid);
+    string? Note, DiagnosticStatus Status, DateTime CreatedAt, int Version, string? ResultText, DateTime? PerformedAt, DiagnosticKind Kind, bool ReturnToDoctor, bool? Paid, int? QueueNumber = null);
 
 public sealed record DiagnosticOrderDto(
     long Id, string OrderNumber, long PatientId, string PatientFileNumber, string PatientName, long? VisitId, int TestId, string TestName,
-    string? Note, string Status, DateTime CreatedAt, int Version, string? ResultText, DateTime? PerformedAt, string Kind, bool ReturnToDoctor, bool? Paid);
+    string? Note, string Status, DateTime CreatedAt, int Version, string? ResultText, DateTime? PerformedAt, string Kind, bool ReturnToDoctor, bool? Paid, int? QueueNumber = null);
 
 /// <summary>The server-side rules around prepaid requests. Screens only reflect them.</summary>
 public static class DiagnosticGate
@@ -131,7 +131,7 @@ public static class DiagnosticEndpoints
         var tests = app.MapGroup("/api/diagnostic-tests").WithTags("Diagnostics");
 
         tests.MapGet("/", async (AppDbContext db, CancellationToken ct) =>
-            Results.Ok(await db.DiagnosticTests.AsNoTracking().OrderBy(t => t.Name).Select(t => new { t.Id, t.Name, t.IsActive, Kind = t.Kind.ToString() }).ToListAsync(ct)))
+            Results.Ok(await db.DiagnosticTests.AsNoTracking().OrderBy(t => t.Name).Select(t => new { t.Id, t.Name, t.IsActive, Kind = t.Kind.ToString(), t.ServiceId }).ToListAsync(ct)))
             .RequirePermission("diagnostics.view");
 
         // Settings managers see every test, without the clinical permission the list above asks for.
@@ -204,7 +204,7 @@ public static class DiagnosticEndpoints
 
         var orders = app.MapGroup("/api/diagnostic-orders").WithTags("Diagnostics");
 
-        orders.MapGet("/", async (AppDbContext db, CurrentUser user, DiagnosticStatus? status, long? visitId, bool? mine, bool? excludeRefraction, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
+        orders.MapGet("/", async (AppDbContext db, CurrentUser user, DiagnosticStatus? status, long? visitId, bool? mine, bool? excludeRefraction, bool? open, DateOnly? date, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
         {
             pageSize = Math.Clamp(pageSize, 1, 100);
             page = Math.Max(page, 1);
@@ -231,14 +231,64 @@ public static class DiagnosticEndpoints
                 query = query.Where(o => o.VisitId == v);
             }
 
+            // A desk's lists stay small however long the hospital runs: the open work, or one day's results.
+            if (open == true)
+            {
+                query = query.Where(o => o.Status == DiagnosticStatus.Requested || o.Status == DiagnosticStatus.InProgress);
+            }
+            else if (open == false)
+            {
+                query = query.Where(o => o.Status == DiagnosticStatus.ResultReady);
+            }
+
+            if (date is { } day)
+            {
+                var (from, to) = KabulDay(day);
+                query = query.Where(o => o.Visit != null ? o.Visit.VisitDate == day : o.CreatedAt >= from && o.CreatedAt < to);
+            }
+
             var total = await query.CountAsync(ct);
-            var rows = await QueryOrders(query.OrderBy(o => o.Status).ThenByDescending(o => o.Id).Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
+            if (open == false)
+            {
+                var done = await QueryOrders(query.OrderByDescending(o => o.Id).Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
+                return Results.Ok(new PagedResult<DiagnosticOrderDto>(done.Select(ToDto).ToList(), total, page, pageSize));
+            }
+
+            var rows = await QueryOrders(query.OrderByDescending(o => o.Status == DiagnosticStatus.InProgress)
+                .ThenBy(o => db.QueueAttendances.Any(a => a.Day == o.Visit!.VisitDate && a.EntryKey == "v:" + o.VisitId && !a.Present
+                    && (o.Test!.Kind == DiagnosticKind.Refraction ? a.Desk == Calls.CallDesk.Refraction : o.Test.Kind == DiagnosticKind.Imaging ? a.Desk == Calls.CallDesk.Imaging : a.Desk == Calls.CallDesk.Lab)))
+                .ThenBy(o => o.Visit != null && o.Visit.QueueShift == QueueShift.Afternoon).ThenBy(o => o.Visit != null ? o.Visit.QueueNumber ?? int.MaxValue : int.MaxValue).ThenBy(o => o.Id).Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
             return Results.Ok(new PagedResult<DiagnosticOrderDto>(rows.Select(ToDto).ToList(), total, page, pageSize));
         }).RequirePermission("diagnostics.view");
 
-        orders.MapPost("/", async (CreateDiagnosticOrderRequest request, AppDbContext db, ClinicalAccess access, Idempotency idempotency, NumberService numbers, InvoiceService invoices, CurrentUser user, AuditService audit, Outbox outbox, HttpContext http, CancellationToken ct) =>
+        orders.MapPost("/", async (CreateDiagnosticOrderRequest request, AppDbContext db, ClinicalAccess access, Idempotency idempotency, NumberService numbers, InvoiceService invoices, LedgerService ledger, CurrentUser user, AuditService audit, Outbox outbox, HttpContext http, CancellationToken ct) =>
             await idempotency.RunAsync(request, async () =>
             {
+                DiagnosticTest? test;
+                if (request.ServiceId is { } selectedService)
+                {
+                    if (request.TestId != 0) throw new AppException(400, "invalid_test", "فقط یک درخواست انتخاب کنید.");
+                    // Lock before any snapshot read: a waiting request must see the first request's new test
+                    // in both the link lookup and the joined response under MySQL repeatable-read isolation.
+                    var service = (await db.Services.FromSqlInterpolated($"SELECT * FROM Services WHERE Id = {selectedService} FOR UPDATE").ToListAsync(ct)).SingleOrDefault();
+                    if (service is null || !service.IsActive || ServiceCodes.PaidFlow.Contains(service.Code)
+                        || await db.SurgeryPackages.AnyAsync(p => p.ServiceId == selectedService, ct)
+                        || await db.OperationDefinitions.AnyAsync(o => o.ServiceId == selectedService, ct)
+                        || await db.Departments.AnyAsync(d => d.Id == service.DepartmentId && d.Code == "surgery", ct))
+                        throw new AppException(400, "unknown_service", "خدمت تشخیصی انتخاب‌شده معتبر نیست.");
+                    test = (await db.DiagnosticTests.FromSqlInterpolated($"SELECT * FROM DiagnosticTests WHERE ServiceId = {selectedService} ORDER BY Id FOR UPDATE").ToListAsync(ct)).FirstOrDefault();
+                    if (test is null)
+                    {
+                        test = new DiagnosticTest { Name = service.Name, IsActive = true, ServiceId = service.Id, Kind = DiagnosticKind.Lab };
+                        db.DiagnosticTests.Add(test);
+                        await db.SaveChangesAsync(ct);
+                        audit.Add("DiagnosticTestCreated", "DiagnosticTest", test.Id.ToString());
+                    }
+                }
+                else test = await db.DiagnosticTests.AsNoTracking().SingleOrDefaultAsync(t => t.Id == request.TestId, ct);
+                if (test is null || !test.IsActive) throw new AppException(StatusCodes.Status400BadRequest, "unknown_test", "آزمایش انتخاب‌شده معتبر نیست.");
+                if (test.ServiceId is { } activeService && !await db.Services.AnyAsync(s => s.Id == activeService && s.IsActive, ct))
+                    throw new AppException(400, "unknown_service", "خدمت این درخواست غیرفعال است.");
                 if (!await db.Patients.AnyAsync(p => p.Id == request.PatientId, ct))
                 {
                     throw new AppException(StatusCodes.Status400BadRequest, "unknown_patient", "مریض پیدا نشد.");
@@ -258,8 +308,6 @@ public static class DiagnosticEndpoints
                     }
                 }
 
-                var test = await db.DiagnosticTests.AsNoTracking().SingleOrDefaultAsync(t => t.Id == request.TestId && t.IsActive, ct)
-                    ?? throw new AppException(StatusCodes.Status400BadRequest, "unknown_test", "آزمایش انتخاب‌شده معتبر نیست.");
                 var prepaid = test.Kind != DiagnosticKind.Lab;
 
                 if (test.Kind == DiagnosticKind.Refraction)
@@ -298,7 +346,7 @@ public static class DiagnosticEndpoints
                     OrderNumber = await numbers.NextNumberAsync("lab", ct),
                     PatientId = request.PatientId,
                     VisitId = request.VisitId,
-                    TestId = request.TestId,
+                    TestId = test.Id,
                     Note = Text.Clean(request.Note),
                     RequestedByUserId = user.Id,
                     ReturnToDoctor = lockedVisit is not null && (test.Kind == DiagnosticKind.Refraction || request.ReturnToDoctor),
@@ -322,7 +370,16 @@ public static class DiagnosticEndpoints
                     // Every charged request keeps its own invoice, so its payment can be checked on its own.
                     var invoice = await invoices.CreateAsync(request.PatientId, request.VisitId, ct);
                     await invoices.AddLineAsync(invoice, line, ct);
+                    if (request.Discount is { } discount)
+                    {
+                        var amount = FinanceEndpoints.DiscountAmount(invoice, discount.Amount, discount.Mode);
+                        await FinanceEndpoints.ApplyDiscountAsync(invoice, amount, discount.Amount, discount.Mode, "تخفیف داکتر هنگام تجویز خدمت تشخیصی", db, ledger, audit, outbox, ct);
+                    }
                     order.InvoiceId = invoice.Id;
+                }
+                else if (request.Discount is not null)
+                {
+                    throw new AppException(StatusCodes.Status409Conflict, "discount_without_charge", "برای این درخواست مبلغی برای تخفیف وجود ندارد.");
                 }
                 else if (prepaid)
                 {
@@ -336,8 +393,26 @@ public static class DiagnosticEndpoints
                     outbox.Add("VisitStatusChanged", new { visitId = lockedVisit.Id }, VisitService.EventGroups);
                 }
 
+                // As with a saved exam: the doctor who refers an unassigned patient keeps them, so the result comes back to this doctor.
+                if (order.ReturnToDoctor && lockedVisit!.DoctorStaffId is null && http.User.HasClaim(RolePermissions.ClaimType, "consultation.edit"))
+                {
+                    var userId = user.Id;
+                    lockedVisit.DoctorStaffId = await db.Staff.Where(s => s.UserId == userId && s.IsDoctor && s.IsActive).Select(s => (long?)s.Id).FirstOrDefaultAsync(ct);
+                }
+
                 await db.SaveChangesAsync(ct);
 
+                if (request.ServiceId is not null)
+                {
+                    // The catalog link can have been committed by the request we waited for. Use the
+                    // locked test instead of joining it through an older repeatable-read snapshot.
+                    var patient = await db.Patients.AsNoTracking().SingleAsync(p => p.Id == order.PatientId, ct);
+                    var invoice = order.InvoiceId is { } invoiceId ? await db.Invoices.SingleAsync(i => i.Id == invoiceId, ct) : null;
+                    var paid = invoice is null ? (bool?)null : invoice.Status != InvoiceStatus.Void && invoice.Total - invoice.Discount <= invoice.Paid - invoice.Refunded;
+                    return (StatusCodes.Status201Created, new DiagnosticOrderDto(order.Id, order.OrderNumber, order.PatientId,
+                        patient.FileNumber, $"{patient.FirstName} {patient.LastName}".Trim(), order.VisitId, test.Id, test.Name,
+                        order.Note, order.Status.ToString(), order.CreatedAt, order.Version, null, null, test.Kind.ToString(), order.ReturnToDoctor, paid));
+                }
                 var row = await QueryOrders(db.DiagnosticOrders.Where(o => o.Id == order.Id)).SingleAsync(ct);
                 return (StatusCodes.Status201Created, ToDto(row));
             }, ct)).RequirePermission("diagnostics.create");
@@ -537,9 +612,16 @@ public static class DiagnosticEndpoints
             o.Id, o.OrderNumber, o.PatientId, o.Patient!.FileNumber, o.Patient.FirstName, o.Patient.LastName, o.VisitId, o.TestId, o.Test!.Name,
             o.Note, o.Status, o.CreatedAt, o.Version, o.Result != null ? o.Result.ResultText : null, o.Result != null ? (DateTime?)o.Result.PerformedAt : null,
             o.Test!.Kind, o.ReturnToDoctor,
-            o.Test!.Kind == DiagnosticKind.Lab && o.InvoiceId == null ? null : (bool?)(o.Invoice != null && o.Invoice.Status != InvoiceStatus.Void && o.Invoice.Total - o.Invoice.Discount <= o.Invoice.Paid - o.Invoice.Refunded)));
+            o.Test!.Kind == DiagnosticKind.Lab && o.InvoiceId == null ? null : (bool?)(o.Invoice != null && o.Invoice.Status != InvoiceStatus.Void && o.Invoice.Total - o.Invoice.Discount <= o.Invoice.Paid - o.Invoice.Refunded), o.Visit != null ? o.Visit.QueueNumber : null));
 
     public static DiagnosticOrderDto ToDto(DiagnosticProjection o) => new(
         o.Id, o.OrderNumber, o.PatientId, o.FileNumber, $"{o.FirstName} {o.LastName}".Trim(), o.VisitId, o.TestId, o.TestName,
-        o.Note, o.Status.ToString(), o.CreatedAt, o.Version, o.ResultText, o.PerformedAt, o.Kind.ToString(), o.ReturnToDoctor, o.Paid);
+        o.Note, o.Status.ToString(), o.CreatedAt, o.Version, o.ResultText, o.PerformedAt, o.Kind.ToString(), o.ReturnToDoctor, o.Paid, o.QueueNumber);
+
+    /// <summary>A Kabul calendar day as a UTC range, for timestamps stored in UTC. Afghanistan keeps no daylight saving.</summary>
+    public static (DateTime From, DateTime To) KabulDay(DateOnly day)
+    {
+        var from = day.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc).AddHours(-4.5);
+        return (from, from.AddDays(1));
+    }
 }

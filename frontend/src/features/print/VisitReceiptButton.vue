@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import QueueCardInput from '@/features/visits/QueueCardInput.vue'
 import { ref } from 'vue'
 import { api, errorMessage } from '@/api/http'
 import { useAuthStore } from '@/stores/auth'
@@ -9,6 +10,7 @@ const props = defineProps<{ visitId: number; queueNumber: number | null }>()
 const emit = defineEmits<{ issued: [row: Admission] }>()
 const auth = useAuthStore()
 const printing = ref(false)
+const card = ref<number | null>(null)
 const error = ref('')
 const fallback = ref('')
 
@@ -21,7 +23,7 @@ async function print() {
   try {
     let number = props.queueNumber
     if (number === null) {
-      const row = await api<Admission>(`/admissions/${props.visitId}/reserve-number`, { method: 'POST' })
+      const row = await api<Admission>(`/admissions/${props.visitId}/reserve-number`, { method: 'POST', body: { queueNumber: card.value } })
       number = row.queueNumber
       emit('issued', row)
     }
@@ -40,7 +42,8 @@ async function print() {
 
 <template>
   <span v-if="auth.can('visits.print')" class="d-inline-flex flex-column align-items-start gap-1">
-    <button type="button" class="btn btn-primary" :disabled="printing || (queueNumber === null && !auth.can('visitfees.create'))" @click="print">
+    <QueueCardInput v-if="queueNumber === null && auth.can('visitfees.create')" v-model="card" />
+    <button type="button" class="btn btn-primary" :disabled="printing || (queueNumber === null && (!auth.can('visitfees.create') || card === null))" @click="print">
       <i class="ri-printer-line" aria-hidden="true"></i> {{ printing ? 'آماده‌سازی چاپ…' : 'چاپ فوری رسید نوبت' }}
     </button>
     <span v-if="error" class="small text-danger text-wrap" role="alert">{{ error }}</span>
