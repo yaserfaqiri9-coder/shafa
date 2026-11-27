@@ -135,6 +135,15 @@ try {
     # A passing run leaves nothing to inspect; each lab holds a full MySQL data directory (~200 MB).
     # A failed run keeps its lab so the TRX results and mysql.err can be read.
     if ($mysqlProcess) { $mysqlProcess.WaitForExit(30000) | Out-Null }
+    # Keep small synthetic test evidence even when the passing database lab is removed.
+    # Never copy credentials, data directories, SQL dumps or application logs here.
+    if (Test-Path (Join-Path $lab 'results')) {
+        $evidence=Join-Path $repo ('.tools\automation-results-'+[IO.Path]::GetFileName($lab))
+        New-Item -ItemType Directory -Force $evidence | Out-Null
+        Protect-Path $evidence @("$([Security.Principal.WindowsIdentity]::GetCurrent().Name)=F")
+        Get-ChildItem (Join-Path $lab 'results') -Filter '*.trx' -File | Copy-Item -Destination $evidence
+        "Synthetic TRX evidence retained: $evidence"
+    }
     if ($succeeded) {
         try { Remove-Item -LiteralPath $lab -Recurse -Force -Confirm:$false -ErrorAction Stop; 'Dedicated MySQL stopped and lab removed; no installed database was accessed.' }
         catch { "Dedicated MySQL stopped. Lab could not be removed ($($_.Exception.Message)): $lab" }

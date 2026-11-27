@@ -9,6 +9,8 @@ namespace AlShifa.Api.Features.Finance;
 public static class Accounts
 {
     public const string Cash = "1000";
+    public const string Bank = "1010";
+    public const string Vault = "1020";
     public const string Receivable = "1100";
     public const string Inventory = "1200";
     public const string Payable = "2000";
@@ -26,6 +28,8 @@ public static class Accounts
     public static readonly (string Code, string Name)[] All =
     [
         (Cash, "صندوق"),
+        (Bank, "بانک و حواله"),
+        (Vault, "گاوصندوق"),
         (Receivable, "باقیات مریضان"),
         (Inventory, "اجناس گدام"),
         (Payable, "قرض به شرکت‌ها"),
@@ -102,9 +106,25 @@ public sealed record ChargeLine(string Description, decimal Quantity, decimal Un
 public sealed class InvoiceService(AppDbContext db, NumberService numbers, LedgerService ledger, CurrentUser user, AuditService audit, Outbox outbox, StockService stock)
 {
     /// <summary>Row lock serialises concurrent payments and charges on one invoice.</summary>
-    public async Task<Invoice> LockAsync(long id, CancellationToken ct) =>
-        await db.Invoices.FromSqlInterpolated($"SELECT * FROM Invoices WHERE Id = {id} FOR UPDATE").SingleOrDefaultAsync(ct)
-        ?? throw AppException.NotFound();
+    public async Task<Invoice> LockAsync(long id, CancellationToken ct)
+    {
+        var locked = await db.Invoices.FromSqlInterpolated($"SELECT * FROM Invoices WHERE Id = {id} FOR UPDATE").AsNoTracking().SingleOrDefaultAsync(ct)
+            ?? throw AppException.NotFound();
+        var tracked = db.Invoices.Local.FirstOrDefault(i => i.Id == id);
+        if (tracked is not null)
+        {
+            var entry = db.Entry(tracked);
+            if (tracked.Version != locked.Version)
+            {
+                if (entry.State != EntityState.Unchanged) throw new DbUpdateConcurrencyException();
+                entry.CurrentValues.SetValues(locked);
+                entry.OriginalValues.SetValues(locked);
+            }
+            return tracked;
+        }
+        db.Invoices.Attach(locked);
+        return locked;
+    }
 
     public async Task<Invoice> CreateAsync(long? patientId, long? visitId, CancellationToken ct)
     {
@@ -180,7 +200,7 @@ public sealed class InvoiceService(AppDbContext db, NumberService numbers, Ledge
     public async Task VoidLineAsync(InvoiceItem item, CancellationToken ct)
     {
         var invoice = await LockAsync(item.InvoiceId, ct);
-        if (invoice.Total - invoice.Discount - item.LineTotal < invoice.Paid)
+        if (invoice.Total - invoice.Discount - item.LineTotal < invoice.Paid - invoice.Refunded)
         {
             throw new AppException(StatusCodes.Status409Conflict, "line_already_paid", "مبلغ این آیتم پرداخت شده است. ابتدا برگشت وجه ثبت شود.");
         }
@@ -196,18 +216,13 @@ public sealed class InvoiceService(AppDbContext db, NumberService numbers, Ledge
         await db.SaveChangesAsync(ct);
     }
 
-    /// <summary>Closes the single-line invoice of a cancelled prepaid item. A refunded one stays: the refund already balances it.</summary>
+    /// <summary>Closes a cancelled prepaid charge once no net payment remains; reverses its receivable and revenue together.</summary>
     public async Task ClosePrepaidAsync(InvoiceItem item, CancellationToken ct)
     {
         var invoice = await LockAsync(item.InvoiceId, ct);
         if (invoice.Paid - invoice.Refunded > 0)
         {
             throw new AppException(StatusCodes.Status409Conflict, "line_already_paid", "مبلغ این آیتم پرداخت شده است. ابتدا برگشت وجه ثبت شود.");
-        }
-
-        if (invoice.Paid > 0)
-        {
-            return;
         }
 
         if (invoice.Discount > 0)
@@ -246,6 +261,7 @@ public sealed class InvoiceService(AppDbContext db, NumberService numbers, Ledge
     public async Task<Payment> ReceiveAsync(PaymentRequest request, bool fullOnly, CancellationToken ct)
     {
         Money.EnsureCents(request.Amount);
+        if (!Enum.IsDefined(request.Method)) throw new AppException(400, "invalid_payment_method", "روش پرداخت معتبر نیست.");
         var userId = user.Id;
 
         // A shared lock lets payments run side by side, but makes closing the session wait until they commit,
@@ -293,7 +309,7 @@ public sealed class InvoiceService(AppDbContext db, NumberService numbers, Ledge
         await db.SaveChangesAsync(ct);
 
         ledger.Post("Payment", "Payment", payment.Id, payment.ReceiptNumber,
-            (Accounts.Cash, payment.Amount, 0),
+            (payment.Method == PaymentMethod.Cash ? Accounts.Cash : Accounts.Bank, payment.Amount, 0),
             (Accounts.Receivable, 0, payment.Amount));
         audit.Add("PaymentReceived", "Payment", payment.Id.ToString());
         outbox.Add("PaymentReceived", new { invoiceId = invoice.Id }, Groups.Cashier, Groups.Finance, Groups.Management, Groups.Reception, Groups.Triage, Groups.Lab, Groups.Pharmacy, Groups.Optical);
@@ -302,7 +318,7 @@ public sealed class InvoiceService(AppDbContext db, NumberService numbers, Ledge
         return payment;
     }
 
-    public static decimal Balance(Invoice i) => i.Status == InvoiceStatus.Void ? 0 : i.Total - i.Discount - i.Paid;
+    public static decimal Balance(Invoice i) => i.Status == InvoiceStatus.Void ? 0 : i.Total - i.Discount - i.Paid + i.Refunded;
 
     /// <summary>The payable amount after discount is covered by money still held, so a refund undoes it.</summary>
     public static bool IsSettled(Invoice i) => i.Status != InvoiceStatus.Void && i.Total - i.Discount <= i.Paid - i.Refunded;
@@ -314,6 +330,6 @@ public sealed class InvoiceService(AppDbContext db, NumberService numbers, Ledge
             return;
         }
 
-        i.Status = i.Paid == 0 ? InvoiceStatus.Issued : Balance(i) > 0 ? InvoiceStatus.PartiallyPaid : InvoiceStatus.Paid;
+        i.Status = Balance(i) <= 0 ? InvoiceStatus.Paid : i.Paid - i.Refunded <= 0 ? InvoiceStatus.Issued : InvoiceStatus.PartiallyPaid;
     }
 }

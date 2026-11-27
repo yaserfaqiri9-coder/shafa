@@ -1,6 +1,7 @@
 import { quantity } from '@/utils/money'
 
 export interface InvoiceRow {
+  correctable?: boolean
   queueNumber?: number | null
   id: number
   invoiceNumber: string
@@ -39,6 +40,9 @@ export function invoiceSubject(row: { description: string | null; itemCount: num
 }
 
 export interface PaymentRow {
+  version: number
+  replacementPaymentId: number | null
+  status: string
   id: number
   receiptNumber: string
   invoiceId: number
@@ -76,6 +80,11 @@ export interface SessionRow {
   closedAt: string | null
   expectedAmount: number | null
   countedAmount: number | null
+  cashRefunded: number
+  cashExpenses: number
+  currentExpected: number
+  difference: number | null
+  closeNote: string | null
   cashCollected: number
   version: number
 }

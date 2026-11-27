@@ -315,7 +315,7 @@ const roleWorkspaces = [
   { role: 'Pharmacist', route: 'pharmacy' },
   { role: 'Optical', route: 'optical' },
   { role: 'Cashier', route: 'cashier' },
-  { role: 'Accountant', route: 'accounting' },
+  { role: 'Accountant', route: 'cashier' },
   { role: 'Inventory', route: 'inventory' },
 ]
 

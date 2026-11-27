@@ -20,6 +20,40 @@ namespace AlShifa.Tests;
 [Collection("api")]
 public sealed class ReportTests(ApiFixture api) : PhysicalQueueTestScope(api)
 {
+
+    [Fact]
+    public async Task Cash_opening_matches_the_original_definition_with_boundary_and_future_entries()
+    {
+        using var scope = api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        await using var testTransaction = await db.Database.BeginTransactionAsync();
+        var start = KabulClock.Today.AddDays(5000).ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc).AddHours(-4.5);
+        var end = start.AddDays(1);
+        var source = "perf-" + Guid.NewGuid().ToString("N")[..12];
+        foreach (var (at, amount) in new[] { (start.AddMilliseconds(-1), 123.45m), (start, -7.89m), (end.AddDays(2), 3.21m) })
+        {
+            db.LedgerTransactions.Add(new LedgerTransaction
+            {
+                Kind = "Opening", SourceType = source, SourceId = at.Ticks, CreatedAt = at, CreatedByUserId = 1,
+                Entries = [new LedgerEntry { AccountCode = Accounts.Cash, Debit = Math.Max(amount, 0), Credit = Math.Max(-amount, 0) },
+                           new LedgerEntry { AccountCode = Accounts.OpeningBalance, Debit = Math.Max(-amount, 0), Credit = Math.Max(amount, 0) }],
+            });
+        }
+        await db.SaveChangesAsync();
+        async Task<decimal> Original(DateTime before) => await (
+            from entry in db.LedgerEntries.AsNoTracking()
+            join transaction in db.LedgerTransactions.AsNoTracking() on entry.TransactionId equals transaction.Id
+            where entry.AccountCode == Accounts.Cash && transaction.CreatedAt < before
+            select (decimal?)(entry.Debit - entry.Credit)).SumAsync() ?? 0;
+        var expectedOpening = await Original(start);
+        var expectedClosing = await Original(end);
+        var figures = await ReportFigures.LoadAsync(start, end, db, CancellationToken.None);
+        Assert.Equal(expectedOpening, figures.CashOpening);
+        Assert.Equal(expectedClosing, figures.CashClosing);
+        await testTransaction.RollbackAsync();
+        Assert.False(await db.LedgerTransactions.AsNoTracking().AnyAsync(t => t.SourceType == source));
+    }
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() } };
 
     private static string Name(string prefix) => $"{prefix}_{Guid.NewGuid():N}"[..20];
@@ -73,13 +107,13 @@ public sealed class ReportTests(ApiFixture api) : PhysicalQueueTestScope(api)
 
         var after = (await accountant.GetFromJsonAsync<FinancialReport>("/api/reports/financial", JsonOptions))!;
 
-        // Revenue is the money received less the money paid back; the 400 still owed is not revenue.
+        // Refunding 100 reopens that receivable: 1000 - 600 + 100 = 500 still owed, never revenue.
         Assert.Equal(500, after.ServiceRevenue - before.ServiceRevenue);
         Assert.Equal(100, after.Refunds - before.Refunds);
         Assert.Equal(500, after.NetRevenue - before.NetRevenue);
         Assert.Equal(600, after.Receipts - before.Receipts);
         Assert.Equal(50, after.Expenses - before.Expenses);
-        Assert.Equal(400, after.OutstandingNow - before.OutstandingNow);
+        Assert.Equal(500, after.OutstandingNow - before.OutstandingNow);
     }
 
     [Fact]

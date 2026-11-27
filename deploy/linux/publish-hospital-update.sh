@@ -43,6 +43,13 @@ if [ "$online_schema" != "$schema" ]; then
   exit 1
 fi
 
+# Both platforms must come from the coordinated release, not merely share a schema.
+online_version=$(python3 -c 'import json; print(json.load(open("/opt/alshifa/api/release.json", encoding="utf-8-sig"))["version"])')
+if [ "$online_version" != "$version" ]; then
+  echo "Refused: Windows and active online release versions differ. Deploy the matching online release first." >&2
+  exit 1
+fi
+
 mkdir -p "$site_dir"
 install -m 644 "$package" "$site_dir/alshifa-$version.zip.tmp"
 mv -f "$site_dir/alshifa-$version.zip.tmp" "$site_dir/alshifa-$version.zip"
@@ -84,4 +91,4 @@ for _ in $(seq 1 15); do
   sleep 1
 done
 test "$served" = 1
-echo "Published hospital update $version (database $schema). Hospitals install it between 03:00 and 05:00."
+echo "Published hospital update $version (database $schema). Hospitals detect the version and install after administrator approval."

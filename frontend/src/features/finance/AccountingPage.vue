@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api, ApiError, errorMessage, newIdempotencyKey } from '@/api/http'
 import { usePagedList } from '@/api/paged'
+import { useLiveRefresh } from '@/api/realtime'
 import { useRoute } from 'vue-router'
 import ShamsiDateInput from '@/components/ShamsiDateInput.vue'
 import UiFilterBar from '@/components/UiFilterBar.vue'
@@ -32,21 +33,6 @@ interface Reconciliation {
   paymentsLessRefundsAndExpenses: number
 }
 
-// Plain Dari names for staff who are not accountants; the ledger's own names stay in the accountant's table.
-// A minus line lowers income (discounts, money handed back).
-const incomeLines = [
-  { code: '4000', label: 'خدمات' },
-  { code: '4100', label: 'دواخانه' },
-  { code: '4200', label: 'عینک' },
-  { code: '4900', label: 'تخفیف', minus: true },
-  { code: '4950', label: 'پول پس‌داده', minus: true },
-]
-const costLines = [
-  { code: '5000', label: 'قیمت خرید اجناس فروخته‌شده' },
-  { code: '6000', label: 'مصارف' },
-  { code: '6100', label: 'کمی اجناس' },
-]
-
 interface ExpenseRow {
   id: number
   expenseNumber: string
@@ -71,14 +57,12 @@ function balanceOf(code: string, creditSide = false) {
   return creditSide ? -net : net
 }
 
-const income = computed(() => incomeLines.map((l) => ({ ...l, amount: l.minus ? balanceOf(l.code) : balanceOf(l.code, true) })))
-const costs = computed(() => costLines.map((l) => ({ ...l, amount: balanceOf(l.code) })))
-const incomeTotal = computed(() => income.value.reduce((sum, l) => sum + (l.minus ? -l.amount : l.amount), 0))
-const costTotal = computed(() => costs.value.reduce((sum, l) => sum + l.amount, 0))
-const profit = computed(() => incomeTotal.value - costTotal.value)
+const financialDay = ref<string | null>(todayIso())
+const cashReport = ref<{ receipts: number; refunds: number; expenses: number; netReceived: number } | null>(null)
+const profit = computed(() => cashReport.value?.netReceived ?? 0)
 
 const headline = computed(() => [
-  { label: 'صندوق', amount: balanceOf('1000') },
+  { label: 'گردش خالص نقدی دفتر', amount: balanceOf('1000') },
   { label: 'باقیات مریضان', amount: balanceOf('1100') },
   { label: 'قرض به شرکت‌ها', amount: balanceOf('2000', true) },
   { label: 'ارزش گدام', amount: balanceOf('1200') },
@@ -149,7 +133,7 @@ async function loadAll() {
   error.value = ''
   try {
     if (auth.can('ledger.view')) {
-      ;[balances.value, reconciliation.value] = await Promise.all([api<LedgerBalance[]>('/ledger/balances'), api<Reconciliation>('/ledger/reconciliation')])
+      ;[balances.value, reconciliation.value, cashReport.value] = await Promise.all([api<LedgerBalance[]>('/ledger/balances'), api<Reconciliation>('/ledger/reconciliation'), api<NonNullable<typeof cashReport.value>>(`/cash/day?date=${financialDay.value ?? todayIso()}`)])
     }
     if (auth.can('invoices.view')) await invoiceList.load()
     if (auth.can('payments.view')) await paymentList.load()
@@ -265,6 +249,8 @@ async function submitCancel() {
   }
 }
 
+watch(financialDay, loadAll)
+useLiveRefresh(['InvoiceIssued', 'PaymentReceived', 'InventoryChanged', 'CashChanged', 'VisitStatusChanged'], loadAll)
 onMounted(() => {
   // Chosen before loading, so a tab the user clicks while data is still arriving stays selected.
   // A link from a report names the tab it means; one this user may not see falls back to the first.
@@ -288,8 +274,8 @@ onMounted(() => {
         <div v-if="reconciliation && !reconciliation.balanced" class="alert alert-danger" role="alert">حساب‌ها برابر نیست. به مدیر سیستم خبر دهید.</div>
 
         <div class="fin-head">
-          <span v-if="reconciliation?.balanced" class="fin-ok" role="status">حساب‌ها درست است</span>
-          <span class="fin-since">از شروع سیستم تا امروز</span>
+          <span v-if="reconciliation?.balanced" class="fin-ok" role="status">تطبیق اسناد دفتر برقرار است</span>
+          <ShamsiDateInput v-model="financialDay" label="روز مالی" required /><RouterLink to="/cashier" class="btn btn-primary">صندوق و دریافت‌های روزانه</RouterLink>
         </div>
 
         <div class="fin-tiles">
@@ -300,29 +286,14 @@ onMounted(() => {
         </div>
 
         <div class="fin-panels">
-          <section class="fin-panel" aria-label="عاید">
-            <h3 class="fin-panel__title">عاید</h3>
-            <div v-for="l in income" :key="l.code" class="fin-line" :class="{ 'fin-line--minus': l.minus }">
-              <span>{{ l.label }}</span>
-              <span>{{ l.minus && l.amount ? '− ' : '' }}{{ money(l.amount) }}</span>
-            </div>
-            <div class="fin-line fin-line--total"><span>عاید خالص</span><span>{{ money(incomeTotal) }}</span></div>
-          </section>
-          <section class="fin-panel" aria-label="مصارف">
-            <h3 class="fin-panel__title">مصارف</h3>
-            <div v-for="l in costs" :key="l.code" class="fin-line">
-              <span>{{ l.label }}</span>
-              <span>{{ money(l.amount) }}</span>
-            </div>
-            <div class="fin-line fin-line--total"><span>مجموع مصارف</span><span>{{ money(costTotal) }}</span></div>
+          <section class="fin-panel" aria-label="پول روز منتخب"><h3 class="fin-panel__title">پول روز منتخب</h3>
+            <div class="fin-line"><span>دریافت واقعی</span><span>{{ money(cashReport?.receipts ?? 0) }}</span></div>
+            <div class="fin-line"><span>برگشت وجه</span><span>{{ money(cashReport?.refunds ?? 0) }}</span></div>
+            <div class="fin-line"><span>مصارف</span><span>{{ money(cashReport?.expenses ?? 0) }}</span></div>
+            <div class="fin-line fin-line--total"><span>خالص دریافتی</span><strong>{{ money(profit) }}</strong></div>
           </section>
         </div>
-
-        <div class="fin-result" :class="profit >= 0 ? 'fin-result--gain' : 'fin-result--loss'">
-          <span>{{ profit >= 0 ? 'مفاد' : 'ضرر' }}</span>
-          <strong>{{ money(Math.abs(profit)) }}</strong>
-        </div>
-
+        <p class="form-hint">مانده‌های حساب و گدام از شروع سیستم تا اکنون است؛ خلاصه بالا پول واقعی روز منتخب را نشان می‌دهد.</p>
         <details class="fin-detail">
           <summary>جدول حسابداری</summary>
           <div class="mt-3">
@@ -368,7 +339,7 @@ onMounted(() => {
                 <td><span class="xr-badge" :class="`xr-badge--${invoiceStatusTones[row.status]}`">{{ invoiceStatusLabels[row.status] }}</span></td>
                 <td v-if="auth.can('invoices.approve')" class="text-nowrap">
                   <button v-if="row.balance > 0" type="button" class="btn btn-soft btn-sm" @click="openDiscount(row)">تخفیف</button>
-                  <button v-if="row.discount > 0 && row.paid === 0 && row.status !== 'Void'" type="button" class="btn btn-soft-danger btn-sm ms-2" @click="Object.assign(undoDiscount, { row, reason: '', saving: false, error: '' })">برگشت تخفیف</button>
+                  <button v-if="row.discount > 0 && row.paid - row.refunded === 0 && row.status !== 'Void'" type="button" class="btn btn-soft-danger btn-sm ms-2" @click="Object.assign(undoDiscount, { row, reason: '', saving: false, error: '' })">برگشت تخفیف</button>
                 </td>
               </tr>
             </tbody>

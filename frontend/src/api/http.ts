@@ -28,10 +28,10 @@ function readCookie(name: string) {
   return match ? decodeURIComponent(match[1]) : null
 }
 
-async function ensureCsrfToken() {
+async function ensureCsrfToken(signal: AbortSignal) {
   const existing = readCookie('XSRF-TOKEN')
   if (existing) return existing
-  await fetch('/api/auth/csrf', { credentials: 'same-origin' })
+  await fetch('/api/auth/csrf', { credentials: 'same-origin', signal })
   return readCookie('XSRF-TOKEN') ?? ''
 }
 
@@ -49,49 +49,48 @@ interface RequestOptions {
 }
 
 export async function uploadFile<T>(path: string, form: FormData): Promise<T> {
-  const token = await ensureCsrfToken()
-  let response: Response
-  try {
-    response = await fetch(`/api${path}`, { method: 'POST', headers: { 'X-XSRF-TOKEN': token }, credentials: 'same-origin', body: form })
-  } catch {
-    throw new ApiError(0, 'outcome_unknown', 'ارتباط قطع شد و معلوم نیست فایل ذخیره شده یا نه. پیش از تکرار، فهرست فایل‌ها را بررسی کنید.')
-  }
-  if (!response.ok) throw await toApiError(response)
-  return (await response.json()) as T
+  return withRequestTimeout(undefined, async signal => {
+    try {
+      const token = await ensureCsrfToken(signal)
+      const response = await fetch(`/api${path}`, { method: 'POST', headers: { 'X-XSRF-TOKEN': token }, credentials: 'same-origin', body: form, signal })
+      if (!response.ok) throw await toApiError(response)
+      return (await response.json()) as T
+    } catch (cause) {
+      if (cause instanceof ApiError) throw cause
+      throw new ApiError(0, 'outcome_unknown', 'ارتباط قطع شد و معلوم نیست فایل ذخیره شده یا نه. پیش از تکرار، فهرست فایل‌ها را بررسی کنید.')
+    }
+  })
 }
 
-async function send(path: string, options: RequestOptions) {
+async function send(path: string, options: RequestOptions, signal: AbortSignal) {
   const method = options.method ?? 'GET'
   const headers: Record<string, string> = {}
   if (options.body !== undefined) headers['Content-Type'] = 'application/json'
-  if (method !== 'GET') headers['X-XSRF-TOKEN'] = await ensureCsrfToken()
+  if (method !== 'GET') headers['X-XSRF-TOKEN'] = await ensureCsrfToken(signal)
   if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey
 
-  // A server or database that stops answering must not leave the screen waiting forever.
+  return fetch(`/api${path}`, {
+    method,
+    headers,
+    credentials: 'same-origin',
+    signal,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  })
+}
+
+// Covers CSRF acquisition, response headers AND the complete JSON/blob body.
+// Clearing a timer as soon as headers arrive leaves stalled bodies waiting forever.
+async function withRequestTimeout<T>(source: AbortSignal | undefined, action: (signal: AbortSignal) => Promise<T>) {
   const controller = new AbortController()
   const abort = () => controller.abort()
-  if (options.signal?.aborted) controller.abort()
-  options.signal?.addEventListener('abort', abort)
-  let timedOut = false
-  const timer = setTimeout(() => {
-    timedOut = true
-    controller.abort()
-  }, REQUEST_TIMEOUT_MS)
+  if (source?.aborted) controller.abort()
+  source?.addEventListener('abort', abort)
+  const timer = setTimeout(abort, REQUEST_TIMEOUT_MS)
   try {
-    return await fetch(`/api${path}`, {
-      method,
-      headers,
-      credentials: 'same-origin',
-      signal: controller.signal,
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    })
-  } catch (cause) {
-    // Not an AbortError: callers treat it like a dropped connection, not like a cancellation they asked for.
-    if (timedOut) throw new TypeError('request_timeout')
-    throw cause
+    return await action(controller.signal)
   } finally {
     clearTimeout(timer)
-    options.signal?.removeEventListener('abort', abort)
+    source?.removeEventListener('abort', abort)
   }
 }
 
@@ -121,18 +120,21 @@ async function toApiError(response: Response) {
 
 /** Saves a file the server makes, under the name the server gives it. A refusal reads like any other API error. */
 export async function downloadFile(path: string, fallbackName: string) {
-  let response: Response
-  try {
-    response = await send(path, {})
-  } catch {
-    throw new ApiError(0, 'network', 'اتصال با سرور برقرار نشد. اتصال شبکه را بررسی کنید.')
-  }
-  if (response.status === 401) onUnauthorized()
-  if (!response.ok) throw await toApiError(response)
+  const { response, blob } = await withRequestTimeout(undefined, async signal => {
+    try {
+      const response = await send(path, {}, signal)
+      if (response.status === 401) onUnauthorized()
+      if (!response.ok) throw await toApiError(response)
+      return { response, blob: await response.blob() }
+    } catch (cause) {
+      if (cause instanceof ApiError) throw cause
+      throw new ApiError(0, 'network', 'اتصال با سرور برقرار نشد. اتصال شبکه را بررسی کنید.')
+    }
+  })
 
   const disposition = response.headers.get('Content-Disposition') ?? ''
   const name = /filename\*=UTF-8''([^;]+)/i.exec(disposition)?.[1] ?? /filename="?([^";]+)"?/i.exec(disposition)?.[1] ?? fallbackName
-  const url = URL.createObjectURL(await response.blob())
+  const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
   link.download = decodeURIComponent(name)
@@ -145,42 +147,43 @@ export async function downloadFile(path: string, fallbackName: string) {
 export async function api<T = void>(path: string, options: RequestOptions = {}): Promise<T> {
   const method = options.method ?? 'GET'
   if (method !== 'GET' && !options.idempotencyKey) options = { ...options, idempotencyKey: newIdempotencyKey() }
-  let response: Response
-  try {
-    response = await send(path, options)
+  return withRequestTimeout(options.signal, async signal => {
+    try {
+      let response = await send(path, options, signal)
 
-    // An invalid CSRF token is rejected before any work happens, so one retry with a fresh token is safe.
-    if (response.status === 400 && method !== 'GET') {
-      const error = await toApiError(response.clone())
-      if (error.code === 'csrf_invalid') {
-        document.cookie = 'XSRF-TOKEN=; Max-Age=0; path=/'
-        response = await send(path, options)
+      // An invalid CSRF token is rejected before any work happens, so one retry with a fresh token is safe.
+      if (response.status === 400 && method !== 'GET') {
+        const error = await toApiError(response.clone())
+        if (error.code === 'csrf_invalid') {
+          document.cookie = 'XSRF-TOKEN=; Max-Age=0; path=/'
+          response = await send(path, options, signal)
+        }
       }
-    }
-  } catch (cause) {
-    if (cause instanceof DOMException && cause.name === 'AbortError') throw cause
-    if (method === 'GET') {
-      throw new ApiError(0, 'network', 'اتصال با سرور برقرار نشد. اتصال شبکه را بررسی کنید.')
-    }
-    throw new ApiError(
-      0,
-      'outcome_unknown',
-      'ارتباط قطع شد و معلوم نیست این عملیات ثبت شده یا نه. پیش از تکرار، صفحه را تازه کنید و بررسی کنید.',
-    )
-  }
+      if (response.status === 401 && path !== '/auth/login' && path !== '/auth/me') {
+        onUnauthorized()
+      }
 
-  if (response.status === 401 && path !== '/auth/login' && path !== '/auth/me') {
-    onUnauthorized()
-  }
-
-  if (!response.ok) throw await toApiError(response)
-  if (response.status === 202 && response.headers.get('Location')?.startsWith('/api/sync/commands/')) {
-    const queued = await response.json() as { commandId: string }
-    // Returning normally would make existing forms announce success. A queued intent is never a saved entity.
-    throw new ApiError(202, 'sync_pending',
-      'درخواست در صف آنلاین محفوظ است؛ هنوز در شفاخانه تأیید نشده است. نتیجه را در فهرست درخواست‌های آنلاین پیگیری کنید و درخواست را تکرار نکنید.',
-      { commandId: queued.commandId })
-  }
-  if (response.status === 204) return undefined as T
-  return (await response.json()) as T
+      if (!response.ok) throw await toApiError(response)
+      if (response.status === 202 && response.headers.get('Location')?.startsWith('/api/sync/commands/')) {
+        const queued = await response.json() as { commandId: string }
+        // A queued online intent must never look like a confirmed business save.
+        throw new ApiError(202, 'sync_pending',
+          'درخواست در صف آنلاین محفوظ است؛ هنوز در شفاخانه تأیید نشده است. نتیجه را در فهرست درخواست‌های آنلاین پیگیری کنید و درخواست را تکرار نکنید.',
+          { commandId: queued.commandId })
+      }
+      if (response.status === 204) return undefined as T
+      return (await response.json()) as T
+    } catch (cause) {
+      if (cause instanceof ApiError) throw cause
+      if (options.signal?.aborted && cause instanceof DOMException && cause.name === 'AbortError') throw cause
+      if (method === 'GET') {
+        throw new ApiError(0, 'network', 'اتصال با سرور برقرار نشد. اتصال شبکه را بررسی کنید.')
+      }
+      throw new ApiError(
+        0,
+        'outcome_unknown',
+        'ارتباط قطع شد و معلوم نیست این عملیات ثبت شده یا نه. پیش از تکرار، صفحه را تازه کنید و بررسی کنید.',
+      )
+    }
+  })
 }

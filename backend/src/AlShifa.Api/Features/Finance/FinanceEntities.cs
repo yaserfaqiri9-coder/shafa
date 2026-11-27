@@ -120,6 +120,8 @@ public enum PaymentMethod
 
 public class Payment
 {
+    public int Version { get; set; }
+    public long? ReplacementPaymentId { get; set; }
     public long Id { get; set; }
 
     [MaxLength(20)]
@@ -180,6 +182,7 @@ public class CashRegister
 
 public class CashSession
 {
+    [MaxLength(300)] public string? CloseNote { get; set; }
     public long Id { get; set; }
 
     public int RegisterId { get; set; }
@@ -201,6 +204,20 @@ public class CashSession
     public decimal? CountedAmount { get; set; }
 
     public int Version { get; set; }
+}
+
+/// <summary>Actual drawer movements. A null session is explicitly unallocated treasury activity, never inferred into an old drawer.</summary>
+public class CashMovement
+{
+    public long Id { get; set; }
+    public long? CashSessionId { get; set; }
+    public CashSession? CashSession { get; set; }
+    [MaxLength(30)] public string Kind { get; set; } = "";
+    [MaxLength(30)] public string SourceType { get; set; } = "";
+    public long SourceId { get; set; }
+    public decimal Amount { get; set; }
+    public long CreatedByUserId { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }
 
 public class LedgerAccount

@@ -286,25 +286,27 @@ public sealed class SyncWorker(IServiceScopeFactory scopes, IHttpClientFactory h
 
                     var columns = SyncSchema.SyncedColumns(table);
                     var keyColumns = SyncSchema.KeyColumns(table);
-                    var keyIndexes = keyColumns.Select(k => columns.ToList().FindIndex(c => c.Name == k.Name)).ToList();
                     var upserts = new List<JsonElement[]>();
                     var deletes = new List<JsonElement[]>();
-                    foreach (var keyJson in group.Select(c => c.KeyJson).Distinct())
+                    // Keep lookup memory and parameter count bounded even with a large configured batch.
+                    // The input ordinal comes back from MySQL, so string/composite keys use the database's
+                    // own collation and provider conversions, exactly as a separate equality lookup did.
+                    foreach (var chunk in group.Select(c => c.KeyJson).Distinct().Chunk(128))
                     {
-                        var key = JsonSerializer.Deserialize<JsonElement[]>(keyJson)!;
-                        var keyValues = keyColumns.Select((c, i) => SyncValues.ToDb(key[i], c)).ToList();
-                        var where = string.Join(" AND ", keyColumns.Select((k, i) => $"{SyncSchema.Quote(k.Name)}=@k{i}"));
-                        var sql = $"SELECT {string.Join(",", columns.Select(c => SyncSchema.Quote(c.Name)))} FROM {SyncSchema.Quote(table.Name)} WHERE {where}";
-                        var rows = await ReadAsync(db, tx, sql, keyValues.Select((v, i) => ($"@k{i}", v)), ct);
-
-                        // A row that is gone was deleted; one that exists is sent as it is now, whatever happened to it before.
-                        if (rows.Count == 0)
+                        var values = chunk.Select(json => JsonSerializer.Deserialize<JsonElement[]>(json)!)
+                            .Select(key => keyColumns.Select((column, i) => SyncValues.ToDb(key[i], column)).ToArray()).ToArray();
+                        var input = string.Join(" UNION ALL ", values.Select((key, row) =>
+                            $"SELECT {row} AS `ordinal`, " + string.Join(",", key.Select((_, i) => $"@k{row}_{i} AS `k{i}`"))));
+                        var where = string.Join(" AND ", keyColumns.Select((key, i) => $"t.{SyncSchema.Quote(key.Name)}=k.`k{i}`"));
+                        var sql = $"SELECT k.`ordinal`,{string.Join(",", columns.Select(column => $"t.{SyncSchema.Quote(column.Name)}"))} "
+                            + $"FROM {SyncSchema.Quote(table.Name)} t JOIN ({input}) k ON {where}";
+                        var parameters = values.SelectMany((key, row) => key.Select((value, i) => ($"@k{row}_{i}", value)));
+                        var rows = await ReadAsync(db, tx, sql, parameters, ct);
+                        var found = rows.ToDictionary(row => Convert.ToInt32(row[0], CultureInfo.InvariantCulture));
+                        for (var i = 0; i < values.Length; i++)
                         {
-                            deletes.Add(keyValues.Select(SyncValues.ToJson).ToArray());
-                        }
-                        else
-                        {
-                            upserts.Add(rows[0].Select(SyncValues.ToJson).ToArray());
+                            if (found.TryGetValue(i, out var row)) upserts.Add(row.Skip(1).Select(SyncValues.ToJson).ToArray());
+                            else deletes.Add(values[i].Select(SyncValues.ToJson).ToArray());
                         }
                     }
 
@@ -402,13 +404,13 @@ public sealed class SyncWorker(IServiceScopeFactory scopes, IHttpClientFactory h
         if (method != HttpMethod.Get)
         {
             // Compressed on the wire; the signature covers the uncompressed bytes the server reads.
-            var compressed = new MemoryStream();
+            using var compressed = new MemoryStream();
             await using (var gzip = new GZipStream(compressed, CompressionLevel.Fastest, leaveOpen: true))
             {
                 await gzip.WriteAsync(body, ct);
             }
 
-            request.Content = new ByteArrayContent(compressed.ToArray());
+            request.Content = new ByteArrayContent(compressed.GetBuffer(), 0, checked((int)compressed.Length));
             request.Content.Headers.ContentType = new MediaTypeHeaderValue(method == HttpMethod.Post ? "application/json" : "application/octet-stream");
             request.Content.Headers.ContentEncoding.Add("gzip");
         }

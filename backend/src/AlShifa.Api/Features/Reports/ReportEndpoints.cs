@@ -93,7 +93,7 @@ public static class ReportEndpoints
             group p by u.FullName into g
             select new CashierRow(g.Key, g.Sum(x => x.Amount))).ToListAsync(ct);
 
-        var open = db.Invoices.AsNoTracking().Where(i => (i.Status == InvoiceStatus.Issued || i.Status == InvoiceStatus.PartiallyPaid) && i.Total - i.Discount - i.Paid > 0);
+        var open = db.Invoices.AsNoTracking().Where(i => (i.Status == InvoiceStatus.Issued || i.Status == InvoiceStatus.PartiallyPaid) && i.Total - i.Discount - i.Paid + i.Refunded > 0);
         var pharmacy = Revenue(ReportSections.Pharmacy);
         var optical = Revenue(ReportSections.Optical);
 
@@ -105,7 +105,7 @@ public static class ReportEndpoints
             f.StockAdjustments,
             f.Receipts,
             byCashier,
-            await open.SumAsync(i => (decimal?)(i.Total - i.Discount - i.Paid), ct) ?? 0,
+            await open.SumAsync(i => (decimal?)(i.Total - i.Discount - i.Paid + i.Refunded), ct) ?? 0,
             await open.CountAsync(ct),
             await db.StockBatches.AsNoTracking().Where(b => b.Quantity > 0).SumAsync(b => (decimal?)(b.Quantity * b.UnitCost), ct) ?? 0);
     }

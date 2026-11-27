@@ -53,15 +53,23 @@ public sealed class EventsHub(ConnectionTracker tracker) : Hub
     public override async Task OnConnectedAsync()
     {
         tracker.Add(Context);
-        foreach (var (group, permission) in Membership)
+        try
         {
-            if (Context.User!.HasClaim(RolePermissions.ClaimType, permission))
+            foreach (var (group, permission) in Membership)
             {
-                await Groups.AddToGroupAsync(Context.ConnectionId, group);
+                if (Context.User!.HasClaim(RolePermissions.ClaimType, permission))
+                {
+                    await Groups.AddToGroupAsync(Context.ConnectionId, group);
+                }
             }
-        }
 
-        await base.OnConnectedAsync();
+            await base.OnConnectedAsync();
+        }
+        catch
+        {
+            tracker.Remove(Context.ConnectionId);
+            throw;
+        }
     }
 
     public override Task OnDisconnectedAsync(Exception? exception)
@@ -97,7 +105,15 @@ public sealed class OutboxDispatcher(IServiceScopeFactory scopes, IHubContext<Ev
             {
                 using var scope = scopes.CreateScope();
                 var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-                await DispatchAsync(db, stoppingToken);
+                // Drain bursts without the old 100-events/second ceiling. Keep work and tracked rows
+                // bounded so this background task still yields to interactive requests and shutdown.
+                var dispatchTime = System.Diagnostics.Stopwatch.StartNew();
+                for (var batch = 0; batch < 4; batch++)
+                {
+                    if (!await DispatchAsync(db, stoppingToken)) break;
+                    db.ChangeTracker.Clear();
+                    if (dispatchTime.Elapsed >= PollInterval) break;
+                }
 
                 if (DateTime.UtcNow >= nextCleanup)
                 {
@@ -198,7 +214,7 @@ public sealed class OutboxDispatcher(IServiceScopeFactory scopes, IHubContext<Ev
         return deleted;
     }
 
-    private async Task DispatchAsync(AppDbContext db, CancellationToken ct)
+    private async Task<bool> DispatchAsync(AppDbContext db, CancellationToken ct)
     {
         var batch = await db.OutboxEvents.Where(e => e.ProcessedAt == null).OrderBy(e => e.Id).Take(100).ToListAsync(ct);
         foreach (var e in batch)
@@ -212,5 +228,7 @@ public sealed class OutboxDispatcher(IServiceScopeFactory scopes, IHubContext<Ev
         {
             await db.SaveChangesAsync(ct);
         }
+
+        return batch.Count == 100;
     }
 }

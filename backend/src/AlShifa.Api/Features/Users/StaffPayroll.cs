@@ -135,6 +135,7 @@ public static class StaffPayroll
                 db.Expenses.Add(expense);
                 await db.SaveChangesAsync(ct);
                 ledger.Post("Expense", nameof(Expense), expense.Id, expense.Category, (Accounts.Expenses, r.Amount, 0), (Accounts.Cash, 0, r.Amount));
+                await CashBook.RecordAsync(db, user.Id, "Expense", "Expense", expense.Id, -expense.Amount, ct);
                 audit.Add("StaffPayout", nameof(Staff), id.ToString(), expense.ExpenseNumber);
                 await db.SaveChangesAsync(ct);
                 return (StatusCodes.Status201Created, new { expense.Id, expense.ExpenseNumber });

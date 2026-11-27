@@ -194,6 +194,7 @@ public sealed class VisitFeeService(AppDbContext db, DbContextOptions<AppDbConte
 
         db.VisitStatusHistory.Add(new VisitStatusHistory { VisitId = visit.Id, FromStatus = visit.Status, ToStatus = VisitStatus.Cancelled, ChangedByUserId = user.Id });
         visit.Status = VisitStatus.Cancelled;
+        await CloseUnpaidFeeAsync(visit.Id, ct);
         audit.Add("VisitStatusChanged", "Visit", visit.Id.ToString(), $"{nameof(VisitStatus.Cancelled)}: refund");
         outbox.Add("VisitStatusChanged", new { visitId = visit.Id }, VisitService.EventGroups);
         await db.SaveChangesAsync(ct);
@@ -210,7 +211,7 @@ public sealed class VisitFeeService(AppDbContext db, DbContextOptions<AppDbConte
 
         var token = await LockTokenAsync(id, ct);
         var invoice = await invoices.LockAsync(token.InvoiceId, ct);
-        if (invoice.Paid > 0 || invoice.Status == InvoiceStatus.Void)
+        if (invoice.Paid - invoice.Refunded > 0 || invoice.Status == InvoiceStatus.Void)
         {
             return;
         }
@@ -231,7 +232,7 @@ public sealed class VisitFeeService(AppDbContext db, DbContextOptions<AppDbConte
         select new AdmissionRow(
             v.Id, v.VisitNumber, v.QueueNumber, v.QueueShift, v.QueueRound, v.PatientId, v.Patient!.FileNumber, (v.Patient.FirstName + " " + (v.Patient.LastName ?? "")).Trim(),
             v.Department!.Name, v.Doctor != null ? v.Doctor.FullName : null, v.Status.ToString(), v.VisitDate, t.InvoiceId, t.Invoice!.InvoiceNumber,
-            t.Invoice.Total, t.Invoice.Discount, t.Invoice.Total - t.Invoice.Discount - t.Invoice.Paid, t.Invoice.Version,
+            t.Invoice.Total, t.Invoice.Discount, t.Invoice.Total - t.Invoice.Discount - t.Invoice.Paid + t.Invoice.Refunded, t.Invoice.Version,
             t.Invoice.Status != InvoiceStatus.Void && t.Invoice.Total - t.Invoice.Discount <= t.Invoice.Paid - t.Invoice.Refunded,
             db.Payments.Where(p => p.InvoiceId == t.InvoiceId).OrderByDescending(p => p.Id).Select(p => p.ReceiptNumber).FirstOrDefault());
 
@@ -390,6 +391,6 @@ public static class ReceptionFeeEndpoints
 
     private static IQueryable<VisitTokenRow> Rows(IQueryable<VisitToken> tokens) => tokens.Select(t => new VisitTokenRow(
         t.Id, t.QueueNumber, t.TokenDate, t.QueueShift, t.QueueRound, t.DepartmentId, t.Department!.Name, t.DoctorStaffId, t.Doctor != null ? t.Doctor.FullName : null,
-        t.InvoiceId, t.Invoice!.InvoiceNumber, t.Invoice.Total, t.Invoice.Discount, t.Invoice.Total - t.Invoice.Discount - t.Invoice.Paid, t.Invoice.Version,
+        t.InvoiceId, t.Invoice!.InvoiceNumber, t.Invoice.Total, t.Invoice.Discount, t.Invoice.Total - t.Invoice.Discount - t.Invoice.Paid + t.Invoice.Refunded, t.Invoice.Version,
         t.Invoice.Status != InvoiceStatus.Void && t.Invoice.Total - t.Invoice.Discount <= t.Invoice.Paid - t.Invoice.Refunded, t.Version));
 }

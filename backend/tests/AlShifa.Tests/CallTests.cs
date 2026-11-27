@@ -168,7 +168,8 @@ public sealed class CallTests(ApiFixture api) : PhysicalQueueTestScope(api)
 
         // Referred to refraction before any exam is written: seen at once, and still this doctor's patient.
         var tests = await doctor.GetFromJsonAsync<JsonElement>("/api/diagnostic-tests");
-        var refraction = tests.EnumerateArray().First(t => t.GetProperty("kind").GetString() == "Refraction").GetProperty("id").GetInt32();
+        var refraction = tests.EnumerateArray().First(t => t.GetProperty("kind").GetString() == "Refraction"
+            && t.GetProperty("serviceId").ValueKind == JsonValueKind.Number).GetProperty("id").GetInt32();
         var order = await Read<DiagnosticOrderDto>(await doctor.SendAsync(Keyed("/api/diagnostic-orders", new CreateDiagnosticOrderRequest(two.Patient.Id, two.Visit.Id, refraction, null))), HttpStatusCode.Created);
         lists = await Lists();
         Assert.Contains(lists.Seen, v => v.Id == two.Visit.Id && v.Status == nameof(VisitStatus.AwaitingDiagnostic) && !v.ResultReady);

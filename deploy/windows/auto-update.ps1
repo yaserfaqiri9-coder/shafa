@@ -1,5 +1,5 @@
-# SYSTEM worker: checks hourly. A signed, verified newer version installs either after an explicit, version-specific
-# administrator approval event, or (autoInstall) by itself inside the night window. update.ps1 backs up, proves the
+# SYSTEM worker: checks every minute. A signed, verified newer version installs only after an explicit, version-specific
+# administrator approval. update.ps1 backs up, proves the
 # backup restores, migrates a disposable copy first and rolls back the application and database on any failure.
 param([string]$Root = 'C:\AlShifa', [switch]$InstallApproved)
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -9,7 +9,7 @@ $settingsPath = Join-Path $Root 'secrets\auto-update.json'
 $cache = Join-Path $Root 'updates'
 $lock = $null
 $status = [ordered]@{ configured = $false; state = 'unconfigured'; checkedAt = (Get-Date).ToUniversalTime().ToString('o'); lastError = $null }
-# The failure memory survives runs, so a version that failed is not retried every hour (each try stops the system).
+# Failure memory survives checks. Installation is never retried without another approval.
 $previousStatus = $null
 try { if (Test-Path -LiteralPath $statusPath) { $previousStatus = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json } } catch { }
 foreach ($kept in 'failedVersion', 'failedAttempts', 'failedAt', 'installedAt') {
@@ -25,12 +25,8 @@ try {
     New-Item -ItemType Directory -Force $cache, (Split-Path $statusPath) | Out-Null
     try { $lock = [IO.File]::Open((Join-Path $cache 'worker.lock'), 'OpenOrCreate', 'ReadWrite', 'None') } catch { exit 0 }
     if (-not (Test-Path -LiteralPath $settingsPath)) { Save-UpdateStatus; exit 0 }
-    $hostConfig=Get-Content -LiteralPath (Join-Path $Root 'app\appsettings.Production.json') -Raw | ConvertFrom-Json
-    if($hostConfig.Sync.RequireCompatibilityApproval -eq $true){
-        $status.state='compatibilityReviewRequired'
-        $status.lastError='Online services await technical compatibility approval; local work and backup remain available.'
-        Save-UpdateStatus; exit 0
-    }
+    # Downloading a signed update must remain possible while Sync is held. The
+    # installed worker retains its own identity/schema/protocol checks throughout.
     $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
     $status.configured = $true
     $feed = [uri]$settings.manifestUrl
@@ -62,27 +58,25 @@ try {
     $stage = 'verify-archive'
     Assert-UpdateArchive $package $destination
     $status.state = 'awaitingApproval'
-    $automatic = $false
-    if (-not $InstallApproved -and $settings.autoInstall -eq $true) {
-        $decision = Get-AutoInstallDecision $settings $status ([string]$manifest.version) (Get-Date)
-        $status.state = $decision.State
-        $status.autoInstallWindow = $decision.Window
-        $automatic = $decision.Install
-    }
+    $status.packageVerified = $true
     Save-UpdateStatus
-    if (-not $InstallApproved -and -not $automatic) { exit 0 }
-    if (-not $automatic) {
+    # An approval event can arrive while a check owns worker.lock. The next
+    # minute also consumes the protected request, so the click is not lost.
+    $approvalFile = Join-Path $Root 'requests\update-approval.json'
+    if (-not $InstallApproved -and -not (Test-Path -LiteralPath $approvalFile)) { exit 0 }
     $stage = 'approval'
+    try { Assert-UpdateApproval $approvalFile ([string]$manifest.version) } catch {
+        if ($InstallApproved) { throw }
+        exit 0
+    }
     $approval = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'AlShifa.Api'; Id = 4101 } -MaxEvents 1 -ErrorAction Stop
     if ($approval.TimeCreated.ToUniversalTime() -lt (Get-Date).ToUniversalTime().AddMinutes(-10) -or $approval.Message.Trim() -ne "AlShifa update approval $($manifest.version)") { throw 'Recent administrator approval for this exact version is required.' }
-    $approvalFile = Join-Path $Root 'requests\update-approval.json'
-    Assert-UpdateApproval $approvalFile ([string]$manifest.version)
     # Local event writers cannot authorize an installation; only the API service can write this protected file.
     Move-Item -LiteralPath $approvalFile -Destination (Join-Path $cache ('approval-consumed-' + [Guid]::NewGuid().ToString('N') + '.json'))
-    }
     [IO.Compression.ZipFile]::ExtractToDirectory($package, $destination)
     $release = Get-Content -LiteralPath (Join-Path $destination 'app\release.json') -Raw | ConvertFrom-Json
     if ($release.version -ne $manifest.version) { throw 'Signed release version does not match package.' }
+    if (-not $manifest.schema -or $release.schema -ne $manifest.schema) { throw 'Signed schema does not match package.' }
     # Recheck immediately before execution. Only trusted, signed package scripts run with SYSTEM privileges.
     if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -ne $manifest.sha256) { throw 'Update package changed.' }
     $status.state = 'installing'

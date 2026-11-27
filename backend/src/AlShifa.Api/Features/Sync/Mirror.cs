@@ -106,8 +106,14 @@ public static class MirrorEndpoints
         {
             await SyncSignature.ReadVerifiedAsync(http, options.Value.SyncKey, 0, ct);
             var root = SettingsEndpoints.StorageRoot(config, env);
-            var names = await db.Attachments.AsNoTracking().Select(a => a.StoredName).ToListAsync(ct);
-            return Results.Ok(names.Where(n => !File.Exists(Path.Combine(root, n))).Take(200).ToList());
+            var missing = new List<string>(200);
+            await foreach (var name in db.Attachments.AsNoTracking().Select(a => a.StoredName).AsAsyncEnumerable().WithCancellation(ct))
+            {
+                if (File.Exists(Path.Combine(root, name))) continue;
+                missing.Add(name);
+                if (missing.Count == 200) break;
+            }
+            return Results.Ok(missing);
         });
 
         group.MapPut("/files/{name}", async (string name, HttpContext http, AppDbContext db, IOptions<MirrorOptions> options, IConfiguration config, IHostEnvironment env, CancellationToken ct) =>

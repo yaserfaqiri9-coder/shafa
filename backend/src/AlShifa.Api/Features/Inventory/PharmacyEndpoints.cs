@@ -174,7 +174,7 @@ public static class PharmacyEndpoints
                 {
                     Row = new PharmacyQueueBill(s.Id, s.SaleNumber, s.PrescriptionId, s.Prescription != null ? s.Prescription.RxNumber : null, s.PatientId,
                         s.Patient != null ? (s.Patient.FirstName + " " + (s.Patient.LastName ?? "")).Trim() : null, s.Patient != null ? s.Patient.FileNumber : null,
-                        s.Invoice!.InvoiceNumber, s.Invoice.Total - s.Invoice.Discount, s.Invoice.Total - s.Invoice.Discount - s.Invoice.Paid, s.CreatedAt, s.CreatedAt < cutoff, s.Version, s.Invoice.Visit != null ? s.Invoice.Visit.QueueNumber : null),
+                        s.Invoice!.InvoiceNumber, s.Invoice.Total - s.Invoice.Discount, s.Invoice.Total - s.Invoice.Discount - s.Invoice.Paid + s.Invoice.Refunded, s.CreatedAt, s.CreatedAt < cutoff, s.Version, s.Invoice.Visit != null ? s.Invoice.Visit.QueueNumber : null),
                     Paid = s.Invoice.Status != InvoiceStatus.Void && s.Invoice.Total - s.Invoice.Discount <= s.Invoice.Paid - s.Invoice.Refunded,
                 })
                 .Take(300)
@@ -311,7 +311,7 @@ public static class PharmacyEndpoints
         var bills = await db.Sales.AsNoTracking().Where(s => s.PrescriptionId == id).OrderByDescending(s => s.Id)
             .Select(s => new
             {
-                s.Id, s.SaleNumber, s.Invoice!.InvoiceNumber, Total = s.Invoice.Total - s.Invoice.Discount, Balance = s.Invoice.Status == InvoiceStatus.Void ? 0 : s.Invoice.Total - s.Invoice.Discount - s.Invoice.Paid,
+                s.Id, s.SaleNumber, s.Invoice!.InvoiceNumber, Total = s.Invoice.Total - s.Invoice.Discount, Balance = s.Invoice.Status == InvoiceStatus.Void ? 0 : s.Invoice.Total - s.Invoice.Discount - s.Invoice.Paid + s.Invoice.Refunded,
                 Paid = s.Invoice.Status != InvoiceStatus.Void && s.Invoice.Total - s.Invoice.Discount <= s.Invoice.Paid - s.Invoice.Refunded,
                 s.IsReturned, s.CreatedAt, s.DeliveredAt, DeliveredBy = db.Users.Where(u => u.Id == s.DeliveredByUserId).Select(u => u.FullName).FirstOrDefault(),
                 s.UnpaidDeliveryReason, s.Version,

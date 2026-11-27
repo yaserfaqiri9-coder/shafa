@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { askConfirm } from '@/components/confirm'
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, errorMessage } from '@/api/http'
 import { usePagedList } from '@/api/paged'
@@ -8,6 +8,8 @@ import { useLiveRefresh } from '@/api/realtime'
 import UiModal from '@/components/UiModal.vue'
 import UiPager from '@/components/UiPager.vue'
 import UiRowMenu from '@/components/UiRowMenu.vue'
+import UiPeriodFilter from '@/components/UiPeriodFilter.vue'
+import { quickRange, type DateRange } from '@/utils/period'
 import QueueCallActions from '@/features/clinical/queue/QueueCallActions.vue'
 import { callStateOf } from '@/features/clinical/queue/queueState'
 import CallNotice from '@/features/calls/CallNotice.vue'
@@ -61,6 +63,7 @@ const search = ref('')
 const rxScope = computed(() => (tab.value === 'all' ? 'all' : 'waiting'))
 /** Sales: one server status, or the separate complimentary report. */
 const salesFilter = ref('')
+const salesPeriod = ref<DateRange | null>(quickRange('today'))
 
 const prescriptions = ref<OpticalRx[]>([])
 // Search goes to the server, so an order from days ago is found by name or phone, not only on the page shown.
@@ -69,12 +72,14 @@ const orderList = usePagedList<OrderRow>(() => {
   if (salesFilter.value && salesFilter.value !== 'free') params.set('status', salesFilter.value)
   const q = plain(search.value)
   if (q) params.set('q', q)
+  if (salesPeriod.value) { params.set('from', salesPeriod.value.from); params.set('to', salesPeriod.value.to) }
   const query = params.toString()
   return `/optical/orders${query ? `?${query}` : ''}`
 })
 const orders = orderList.rows
 const complimentaryOrders = ref<ComplimentaryOrderRow[]>([])
 const loading = ref(true)
+const salesLoading = ref(false)
 const error = ref('')
 
 function plain(text: string | null | undefined) {
@@ -91,21 +96,27 @@ const waitingCount = computed(() => prescriptions.value.filter((rx) => !rx.order
 const visibleRx = computed(() => prescriptions.value
   .filter((rx) => rxScope.value === 'all' || !rx.orderStatus)
   .filter((rx) => matches(rx.patientName, rx.rxNumber, rx.patientFileNumber, rx.queueNumber)))
-// Cancelled orders leave the everyday list; the «لغو شده» filter still shows them.
-const visibleOrders = computed(() => orders.value.filter((row) => (salesFilter.value || row.status !== 'Cancelled') && matches(row.patientName, row.customerPhone, row.orderNumber, row.invoiceNumber, row.description)))
-const visibleFree = computed(() => complimentaryOrders.value.filter((row) => matches(row.patientName, row.orderNumber, row.items)))
+// The server searches and filters the entire history before pagination, including cancelled orders.
 
 async function loadPrescriptions() {
   const q = search.value.trim()
   prescriptions.value = await api<OpticalRx[]>(`/optical-prescriptions${q ? `?q=${encodeURIComponent(q)}` : ''}`)
 }
 
+let freeLoadVersion = 0
 async function loadSales() {
-  if (salesFilter.value === 'free') {
-    complimentaryOrders.value = await api<ComplimentaryOrderRow[]>('/optical/reports/complimentary')
-  } else {
-    await orderList.load()
-  }
+  const version = ++freeLoadVersion
+  salesLoading.value = true
+  try {
+    if (salesFilter.value === 'free') {
+      const params = new URLSearchParams({ q: plain(search.value) })
+      if (salesPeriod.value) { params.set('from', salesPeriod.value.from); params.set('to', salesPeriod.value.to) }
+      const rows = await api<ComplimentaryOrderRow[]>(`/optical/reports/complimentary?${params}`)
+      if (version === freeLoadVersion) complimentaryOrders.value = rows
+    } else {
+      await orderList.load()
+    }
+  } finally { if (version === freeLoadVersion) salesLoading.value = false }
 }
 
 async function load() {
@@ -123,9 +134,12 @@ async function load() {
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 watch(search, () => {
   clearTimeout(searchTimer)
-  searchTimer = setTimeout(() => Promise.all([loadPrescriptions(), salesFilter.value === 'free' ? null : orderList.first()]).catch((cause) => (error.value = errorMessage(cause))), 300)
+  searchTimer = setTimeout(() => {
+    orderList.page.value = 1
+    Promise.all([loadPrescriptions(), loadSales()]).catch((cause) => (error.value = errorMessage(cause)))
+  }, 300)
 })
-watch(salesFilter, () => {
+watch([salesFilter, salesPeriod], () => {
   orderList.page.value = 1
   loadSales().catch((cause) => (error.value = errorMessage(cause)))
 })
@@ -190,6 +204,7 @@ const eyeLine = (sph?: string | null, cyl?: string | null, axis?: string | null,
 
 useLiveRefresh(['OpticalPrescriptionCreated', 'OpticalOrderChanged', 'InventoryChanged', 'PaymentReceived'], load)
 onMounted(load)
+onBeforeUnmount(() => { clearTimeout(searchTimer); freeLoadVersion++ })
 </script>
 
 <template>
@@ -219,7 +234,7 @@ onMounted(load)
           <button v-if="search" type="button" class="dq-search__clear" aria-label="پاک کردن جستجو" @click="search = ''"><i class="ri-close-line" aria-hidden="true"></i></button>
         </label>
         <select v-if="tab === 'sales'" v-model="salesFilter" class="form-select dq-select" aria-label="فیلتر فروشات">
-          <option value="">در جریان و تحویل‌شده</option>
+          <option value="">همه فروشات</option>
           <option value="Ordered">سفارش‌شده</option>
           <option value="InWorkshop">در کارگاه</option>
           <option value="Ready">آماده تحویل</option>
@@ -228,6 +243,7 @@ onMounted(load)
           <option v-if="auth.can('reports.view')" value="free">تحویل رایگان</option>
         </select>
       </div>
+      <UiPeriodFilter v-if="tab === 'sales'" v-model="salesPeriod" allow-all :kinds="['today', 'yesterday', 'custom']" :label="salesFilter === 'free' ? 'تاریخ تحویل رایگان' : 'تاریخ ثبت فروش عینک'" />
 
       <template v-if="tab !== 'sales'">
         <CallNotice :desks="[calls]" :numbers="false" />
@@ -260,9 +276,10 @@ onMounted(load)
       </template>
 
       <template v-else-if="salesFilter === 'free'">
-        <div v-if="visibleFree.length === 0" class="xr-state">تحویل رایگان ثبت نشده است.</div>
+        <div v-if="salesLoading" class="xr-state" role="status">در حال بارگذاری...</div>
+        <div v-else-if="complimentaryOrders.length === 0" class="xr-state">در تاریخ و جستجوی انتخاب‌شده تحویل رایگانی پیدا نشد.</div>
         <ol v-else class="dq" aria-label="تحویل‌های رایگان">
-          <li v-for="row in visibleFree" :key="row.id" class="dq__row">
+          <li v-for="row in complimentaryOrders" :key="row.id" class="dq__row">
             <div class="dq__num"><strong class="ltr-num dq__code">{{ row.orderNumber }}</strong></div>
             <div class="dq__who">
               <div class="dq__name">{{ row.patientName ?? 'بدون نسخه' }}</div>
@@ -275,10 +292,10 @@ onMounted(load)
       </template>
 
       <template v-else>
-        <div v-if="loading" class="xr-state" role="status">در حال بارگذاری...</div>
-        <div v-else-if="visibleOrders.length === 0" class="xr-state">فروشی پیدا نشد.</div>
+        <div v-if="loading || salesLoading" class="xr-state" role="status">در حال بارگذاری...</div>
+        <div v-else-if="orders.length === 0" class="xr-state">در تاریخ و جستجوی انتخاب‌شده فروشی پیدا نشد.</div>
         <ol v-else class="dq" aria-label="فروشات عینک">
-          <li v-for="row in visibleOrders" :key="row.id" class="dq__row" :class="{ 'dq__row--next': row.status === 'Ready', 'dq__row--away': row.status === 'Cancelled' }">
+          <li v-for="row in orders" :key="row.id" class="dq__row" :class="{ 'dq__row--next': row.status === 'Ready', 'dq__row--away': row.status === 'Cancelled' }">
             <div class="dq__num"><strong class="ltr-num dq__code">{{ row.orderNumber }}</strong></div>
             <div class="dq__who">
               <div class="dq__name">{{ row.patientName ?? 'بدون نسخه' }}</div>

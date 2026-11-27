@@ -143,11 +143,15 @@ public static class ReportFigures
             select new { Code = g.Key, Debit = g.Sum(x => x.Debit), Credit = g.Sum(x => x.Credit) }).ToListAsync(ct);
         decimal DebitNet(string code) => movement.Where(m => m.Code == code).Sum(m => m.Debit - m.Credit);
 
-        var cashOpening = await (
-            from e in db.LedgerEntries.AsNoTracking()
-            join t in db.LedgerTransactions.AsNoTracking() on e.TransactionId equals t.Id
-            where e.AccountCode == Accounts.Cash && t.CreatedAt < startUtc
-            select (decimal?)(e.Debit - e.Credit)).SumAsync(ct) ?? 0;
+        // Two indexed aggregates in ONE statement preserve a consistent balance while avoiding
+        // a join for every historical cash entry. Future-dated entries cancel out as well.
+        var cashOpening = await db.LedgerAccounts.AsNoTracking().Where(a => a.Code == Accounts.Cash)
+            .Select(a => (db.LedgerEntries.Where(e => e.AccountCode == a.Code).Sum(e => (decimal?)(e.Debit - e.Credit)) ?? 0)
+                - ((from e in db.LedgerEntries
+                    join t in db.LedgerTransactions on e.TransactionId equals t.Id
+                    where e.AccountCode == a.Code && t.CreatedAt >= startUtc
+                    select (decimal?)(e.Debit - e.Credit)).Sum() ?? 0))
+            .SingleOrDefaultAsync(ct);
 
         var payments = await db.Payments.AsNoTracking().Where(p => p.CreatedAt >= startUtc && p.CreatedAt < endUtc)
             .Select(p => new Received(p.Id, p.InvoiceId, p.Amount, p.Method == PaymentMethod.Cash)).ToListAsync(ct);
@@ -186,10 +190,16 @@ public static class ReportFigures
     /// </summary>
     private static async Task<List<SectionFigures>> SectionsAsync(DateTime startUtc, DateTime endUtc, List<Received> payments, List<Received> refunds, AppDbContext db, CancellationToken ct)
     {
-        var lines = await ItemSections(db)
-            .Where(s => db.Payments.Any(p => p.InvoiceId == s.InvoiceId && p.CreatedAt >= startUtc && p.CreatedAt < endUtc)
-                || db.Refunds.Any(r => r.CreatedAt >= startUtc && r.CreatedAt < endUtc && db.Payments.Any(p => p.Id == r.PaymentId && p.InvoiceId == s.InvoiceId)))
-            .Select(s => new { s.InvoiceId, s.Section, s.LineTotal, s.IsVoid }).ToListAsync(ct);
+        // UNION deduplicates partial receipts/refunds before the join, preserving exactly one copy
+        // of each invoice line. The date indexes drive this query instead of scanning all old lines.
+        var affectedInvoices = db.Payments.Where(p => p.CreatedAt >= startUtc && p.CreatedAt < endUtc).Select(p => p.InvoiceId)
+            .Union(from refund in db.Refunds
+                   join payment in db.Payments on refund.PaymentId equals payment.Id
+                   where refund.CreatedAt >= startUtc && refund.CreatedAt < endUtc
+                   select payment.InvoiceId);
+        var lines = await (from id in affectedInvoices
+                           join section in ItemSections(db) on id equals section.InvoiceId
+                           select new { section.InvoiceId, section.Section, section.LineTotal, section.IsVoid }).ToListAsync(ct);
 
         // Each invoice's share per section: its lines still charged, or, when all were taken back, the lines it had.
         var shares = lines.GroupBy(l => l.InvoiceId).ToDictionary(g => g.Key, g =>

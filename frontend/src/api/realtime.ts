@@ -18,17 +18,25 @@ function notify(type: string, payload?: string) {
   for (const listener of listeners) listener(type, payload)
 }
 
-async function start() {
-  if (!connection) return
+async function start(current: HubConnection) {
+  if (connection !== current) return
   try {
-    await connection.start()
+    await current.start()
+    if (connection !== current) return
     liveConnected.value = true
     // Anything missed while disconnected is read back from the database.
     notify(RECONNECTED)
   } catch {
+    if (connection !== current) return
     liveConnected.value = false
-    restartTimer = setTimeout(start, RESTART_DELAY_MS)
+    scheduleRestart(current)
   }
+}
+
+function scheduleRestart(current: HubConnection) {
+  if (connection !== current) return
+  clearTimeout(restartTimer)
+  restartTimer = setTimeout(() => start(current), RESTART_DELAY_MS)
 }
 
 export function connectRealtime() {
@@ -39,20 +47,27 @@ export function connectRealtime() {
     .configureLogging(LogLevel.None)
     .build()
 
-  connection.on('event', (event: { type: string; payload?: string }) => notify(event.type, event.payload))
+  const current = connection
+  connection.on('event', (event: { type: string; payload?: string }) => {
+    if (connection === current) notify(event.type, event.payload)
+  })
   connection.on('chatMessage', (message: { senderUserId: number; recipientUserId: number }) =>
-    notify('chatMessage', JSON.stringify(message)),
+    connection === current && notify('chatMessage', JSON.stringify(message)),
   )
-  connection.onreconnecting(() => (liveConnected.value = false))
+  connection.onreconnecting(() => {
+    if (connection === current) liveConnected.value = false
+  })
   connection.onreconnected(() => {
+    if (connection !== current) return
     liveConnected.value = true
     notify(RECONNECTED)
   })
   connection.onclose(() => {
+    if (connection !== current) return
     liveConnected.value = false
-    if (connection) restartTimer = setTimeout(start, RESTART_DELAY_MS)
+    scheduleRestart(current)
   })
-  start()
+  void start(current)
 }
 
 export function disconnectRealtime() {
@@ -60,7 +75,7 @@ export function disconnectRealtime() {
   const current = connection
   connection = null
   liveConnected.value = false
-  if (current && current.state !== HubConnectionState.Disconnected) current.stop()
+  if (current && current.state !== HubConnectionState.Disconnected) void current.stop().catch(() => {})
 }
 
 /**
@@ -73,10 +88,17 @@ export function useLiveRefresh(eventTypes: string[], load: () => unknown, refres
   let timer: ReturnType<typeof setInterval> | undefined
   let running = false
   let again = false
+  let disposed = false
+  let hiddenChange = false
 
   // One load at a time: a burst of events during a load causes one more load after it, never an overlapping one
   // whose older answer could land last and show stale rows.
   async function run() {
+    if (disposed) return
+    if (document.hidden) {
+      hiddenChange = true
+      return
+    }
     if (running) {
       again = true
       return
@@ -89,7 +111,7 @@ export function useLiveRefresh(eventTypes: string[], load: () => unknown, refres
     } finally {
       running = false
     }
-    if (again) {
+    if (again && !disposed) {
       again = false
       run()
     }
@@ -97,26 +119,35 @@ export function useLiveRefresh(eventTypes: string[], load: () => unknown, refres
 
   const listener: Listener = (type, payload) => {
     if (type !== RECONNECTED && (!eventTypes.includes(type) || (accept && !accept(type, parseIds(payload))))) return
+    if (document.hidden) {
+      hiddenChange = true
+      return
+    }
     clearTimeout(debounce)
     debounce = setTimeout(run, 200)
   }
 
   // A hidden tab skips the safety refresh and catches up as soon as it is shown again.
   const onVisible = () => {
-    if (!document.hidden) run()
+    if (!document.hidden && (hiddenChange || refreshMs > 0)) {
+      hiddenChange = false
+      void run()
+    }
   }
 
   onMounted(() => {
     listeners.add(listener)
+    document.addEventListener('visibilitychange', onVisible)
     if (refreshMs <= 0) return
     // Safety net: a lost event can delay a screen but never leave it stale for long.
     timer = setInterval(() => {
       if (!document.hidden) run()
     }, refreshMs)
-    document.addEventListener('visibilitychange', onVisible)
   })
 
   onBeforeUnmount(() => {
+    disposed = true
+    again = false
     listeners.delete(listener)
     clearTimeout(debounce)
     clearInterval(timer)

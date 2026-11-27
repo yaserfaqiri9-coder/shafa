@@ -264,7 +264,7 @@ public static class PrintEndpoints
             var pharmacy = s.Kind == SaleKind.Pharmacy;
             var invoice = s.Invoice!;
             var printableItems = await BillingLinesAsync(db, items, ct);
-            return Results.Ok(new PrintDocument(pharmacy ? "فاکتور دواخانه" : "فاکتور عینک", pharmacy ? invoice.InvoiceNumber : s.SaleNumber, s.CreatedAt, pharmacy ? A4 : Receipt, await SettingsEndpoints.LoadAsync(db, ct),
+            return Results.Ok(new PrintDocument(pharmacy ? "فاکتور دواخانه" : "فاکتور عینک", pharmacy ? invoice.InvoiceNumber : s.SaleNumber, s.CreatedAt, Receipt, await SettingsEndpoints.LoadAsync(db, ct),
             [
                 new("نام مریض", s.Patient is null ? null : Name(s.Patient.FirstName, s.Patient.LastName)),
                 ..InvoiceStanding(invoice),

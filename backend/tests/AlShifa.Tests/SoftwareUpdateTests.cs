@@ -39,7 +39,10 @@ public sealed class SoftwareUpdateTests(ApiFixture api)
             Assert.Equal(HttpStatusCode.Conflict, (await admin.PostAsJsonAsync("/api/settings/software-update/approve", new { version = status.AvailableVersion })).StatusCode);
             Assert.Equal(before, api.UpdateTrigger.Versions.Count);
             await File.WriteAllTextAsync(path, JsonSerializer.Serialize(status, JsonSerializerOptions.Web));
-            Assert.Equal(HttpStatusCode.Accepted, (await admin.PostAsJsonAsync("/api/settings/software-update/approve", new { version = status.AvailableVersion })).StatusCode);
+            var accepted = await admin.PostAsJsonAsync("/api/settings/software-update/approve", new { version = status.AvailableVersion });
+            Assert.Equal(HttpStatusCode.Accepted, accepted.StatusCode);
+            using var body = JsonDocument.Parse(await accepted.Content.ReadAsStringAsync());
+            Assert.Equal("requested", body.RootElement.GetProperty("state").GetString());
             Assert.Equal(before + 1, api.UpdateTrigger.Versions.Count);
             Assert.Equal(status.AvailableVersion, api.UpdateTrigger.Versions.Last());
         }
@@ -48,5 +51,30 @@ public sealed class SoftwareUpdateTests(ApiFixture api)
             configuration["Update:StatusFile"] = oldPath;
             File.Delete(path);
         }
+    }
+
+    [Theory]
+    [InlineData("downloading", false, -1, "2026.11.20.1")]
+    [InlineData("failed", false, -1, "2026.11.20.1")]
+    [InlineData("awaitingApproval", true, -11, "2026.11.20.1")]
+    [InlineData("awaitingApproval", true, 2, "2026.11.20.1")]
+    [InlineData("awaitingApproval", true, -1, "2026.11.21.1")]
+    [InlineData("awaitingApproval", true, -1, "2026.11.22.1")]
+    public async Task Unready_stale_future_or_non_newer_versions_never_trigger_installation(string state, bool verified, int age, string current)
+    {
+        var admin = await UserAsync(Roles.SuperAdmin);
+        var configuration = api.Services.GetRequiredService<IConfiguration>();
+        var oldPath = configuration["Update:StatusFile"];
+        var path = Path.Combine(Path.GetTempPath(), "alshifa-update-guard-" + Guid.NewGuid() + ".json");
+        var before = api.UpdateTrigger.Versions.Count;
+        configuration["Update:StatusFile"] = path;
+        try
+        {
+            var status = new SoftwareUpdateStatus(true, state, current, "2026.11.21.1", DateTime.UtcNow.AddMinutes(age), PackageVerified: verified);
+            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(status, JsonSerializerOptions.Web));
+            Assert.Equal(HttpStatusCode.Conflict, (await admin.PostAsJsonAsync("/api/settings/software-update/approve", new { version = status.AvailableVersion })).StatusCode);
+            Assert.Equal(before, api.UpdateTrigger.Versions.Count);
+        }
+        finally { configuration["Update:StatusFile"] = oldPath; File.Delete(path); }
     }
 }

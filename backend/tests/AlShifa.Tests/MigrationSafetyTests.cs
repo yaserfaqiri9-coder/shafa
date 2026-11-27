@@ -9,8 +9,54 @@ using Microsoft.EntityFrameworkCore.Migrations;
 namespace AlShifa.Tests;
 
 /// <summary>Rehearses the upgrade to Refractions and VisitTokens on a throwaway database holding records from before them.</summary>
-public sealed class MigrationSafetyTests
+public sealed partial class MigrationSafetyTests
 {
+    [Fact]
+    public async Task Daily_cash_upgrade_preserves_original_receipts_closed_drawers_and_sync_checkpoints()
+    {
+        var connection = ConnectionString();
+        Assert.True(DatabaseSafety.IsDisposable(connection));
+        await using var db = new AppDbContext(new DbContextOptionsBuilder<AppDbContext>().UseMySQL(connection).Options);
+        await db.Database.EnsureDeletedAsync();
+        try
+        {
+            await db.GetService<IMigrator>().MigrateAsync("20261125105153_OpticalOrderCustomerName");
+            await db.Database.ExecuteSqlRawAsync("""
+                INSERT INTO LedgerAccounts(Code,Name) VALUES ('1000','cash'),('1100','due'),('4000','income'),('4950','refund');
+                INSERT INTO CashRegisters(Id,Name,IsActive) VALUES(1,'Synthetic',1);
+                INSERT INTO CashSessions(Id,RegisterId,OpenedByUserId,OpeningAmount,OpenedAt,ClosedByUserId,ClosedAt,ExpectedAmount,CountedAmount,Version)
+                VALUES(1,1,1,0,UTC_TIMESTAMP(6),1,UTC_TIMESTAMP(6),100,100,2);
+                INSERT INTO Invoices(Id,InvoiceNumber,Status,Total,Discount,Paid,Refunded,IssuedByUserId,CreatedAt,Version)
+                VALUES(1,'legacy-test','Paid',100,0,100,20,1,UTC_TIMESTAMP(6),3);
+                INSERT INTO Payments(Id,ReceiptNumber,InvoiceId,Amount,Method,CashSessionId,ReceivedByUserId,CreatedAt,Refunded)
+                VALUES(1,'legacy-receipt',1,100,'Cash',1,1,UTC_TIMESTAMP(6),20);
+                INSERT INTO Refunds(Id,RefundNumber,PaymentId,Amount,Reason,ApprovedByUserId,CreatedAt) VALUES(1,'legacy-refund',1,20,'Synthetic',1,UTC_TIMESTAMP(6));
+                INSERT INTO LedgerTransactions(Id,Kind,SourceType,SourceId,CreatedByUserId,CreatedAt) VALUES
+                (1,'Charge','Invoice',1,1,UTC_TIMESTAMP(6)),(2,'Payment','Payment',1,1,UTC_TIMESTAMP(6)),(3,'Refund','Refund',1,1,UTC_TIMESTAMP(6));
+                INSERT INTO LedgerEntries(TransactionId,AccountCode,Debit,Credit) VALUES(1,'1100',100,0),(1,'4000',0,100),(2,'1000',100,0),(2,'1100',0,100),(3,'4950',20,0),(3,'1000',0,20);
+                INSERT INTO SyncStates(`Key`,Value,UpdatedAt) VALUES('push.ackedSeq','123',UTC_TIMESTAMP(6));
+                INSERT INTO SyncChanges(TableName,KeyJson,CreatedAt) VALUES('Patients','[999]',UTC_TIMESTAMP(6));
+                """);
+            await db.Database.MigrateAsync();
+            var payment = await db.Payments.SingleAsync();
+            Assert.Equal((100m, 20m, "legacy-receipt"), (payment.Amount, payment.Refunded, payment.ReceiptNumber));
+            var session = await db.CashSessions.SingleAsync();
+            Assert.Equal((100m, 100m, 2), (session.ExpectedAmount, session.CountedAmount, session.Version));
+            var invoice = await db.Invoices.SingleAsync();
+            Assert.Equal((20m, AlShifa.Api.Features.Finance.InvoiceStatus.PartiallyPaid), (AlShifa.Api.Features.Finance.InvoiceService.Balance(invoice), invoice.Status));
+            var due = await db.LedgerEntries.Where(e => e.AccountCode == "1100").SumAsync(e => e.Debit - e.Credit);
+            Assert.Equal(20, due);
+            Assert.Equal("123", await db.SyncStates.Where(s => s.Key == "push.ackedSeq").Select(s => s.Value).SingleAsync());
+            Assert.True(await db.SyncChanges.AnyAsync(s => s.TableName == "Patients" && s.KeyJson == "[999]"));
+            Assert.True(await db.SyncChanges.AnyAsync(s => s.TableName == "LedgerTransactions"));
+            var movement = Assert.Single(await db.CashMovements.ToListAsync());
+            Assert.Null(movement.CashSessionId);
+            Assert.Equal(-20, movement.Amount);
+            Assert.Throws<NotSupportedException>(() => new AlShifa.Api.Infrastructure.Migrations.DailyCashWorkspace().DownOperations);
+        }
+        finally { await db.Database.EnsureDeletedAsync(); }
+    }
+
     [Fact]
     public async Task Physical_card_migration_preserves_legacy_duplicate_rounds_and_sync_progress()
     {

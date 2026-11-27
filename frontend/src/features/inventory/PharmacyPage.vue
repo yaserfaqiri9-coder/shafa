@@ -7,6 +7,8 @@ import { useLiveRefresh } from '@/api/realtime'
 import UiModal from '@/components/UiModal.vue'
 import UiPager from '@/components/UiPager.vue'
 import UiListSkeleton from '@/components/UiListSkeleton.vue'
+import UiPeriodFilter from '@/components/UiPeriodFilter.vue'
+import { quickRange, type DateRange } from '@/utils/period'
 import QueueCallActions from '@/features/clinical/queue/QueueCallActions.vue'
 import { callStateOf } from '@/features/clinical/queue/queueState'
 import CallNotice from '@/features/calls/CallNotice.vue'
@@ -114,9 +116,30 @@ type TabKey = 'new' | 'bills' | 'followUp' | 'sales'
 const tab = ref<TabKey>('new')
 const queues = ref<PharmacyQueues | null>(null)
 // The sales history is read a page at a time, so older sales stay reachable for a return or a reprint.
-const saleList = usePagedList<SaleRow>(() => '/pharmacy/sales')
+const saleSearch = ref('')
+const salePeriod = ref<DateRange | null>(quickRange('today'))
+const saleList = usePagedList<SaleRow>(() => {
+  const params = new URLSearchParams({ q: saleSearch.value.trim() })
+  if (salePeriod.value) { params.set('from', salePeriod.value.from); params.set('to', salePeriod.value.to) }
+  return `/pharmacy/sales?${params}`
+})
 const sales = saleList.rows
 const loading = ref(true)
+const salesLoading = ref(false)
+let salesLoadVersion = 0
+async function loadSales(first = false) {
+  const version = ++salesLoadVersion
+  salesLoading.value = true
+  try { await (first ? saleList.first() : saleList.load()) }
+  finally { if (version === salesLoadVersion) salesLoading.value = false }
+}
+let saleTimer: ReturnType<typeof setTimeout> | undefined
+function searchSales() {
+  error.value = ''
+  return loadSales(true).catch((cause) => (error.value = errorMessage(cause)))
+}
+watch(salePeriod, searchSales)
+watch(saleSearch, () => { clearTimeout(saleTimer); saleTimer = setTimeout(searchSales, 300) })
 
 const tabs = computed(() => [
   { key: 'new' as const, label: 'نسخه‌های جدید', count: queues.value?.new.length },
@@ -137,7 +160,7 @@ async function load() {
   error.value = ''
   try {
     queues.value = await api<PharmacyQueues>('/pharmacy/queues')
-    await saleList.load()
+    await loadSales()
     if (chosen.value) await choose(chosen.value.patient.id)
   } catch (cause) {
     error.value = errorMessage(cause)
@@ -182,6 +205,7 @@ useLiveRefresh(['PrescriptionCreated', 'InventoryChanged', 'PaymentReceived'], l
 onMounted(load)
 onBeforeUnmount(() => {
   clearTimeout(debounce)
+  clearTimeout(saleTimer)
   searchController?.abort()
 })
 </script>
@@ -199,16 +223,27 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- One field finds any patient or prescription, old or new; while it has text, its results replace the lists. -->
+      <div class="xr-tabs dq-tabs" role="tablist" aria-label="کارهای دواخانه">
+        <button v-for="t in tabs" :key="t.key" type="button" role="tab" class="xr-tab" :class="{ 'xr-tab--active': tab === t.key }" :aria-selected="tab === t.key" @click="tab = t.key">
+          {{ t.label }}<span v-if="t.count" class="xr-tab__count">{{ quantity(t.count) }}</span>
+        </button>
+      </div>
+
       <div class="dq-filters">
-        <label class="dq-search">
+        <label v-if="tab !== 'sales'" class="dq-search">
           <i class="ri-search-line" aria-hidden="true"></i>
           <input v-model="q" type="search" placeholder="جستجو: نام، نام پدر، شماره تماس، پرونده، نسخه یا مراجعه" aria-label="جستجوی مریض و نسخه" autofocus @keydown.enter.prevent="searchEnter" />
           <button v-if="q" type="button" class="dq-search__clear" aria-label="پاک کردن جستجو" @click="q = ''"><i class="ri-close-line" aria-hidden="true"></i></button>
         </label>
+        <label v-else class="dq-search">
+          <i class="ri-search-line" aria-hidden="true"></i>
+          <input v-model="saleSearch" type="search" placeholder="جستجو: نام مریض، جنس، شماره بل یا فاکتور" aria-label="جستجوی سوابق فروش دواخانه" />
+          <button v-if="saleSearch" type="button" class="dq-search__clear" aria-label="پاک کردن جستجوی فروش" @click="saleSearch = ''"><i class="ri-close-line" aria-hidden="true"></i></button>
+        </label>
       </div>
+      <UiPeriodFilter v-if="tab === 'sales'" v-model="salePeriod" allow-all :kinds="['today', 'yesterday', 'custom']" label="تاریخ ثبت فروش دواخانه" />
 
-      <template v-if="q.trim()">
+      <template v-if="q.trim() && tab !== 'sales'">
         <div v-if="searching" class="xr-state" role="status">در حال جستجو...</div>
         <div v-else-if="hits && hits.length === 0" class="xr-state">مریضی پیدا نشد.</div>
         <ol v-else-if="hits && !chosen" class="dq" aria-label="نتیجه جستجو">
@@ -251,12 +286,6 @@ onBeforeUnmount(() => {
       </template>
 
       <template v-else>
-        <div class="xr-tabs dq-tabs" role="tablist" aria-label="کارهای دواخانه">
-          <button v-for="t in tabs" :key="t.key" type="button" role="tab" class="xr-tab" :class="{ 'xr-tab--active': tab === t.key }" :aria-selected="tab === t.key" @click="tab = t.key">
-            {{ t.label }}<span v-if="t.count" class="xr-tab__count">{{ quantity(t.count) }}</span>
-          </button>
-        </div>
-
         <CallNotice v-if="tab === 'new'" :desks="[calls]" :numbers="false" />
         <UiListSkeleton v-if="loading" />
 
@@ -308,7 +337,8 @@ onBeforeUnmount(() => {
         </template>
 
         <template v-else>
-          <div v-if="sales.length === 0" class="xr-state">فروشی ثبت نشده است.</div>
+          <div v-if="salesLoading" class="xr-state" role="status">در حال بارگذاری فروشات...</div>
+          <div v-else-if="sales.length === 0" class="xr-state">در تاریخ و جستجوی انتخاب‌شده فروشی پیدا نشد.</div>
           <ol v-else class="dq" aria-label="سوابق فروش">
             <li v-for="row in sales" :key="row.id" class="dq__row" :class="{ 'dq__row--away': row.isReturned }">
               <div class="dq__num"><strong class="ltr-num dq__code">{{ row.saleNumber }}</strong></div>

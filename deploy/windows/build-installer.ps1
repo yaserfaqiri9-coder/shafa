@@ -11,14 +11,16 @@ param(
     # A folder of voice clips the hospital may use. They install with the system, so calling works with no Import-AlShifa-Voice step.
     # Off by default: whether a voice's licence allows this is the hospital's decision. See DEPLOYMENT-WINDOWS.md.
     [string]$VoicePack,
-    [switch]$UpgradeOnly
+    [switch]$UpgradeOnly,
+    # A short shared cache path also avoids Git GnuPG's socket-path limit in deep snapshots.
+    [string]$CacheRoot
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
 
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not $OutputRoot) { $OutputRoot = Join-Path $repo 'release' }
-$cache = Join-Path $repo '.tools\installer-cache'
+$cache = if($CacheRoot){[IO.Path]::GetFullPath($CacheRoot)}else{Join-Path $repo '.tools\installer-cache'}
 $manifest = Get-Content (Join-Path $PSScriptRoot 'prerequisites.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $csc = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $gpg = Find-Gpg
@@ -83,6 +85,12 @@ try {
     New-Item -ItemType Directory $prerequisites | Out-Null
     $notices = New-Object System.Collections.Generic.List[string]
     foreach ($item in $manifest.items) {
+        # An upgrade uses the verified installed database engine. update.ps1 never
+        # installs this archive, so carrying it only increases the transfer size.
+        if ($UpgradeOnly -and $item.id -eq 'mysql') {
+            "$($item.file): existing database engine retained for upgrade"
+            continue
+        }
         if ($item.requiresVisualStudioLicense -and -not $IncludeVisualCppRuntime) {
             "$($item.file): left out, see -IncludeVisualCppRuntime"
             continue

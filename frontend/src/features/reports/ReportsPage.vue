@@ -5,17 +5,18 @@ import { api, downloadFile, errorMessage } from '@/api/http'
 import UiCard from '@/components/UiCard.vue'
 import UiFilterBar from '@/components/UiFilterBar.vue'
 import UiPeriodFilter from '@/components/UiPeriodFilter.vue'
+import ShamsiDateInput from '@/components/ShamsiDateInput.vue'
 import { useHospital } from '@/features/print/paper'
 import { useAuthStore } from '@/stores/auth'
-import { formatDateTime, latinDigits } from '@/utils/date'
+import { formatDateTime, latinDigits, todayIso } from '@/utils/date'
+import { money } from '@/utils/money'
 import { kindOf, quickRange, type DateRange, type PeriodKind } from '@/utils/period'
 import { reportItems, reportPeriods, reportTabs, type ReportTab } from './reportCatalog'
-import { numberText, periodWords } from './reportFormat'
+import { periodWords } from './reportFormat'
 import ReportArtDefs from './ReportArtDefs.vue'
 import ReportAvatar from './ReportAvatar.vue'
-import ReportStat from './ReportStat.vue'
 import ReportTableCard from './ReportTableCard.vue'
-import type { ReportDocument, ReportTile } from './types'
+import type { ReportDocument } from './types'
 
 const route = useRoute()
 const router = useRouter()
@@ -23,10 +24,11 @@ const auth = useAuthStore()
 const { hospital, load: loadHospital } = useHospital()
 
 const tabs = computed(() => reportTabs.filter((tab) => tab.needs.some((need) => auth.can(need))))
-/** An unknown or forbidden tab in the address opens the first one the user may see. */
+/** The address retains the source endpoint for a detail page; the gallery itself has no category tabs. */
 const active = computed<ReportTab | null>(() => tabs.value.find((tab) => tab.key === route.query.tab) ?? tabs.value[0] ?? null)
 /** The one report open on its own page, or none for the tab's list of reports. */
 const item = computed(() => (typeof route.query.item === 'string' && route.query.item ? route.query.item : null))
+const isDailySummary = computed(() => auth.can('ledger.view') && !item.value && route.query.view === 'daily')
 
 const isoDate = /^\d{4}-\d{2}-\d{2}$/
 
@@ -40,35 +42,31 @@ const selected = computed<DateRange & { kind: PeriodKind }>(() => {
   return { kind: choice, ...quickRange(choice as Exclude<PeriodKind, 'custom'>) }
 })
 
-function queryFor(tab: string, kind: PeriodKind, range: DateRange, report: string | null = null) {
+function queryFor(tab: string, kind: PeriodKind, range: DateRange, report: string | null = null, view: 'gallery' | 'daily' | null = null) {
   const days = kind === 'custom' ? { period: kind, from: range.from, to: range.to } : { period: kind }
-  return report ? { tab, item: report, ...days } : { tab, ...days }
+  const query = report ? { tab, item: report, ...days } : { tab, ...days }
+  return view ? { ...query, view } : query
 }
 
-/** Changing the tab keeps the days, so the three reports are always read for the same dates. */
-const chooseTab = (key: string) => router.replace({ query: queryFor(key, selected.value.kind, selected.value) })
-/** Each report opens alone, on a page of its own; back returns to the tab's list with the same days. */
-const openReport = (key: string) => active.value && router.push({ query: queryFor(active.value.key, selected.value.kind, selected.value, key) })
-const closeReport = () => active.value && router.push({ query: queryFor(active.value.key, selected.value.kind, selected.value) })
+/** A detail page keeps the endpoint that owns the report, so server-side authorization remains authoritative. */
+const openReport = (key: string, tabKey = active.value?.key) => tabKey && router.push({ query: queryFor(tabKey, selected.value.kind, selected.value, key, 'gallery') })
+const closeReport = () => active.value && router.push({ query: queryFor(active.value.key, selected.value.kind, selected.value, null, 'gallery') })
+const showGallery = () => active.value && router.push({ query: queryFor(active.value.key, selected.value.kind, selected.value, null, 'gallery') })
+const showDailySummary = () => active.value && router.push({ query: queryFor(active.value.key, selected.value.kind, selected.value, null, 'daily') })
 
 /** The shared period filter reads and writes the address, so back, forward and reload keep the days. */
 const period = computed<DateRange | null>({
   get: () => ({ from: selected.value.from, to: selected.value.to }),
   set: (range) => {
-    if (range && active.value) router.push({ query: queryFor(active.value.key, kindOf(range), range, item.value) })
+    if (range && active.value) router.push({ query: queryFor(active.value.key, kindOf(range), range, item.value, 'gallery') })
   },
 })
 
-/** Arrow keys move between the tabs, as a tab list should. */
-function step(by: number) {
-  const list = tabs.value
-  const index = list.findIndex((tab) => tab.key === active.value?.key)
-  const next = list[(index + by + list.length) % list.length]
-  chooseTab(next.key)
-  requestAnimationFrame(() => document.getElementById(`report-tab-${next.key}`)?.focus())
-}
-
-const doc = ref<ReportDocument | null>(null)
+const documents = ref<Partial<Record<ReportTab['key'], ReportDocument>>>({})
+const doc = computed(() => (active.value ? documents.value[active.value.key] ?? null : null))
+interface DailyFinancialSummary { receipts: number; refunds: number; expenses: number }
+const dailyDate = ref(todayIso())
+const dailyFinancial = ref<DailyFinancialSummary | null>(null)
 const loading = ref(false)
 const error = ref('')
 const loadedAt = ref<string | null>(null)
@@ -77,27 +75,55 @@ const daysQuery = () => new URLSearchParams({ from: selected.value.from, to: sel
 
 let controller: AbortController | null = null
 async function load() {
-  const tab = active.value
-  if (!tab) return
+  const requested = isDailySummary.value ? [] : item.value ? (active.value ? [active.value] : []) : tabs.value
+  if (!isDailySummary.value && !requested.length) return
   controller?.abort()
   controller = new AbortController()
   const { signal } = controller
   loading.value = true
   error.value = ''
-  try {
-    doc.value = await api<ReportDocument>(`/reports/${tab.key}?${daysQuery()}`, { signal })
-    loadedAt.value = new Date().toISOString()
-  } catch (cause) {
+  if (isDailySummary.value) {
+    documents.value = {}
+    dailyFinancial.value = null
+    try {
+      const date = encodeURIComponent(dailyDate.value)
+      dailyFinancial.value = await api<DailyFinancialSummary>(`/reports/financial?from=${date}&to=${date}`, { signal })
+      loadedAt.value = new Date().toISOString()
+    } catch (cause) {
+      if (signal.aborted) return
+      error.value = errorMessage(cause)
+    }
     if (signal.aborted) return
-    error.value = errorMessage(cause)
-    // The previous answer belongs to another choice, and must not stand under this one.
-    doc.value = null
+    loading.value = false
+    return
+  }
+  dailyFinancial.value = null
+  documents.value = {}
+  const results = await Promise.allSettled(requested.map(async (tab) => ({
+    key: tab.key,
+    document: await api<ReportDocument>(`/reports/${tab.key}?${daysQuery()}`, { signal }),
+  })))
+  if (signal.aborted) return
+  const next: Partial<Record<ReportTab['key'], ReportDocument>> = {}
+  for (const result of results) if (result.status === 'fulfilled') next[result.value.key] = result.value.document
+  documents.value = next
+  if (Object.keys(next).length) loadedAt.value = new Date().toISOString()
+  const failed = results.find((result) => result.status === 'rejected')
+  if (failed?.status === 'rejected') {
+    error.value = Object.keys(next).length
+      ? 'بارگذاری برخی از گزارش‌ها ممکن نشد؛ برای تلاش دوباره اقدام کنید.'
+      : errorMessage(failed.reason)
   }
   loading.value = false
 }
 
 // Opening a report reads the same tab document, so its numbers are those of the tab and of its file.
-const requestKey = computed(() => (route.name === 'reports' && active.value ? `${active.value.key}|${selected.value.from}|${selected.value.to}` : null))
+const requestKey = computed(() => {
+  if (route.name !== 'reports' || !active.value) return null
+  if (isDailySummary.value) return `daily|${dailyDate.value}`
+  const source = item.value ? `${active.value.key}|${item.value}` : `gallery|${tabs.value.map((tab) => tab.key).join(',')}`
+  return `${source}|${selected.value.from}|${selected.value.to}`
+})
 watch(requestKey, (key) => key && load(), { immediate: true })
 
 // The address always says what is on screen: a missing or wrong tab or period is written in.
@@ -105,32 +131,24 @@ watch(
   () => route.query,
   (query) => {
     if (route.name !== 'reports' || !active.value) return
-    const wanted = queryFor(active.value.key, selected.value.kind, selected.value, item.value) as Record<string, string>
+    const view = query.view === 'daily' && auth.can('ledger.view') && !item.value ? 'daily' : 'gallery'
+    const wanted = queryFor(active.value.key, selected.value.kind, selected.value, item.value, view) as Record<string, string>
     const same = Object.keys({ ...wanted, ...query }).every((key) => query[key] === wanted[key])
     if (!same) router.replace({ query: wanted })
   },
   { immediate: true },
 )
 
-/** The few figures on top of the tab; the rest are lines inside the reports. */
-const tiles = computed(() => (doc.value?.tiles ?? []).filter((tile) => tile.main).slice(0, 4))
 const warnings = computed(() => doc.value?.warnings ?? [])
-/** A figure opens the report that details it, in one click, when that report is in this tab. */
-const tileTarget = (tile: ReportTile) => (tile.item && doc.value?.tables.some((t) => t.key === tile.item) ? tile.item : null)
-const statProps = (tile: ReportTile) => ({
-  label: tile.label,
-  value: tile.value === null ? 'نامعلوم' : numberText(tile.value, tile.kind),
-  kind: tile.kind,
-  note: tile.note ?? undefined,
-  unknown: tile.value === null,
-  negative: tile.kind === 'money' && tile.value !== null && tile.value < 0,
-})
 
 const reports = computed(() =>
-  (doc.value?.tables ?? []).map((table) => ({ table, info: reportItems[table.key] ?? { art: 'overview', hint: '' } })),
+  (doc.value?.tables ?? []).map((table) => ({ table, info: reportItems[table.key] ?? { art: 'overview', explained: false } })),
 )
+const galleryReports = computed(() => tabs.value.flatMap((tab) =>
+  (documents.value[tab.key]?.tables ?? []).map((table) => ({ tab, table, info: reportItems[table.key] ?? { art: 'overview', explained: false } })),
+))
+const hasGalleryDocuments = computed(() => Object.keys(documents.value).length > 0)
 const current = computed(() => (item.value ? reports.value.find((r) => r.table.key === item.value) ?? null : null))
-const rowsWord = (count: number) => (count === 0 ? 'چیزی ثبت نشده' : `${latinDigits(count)} ردیف`)
 
 const canExcel = computed(() => auth.can('reports.export'))
 const canPdf = computed(() => auth.can('reports.print') || auth.can('reports.export'))
@@ -254,8 +272,6 @@ onBeforeUnmount(() => controller?.abort())
         </template>
 
         <ReportTableCard :table="current.table" bare />
-
-        <p v-if="current.info.explained && doc.description" class="report-about">{{ doc.description }}</p>
       </article>
 
       <UiCard v-else-if="doc && !loading">
@@ -270,30 +286,61 @@ onBeforeUnmount(() => controller?.abort())
       </div>
     </div>
 
-    <!-- A tab: its few main figures in one row, then each of its reports as one picture to open. -->
+    <div v-else-if="isDailySummary" class="report-main report-daily">
+      <UiFilterBar title="خلاصه روزانه" :subtitle="periodWords(dailyDate, dailyDate)" sticky class="report-bar no-print">
+        <ShamsiDateInput v-model="dailyDate" label="تاریخ مورد نظر" required :max="todayIso()" />
+        <template #actions>
+          <button type="button" class="btn btn-soft report-back" @click="showGallery">
+            <i class="ri-list-check-2" aria-hidden="true"></i> همه گزارش‌ها
+          </button>
+        </template>
+      </UiFilterBar>
+
+      <p v-if="syncLine?.warn" class="report-sync report-sync--warn no-print" role="status">
+        <i class="ri-error-warning-line" aria-hidden="true"></i> {{ syncLine.text }}
+      </p>
+
+      <div v-if="error" class="alert alert-danger report-error" role="alert">
+        <span>{{ error }}</span>
+        <button type="button" class="btn btn-soft-danger btn-sm" @click="load">تلاش دوباره</button>
+      </div>
+
+      <p class="visually-hidden" role="status">{{ loading ? 'گزارش روزانه در حال بارگذاری است' : '' }}</p>
+
+      <section v-if="dailyFinancial" class="daily-summary" :aria-busy="loading" aria-label="عواید و مصارف روزانه">
+        <div class="daily-summary__cards">
+          <article class="daily-summary__card daily-summary__card--income">
+            <span class="daily-summary__icon" aria-hidden="true"><i class="ri-money-dollar-circle-line"></i></span>
+            <div>
+              <h2>عواید دریافت‌شده</h2>
+              <strong class="daily-summary__amount">{{ money(dailyFinancial.receipts) }}</strong>
+              <p>پولی که شفاخانه در این تاریخ واقعاً دریافت کرده است.</p>
+            </div>
+          </article>
+          <article class="daily-summary__card daily-summary__card--expense">
+            <span class="daily-summary__icon" aria-hidden="true"><i class="ri-wallet-3-line"></i></span>
+            <div>
+              <h2>مصارف</h2>
+              <strong class="daily-summary__amount">{{ money(dailyFinancial.expenses) }}</strong>
+              <p>مصارف ثبت‌شده در همین تاریخ.</p>
+            </div>
+          </article>
+        </div>
+        <p v-if="dailyFinancial.refunds > 0" class="daily-summary__refund">
+          <i class="ri-arrow-go-back-line" aria-hidden="true"></i>
+          پول برگشت‌داده‌شده به مریضان: <strong>{{ money(dailyFinancial.refunds) }}</strong>
+        </p>
+      </section>
+
+      <div v-else-if="loading" class="daily-summary__loading" role="status">خلاصه این تاریخ در حال آماده‌شدن است…</div>
+    </div>
+
+    <!-- One gallery contains every report returned by the endpoints the user is allowed to access. -->
     <div v-else class="report-main">
       <ReportArtDefs />
       <UiFilterBar title="گزارش‌ها" :subtitle="periodWords(selected.from, selected.to)" sticky class="report-bar no-print">
         <UiPeriodFilter v-model="period" label="تاریخ گزارش" :kinds="reportPeriods" />
       </UiFilterBar>
-
-      <div v-if="tabs.length > 1" class="report-tabs no-print" role="tablist" aria-label="دسته گزارش‌ها" @keydown.left.prevent="step(1)" @keydown.right.prevent="step(-1)">
-        <button
-          v-for="tab in tabs"
-          :id="`report-tab-${tab.key}`"
-          :key="tab.key"
-          type="button"
-          role="tab"
-          class="report-tab"
-          :class="{ 'report-tab--active': tab.key === active.key }"
-          :aria-selected="tab.key === active.key"
-          aria-controls="report-panel"
-          :tabindex="tab.key === active.key ? 0 : -1"
-          @click="chooseTab(tab.key)"
-        >
-          <i :class="tab.icon" aria-hidden="true"></i> {{ tab.title }}
-        </button>
-      </div>
 
       <p v-if="syncLine" class="report-sync no-print" :class="{ 'report-sync--warn': syncLine.warn }" role="status">
         <i :class="syncLine.warn ? 'ri-error-warning-line' : 'ri-refresh-line'" aria-hidden="true"></i> {{ syncLine.text }}
@@ -306,38 +353,27 @@ onBeforeUnmount(() => controller?.abort())
 
       <p class="visually-hidden" role="status">{{ loading ? 'گزارش در حال آمدن است' : '' }}</p>
 
-      <article v-if="doc" id="report-panel" class="report-sheet" :class="{ 'report-sheet--busy': loading }" role="tabpanel" :aria-labelledby="`report-tab-${active.key}`" :aria-busy="loading">
-        <div v-if="tiles.length" class="report-tiles">
-          <template v-for="tile in tiles" :key="tile.label">
-            <button v-if="tileTarget(tile)" type="button" class="report-tile-link" :aria-label="`${tile.label}: جزئیات`" @click="openReport(tileTarget(tile)!)">
-              <ReportStat v-bind="statProps(tile)" />
-            </button>
-            <ReportStat v-else v-bind="statProps(tile)" />
-          </template>
-        </div>
-
-        <div v-for="warning in warnings" :key="warning" class="report-warning" role="note">
-          <i class="ri-information-line" aria-hidden="true"></i>
-          <span>{{ warning }}</span>
-        </div>
-
-        <section class="report-list" aria-labelledby="report-list-title">
-          <h2 id="report-list-title" class="report-list__title">{{ doc.title }}</h2>
+      <article v-if="hasGalleryDocuments" class="report-sheet" :class="{ 'report-sheet--busy': loading }" :aria-busy="loading">
+        <section class="report-list" aria-label="فهرست همه گزارش‌ها">
           <div class="report-grid">
-            <button v-for="r in reports" :key="r.table.key" type="button" class="report-item" @click="openReport(r.table.key)">
+            <button v-if="auth.can('ledger.view')" type="button" class="report-item" @click="showDailySummary">
+              <span class="report-item__art"><ReportAvatar name="daily-finance" /></span>
+              <span class="report-item__name">خلاصه روزانه</span>
+            </button>
+            <button v-for="r in galleryReports" :key="`${r.tab.key}-${r.table.key}`" type="button" class="report-item" @click="openReport(r.table.key, r.tab.key)">
               <span class="report-item__art"><ReportAvatar :name="r.info.art" /></span>
               <span class="report-item__name">{{ r.table.title }}</span>
-              <span v-if="r.info.hint" class="report-item__hint">{{ r.info.hint }}</span>
-              <span class="report-item__count">{{ rowsWord(r.table.rows.length) }}</span>
             </button>
           </div>
         </section>
       </article>
 
       <div v-else-if="loading" class="report-sheet" aria-hidden="true">
-        <div class="report-tiles">
-          <div v-for="n in 4" :key="n" class="report-skeleton-tile"><span class="xr-skeleton xr-skeleton--wide"></span></div>
-        </div>
+        <section class="report-list">
+          <div class="report-grid">
+            <div v-for="n in 8" :key="n" class="report-skeleton-card"><span class="report-skeleton-card__art xr-skeleton"></span><span class="xr-skeleton xr-skeleton--wide"></span></div>
+          </div>
+        </section>
       </div>
     </div>
   </div>
@@ -349,7 +385,6 @@ onBeforeUnmount(() => controller?.abort())
   --rp-ink: var(--xr-text);
   --rp-soft: var(--xr-text-soft);
   --rp-accent: var(--xr-tone-primary-text);
-  --rp-accent-bg: var(--xr-tone-primary-bg);
   --rp-line: var(--xr-row-border);
 }
 
@@ -361,52 +396,103 @@ onBeforeUnmount(() => controller?.abort())
   align-content: start;
 }
 
+.report-daily {
+  width: 100%;
+  max-width: 1080px;
+  margin-inline: auto;
+}
+
+.daily-summary {
+  display: grid;
+  gap: 14px;
+}
+
+.daily-summary__cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.daily-summary__card {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  min-width: 0;
+  min-height: 190px;
+  padding: 26px;
+  border: 1px solid var(--rp-line);
+  border-inline-start: 5px solid transparent;
+  border-radius: 14px;
+  background: var(--xr-surface);
+  box-shadow: var(--xr-shadow-card);
+}
+
+.daily-summary__card--income { border-inline-start-color: #17845b; }
+.daily-summary__card--expense { border-inline-start-color: #c75b4d; }
+
+.daily-summary__icon {
+  display: grid;
+  flex: none;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  border-radius: 14px;
+  background: #e8f5ef;
+  color: #13754f;
+  font-size: 24px;
+}
+
+.daily-summary__card--expense .daily-summary__icon {
+  background: #fff0ed;
+  color: #a8473b;
+}
+
+.daily-summary__card h2 {
+  margin: 0 0 8px;
+  color: var(--rp-ink);
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.daily-summary__amount {
+  display: block;
+  color: var(--rp-ink);
+  font-size: clamp(24px, 3vw, 34px);
+  font-weight: 800;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.daily-summary__card p {
+  margin: 8px 0 0;
+  color: var(--rp-soft);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.daily-summary__refund {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--rp-soft);
+  font-size: 13px;
+}
+
+.daily-summary__refund strong { color: var(--rp-ink); }
+
+.daily-summary__loading {
+  padding: 28px;
+  border-radius: 12px;
+  background: var(--xr-surface);
+  color: var(--rp-soft);
+  text-align: center;
+}
+
 /* The shared bar sits in the page's grid, which already spaces it. */
 .report-bar {
   margin-bottom: 0;
-}
-
-/* Three tabs on a hairline, each with its icon, so the three groups are told apart at a glance. */
-.report-tabs {
-  display: flex;
-  gap: 4px;
-  overflow-x: auto;
-  border-bottom: 1px solid var(--rp-line);
-  scrollbar-width: none;
-}
-
-.report-tab {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 10px 16px;
-  border: 0;
-  border-bottom: 3px solid transparent;
-  background: transparent;
-  color: var(--rp-soft);
-  font-size: 14.5px;
-  font-weight: 600;
-  white-space: nowrap;
-  transition: color 0.15s ease, border-color 0.15s ease;
-}
-
-.report-tab i {
-  font-size: 18px;
-}
-
-.report-tab:hover {
-  color: var(--rp-ink);
-}
-
-.report-tab--active,
-.report-tab--active:hover {
-  border-bottom-color: var(--xr-primary-strong);
-  color: var(--xr-primary-strong);
-}
-
-.report-tab:focus-visible {
-  outline: 2px solid var(--rp-accent);
-  outline-offset: -2px;
 }
 
 .report-sync {
@@ -540,19 +626,13 @@ onBeforeUnmount(() => controller?.abort())
   box-shadow: var(--xr-shadow-card);
 }
 
-.report-list__title {
-  margin: 0 0 18px;
-  color: var(--rp-ink);
-  font-size: 16px;
-  font-weight: 700;
-}
-
 .report-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
   gap: 16px;
 }
 
+/* The gallery entries are image-and-title links, not boxed cards. */
 .report-item {
   display: flex;
   flex-direction: column;
@@ -561,19 +641,17 @@ onBeforeUnmount(() => controller?.abort())
   min-width: 0;
   height: 100%;
   padding: 20px 14px 16px;
-  border: 1px solid var(--rp-line);
-  border-radius: var(--xr-radius-tile);
-  background: var(--xr-surface);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   color: var(--rp-ink);
   text-align: center;
   cursor: pointer;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  transition: color 0.15s ease;
 }
 
 .report-item:hover {
-  border-color: var(--xr-primary-light);
-  box-shadow: 0 6px 18px rgba(8, 127, 140, 0.12);
-  transform: translateY(-2px);
+  color: var(--xr-primary-strong);
 }
 
 .report-item:focus-visible {
@@ -604,30 +682,6 @@ onBeforeUnmount(() => controller?.abort())
 
 .report-item:hover .report-item__name {
   color: var(--xr-primary-strong);
-}
-
-.report-item__hint {
-  color: var(--rp-soft);
-  font-size: 12.5px;
-  line-height: 1.7;
-}
-
-.report-item__count {
-  margin-top: auto;
-  padding: 2px 10px;
-  border-radius: 999px;
-  background: var(--xr-tone-primary-bg);
-  color: var(--xr-tone-primary-text);
-  font-size: 12px;
-  font-weight: 600;
-}
-
-/* What the report counts, in one quiet paragraph under it. */
-.report-about {
-  margin: 0;
-  color: var(--rp-soft);
-  font-size: 12.5px;
-  line-height: 1.9;
 }
 
 .report-missing {
@@ -661,73 +715,35 @@ onBeforeUnmount(() => controller?.abort())
   display: none;
 }
 
-/* A figure that opens its details: the whole card is the button. */
-.report-tile-link {
-  display: block;
-  padding: 0;
-  border: 0;
-  border-radius: 10px;
-  background: none;
-  text-align: inherit;
-  cursor: pointer;
-}
-
-.report-tile-link:hover :deep(.rs) {
-  box-shadow: 0 0 0 2px var(--xr-primary, currentColor), var(--xr-shadow-card);
-}
-
-.report-tile-link:focus-visible {
-  outline: 2px solid var(--xr-primary, currentColor);
-  outline-offset: 2px;
-}
-
-/* The main figures: all four in one row on a computer. */
-.report-tiles {
+.report-skeleton-card {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 16px;
+  justify-items: center;
+  align-content: center;
+  gap: 12px;
+  min-height: 170px;
+  padding: 20px 14px;
+  border: 1px solid var(--rp-line);
+  border-radius: var(--xr-radius-tile);
+  background: var(--xr-surface);
+}
+
+.report-skeleton-card__art {
+  width: 82px;
+  height: 82px;
+  border-radius: 50%;
 }
 
 .report-skeleton-tile {
   display: flex;
   align-items: center;
-  height: 84px;
+  min-height: 84px;
   padding: 14px;
   border-radius: 10px;
   background: var(--xr-surface);
   box-shadow: var(--xr-shadow-card);
 }
 
-@media (max-width: 1199.98px) {
-  .report-tiles {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
 @media (max-width: 575.98px) {
-  .report-tiles {
-    gap: 10px;
-  }
-
-  /* All three tabs stay in view on a phone: equal thirds, the name wrapping under its icon. */
-  .report-tabs {
-    display: grid;
-    grid-auto-columns: minmax(0, 1fr);
-    grid-auto-flow: column;
-  }
-
-  .report-tab {
-    flex-direction: column;
-    justify-content: center;
-    gap: 2px;
-    min-width: 0;
-    padding: 8px 4px;
-    font-size: 12.5px;
-    line-height: 1.5;
-    text-align: center;
-    white-space: normal;
-  }
-
   /* Back, print and the two files: two to a row, the same width. */
   .report-back,
   .report-file {
@@ -739,6 +755,10 @@ onBeforeUnmount(() => controller?.abort())
   .report-list {
     padding: 16px 12px 18px;
   }
+
+  .daily-summary__cards { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .daily-summary__card { min-height: 0; padding: 20px 16px; gap: 14px; }
+  .daily-summary__icon { width: 42px; height: 42px; font-size: 21px; }
 
   .report-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -758,9 +778,6 @@ onBeforeUnmount(() => controller?.abort())
     font-size: 13.5px;
   }
 
-  .report-item__hint {
-    font-size: 12px;
-  }
 }
 </style>
 

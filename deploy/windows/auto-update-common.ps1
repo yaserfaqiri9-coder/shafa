@@ -25,8 +25,10 @@ function Receive-UpdateFile([uri]$Uri, [string]$Path, [long]$MaximumBytes) {
     $handler.AllowAutoRedirect = $false
     $client = New-Object Net.Http.HttpClient($handler)
     $client.Timeout = [TimeSpan]::FromMinutes(15)
+    $deadline = New-Object Threading.CancellationTokenSource
+    $deadline.CancelAfter([TimeSpan]::FromMinutes(15))
     try {
-        $reply = $client.GetAsync($Uri, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        $reply = $client.GetAsync($Uri, [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $deadline.Token).GetAwaiter().GetResult()
         try {
             if ([int]$reply.StatusCode -ne 200) { throw 'Update download failed or redirected.' }
             if ($reply.Content.Headers.ContentLength -gt $MaximumBytes) { throw 'Update download exceeds size limit.' }
@@ -35,14 +37,14 @@ function Receive-UpdateFile([uri]$Uri, [string]$Path, [long]$MaximumBytes) {
             try {
                 $buffer = New-Object byte[] 81920
                 $total = 0L
-                while (($count = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                while (($count = $inputStream.ReadAsync($buffer, 0, $buffer.Length, $deadline.Token).GetAwaiter().GetResult()) -gt 0) {
                     $total += $count
                     if ($total -gt $MaximumBytes) { throw 'Update download exceeds size limit.' }
                     $outputStream.Write($buffer, 0, $count)
                 }
             } finally { $outputStream.Dispose(); $inputStream.Dispose() }
         } finally { $reply.Dispose() }
-    } finally { $client.Dispose(); $handler.Dispose() }
+    } finally { $deadline.Dispose(); $client.Dispose(); $handler.Dispose() }
 }
 
 function Assert-UpdateArchive([string]$Archive, [string]$Destination) {
@@ -65,24 +67,6 @@ function Assert-UpdateArchive([string]$Archive, [string]$Destination) {
         }
         if ($zip.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq 'app/appsettings.Production.json' }) { throw 'A release must not contain host secrets.' }
     } finally { $zip.Dispose() }
-}
-
-# Unattended installation: only inside the night window (host local time, default 03:00-05:00, after the 02:00 backup), and a version that
-# failed is retried at most three times, at least 20 hours apart, so a bad release never stops the hospital each hour.
-function Get-AutoInstallDecision($Settings, $Status, [string]$Version, [datetime]$Now) {
-    $start = if ($null -ne $Settings.installWindowStartHour) { [int]$Settings.installWindowStartHour } else { 3 }
-    $end = if ($null -ne $Settings.installWindowEndHour) { [int]$Settings.installWindowEndHour } else { 5 }
-    if ($start -lt 0 -or $start -gt 23 -or $end -lt 0 -or $end -gt 24 -or $start -eq $end) { throw 'Invalid automatic install window.' }
-    $window = '{0:00}:00-{1:00}:00' -f $start, $end
-    $inside = if ($start -lt $end) { $Now.Hour -ge $start -and $Now.Hour -lt $end } else { $Now.Hour -ge $start -or $Now.Hour -lt $end }
-    if ($Status.failedVersion -eq $Version) {
-        $attempts = [int]$Status.failedAttempts
-        $last = if ($Status.failedAt) { [DateTimeOffset]::Parse([string]$Status.failedAt).ToUniversalTime() } else { [DateTimeOffset]::MinValue }
-        if ($attempts -ge 3) { return @{ Install = $false; State = 'failed'; Window = $window } }
-        if (([DateTimeOffset]::UtcNow - $last).TotalHours -lt 20) { return @{ Install = $false; State = 'retryScheduled'; Window = $window } }
-    }
-    if (-not $inside) { return @{ Install = $false; State = 'scheduled'; Window = $window } }
-    return @{ Install = $true; State = 'installing'; Window = $window }
 }
 
 # Downloaded packages and unpacked copies of versions other than the one just installed. Program files only, never data.
@@ -115,8 +99,10 @@ function Enable-PublisherFeed([string]$Root, [string]$ScriptsDir, [string]$Backu
     $settings = if (Test-Path -LiteralPath $settingsPath) { Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json } else {
         [pscustomobject]@{ manifestUrl = $feed.AbsoluteUri; backupDestination = $BackupDestination; allowSameDisk = $AllowSameDisk }
     }
-    if (-not $settings.PSObject.Properties['autoInstall']) { $settings | Add-Member -NotePropertyName autoInstall -NotePropertyValue $true }
+    # The hospital requests installation by a button; migrate the old unattended
+    # night policy without changing the enrolled URL, trust key or backup target.
+    $settings | Add-Member -NotePropertyName autoInstall -NotePropertyValue $false -Force
     [IO.File]::WriteAllText(($settingsPath + '.tmp'), ($settings | ConvertTo-Json))
     Move-Item -LiteralPath ($settingsPath + '.tmp') -Destination $settingsPath -Force
-    return "Automatic updates: $($settings.manifestUrl), unattended install $($settings.autoInstall)."
+    return 'Automatic update detection enabled; installation requires approval for the exact verified version.'
 }

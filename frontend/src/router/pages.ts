@@ -49,7 +49,7 @@ const rolePages: Record<string, (keyof typeof pages)[]> = {
   Pharmacist: ['pharmacy', 'pharmacyRx', 'pharmacySale'],
   Optical: ['optical', 'opticalOrder'],
   Cashier: ['cashier', 'invoiceForm'],
-  Accountant: ['accounting'],
+  Accountant: ['cashier', 'accounting', 'invoiceForm'],
   Inventory: ['inventory', 'inventoryLocation', 'purchases', 'purchase'],
   Manager: ['reports', 'patients', 'patient'],
 }

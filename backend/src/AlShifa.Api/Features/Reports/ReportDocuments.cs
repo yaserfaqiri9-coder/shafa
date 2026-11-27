@@ -264,9 +264,9 @@ public static class ReportDocuments
     {
         var f = await ReportFigures.LoadAsync(p.StartUtc, p.EndUtc, db, ct);
 
-        var open = db.Invoices.AsNoTracking().Where(i => (i.Status == InvoiceStatus.Issued || i.Status == InvoiceStatus.PartiallyPaid) && i.Total - i.Discount - i.Paid > 0);
+        var open = db.Invoices.AsNoTracking().Where(i => (i.Status == InvoiceStatus.Issued || i.Status == InvoiceStatus.PartiallyPaid) && i.Total - i.Discount - i.Paid + i.Refunded > 0);
         var openCount = await open.CountAsync(ct);
-        var outstanding = await open.SumAsync(i => (decimal?)(i.Total - i.Discount - i.Paid), ct) ?? 0;
+        var outstanding = await open.SumAsync(i => (decimal?)(i.Total - i.Discount - i.Paid + i.Refunded), ct) ?? 0;
         var openRows = await open.OrderBy(i => i.Id).Take(MaxListRows)
             .Select(i => new
             {
@@ -277,7 +277,7 @@ public static class ReportDocuments
                 Item = i.Items.Where(x => !x.IsVoid).OrderBy(x => x.Id).Select(x => x.Description).FirstOrDefault(),
                 Payable = i.Total - i.Discount,
                 i.Paid,
-                Balance = i.Total - i.Discount - i.Paid,
+                Balance = i.Total - i.Discount - i.Paid + i.Refunded,
             }).ToListAsync(ct);
         var today = KabulClock.Today;
 
@@ -358,7 +358,7 @@ public static class ReportDocuments
                 s.RegisterId,
                 s.OpenedAt,
                 Cashier = u.FullName,
-                Expected = s.OpeningAmount + (db.Payments.Where(x => x.CashSessionId == s.Id && x.Method == PaymentMethod.Cash).Sum(x => (decimal?)x.Amount) ?? 0),
+                Expected = s.OpeningAmount + (db.Payments.Where(x => x.CashSessionId == s.Id && x.Method == PaymentMethod.Cash).Sum(x => (decimal?)x.Amount) ?? 0) + (db.CashMovements.Where(m => m.CashSessionId == s.Id).Sum(m => (decimal?)m.Amount) ?? 0),
             }).ToListAsync(ct);
         var received = await db.Payments.AsNoTracking().Where(x => x.CreatedAt >= p.StartUtc && x.CreatedAt < p.EndUtc && x.Method == PaymentMethod.Cash)
             .GroupBy(x => x.CashSession!.RegisterId).Select(g => new { RegisterId = g.Key, Amount = g.Sum(x => x.Amount) }).ToListAsync(ct);

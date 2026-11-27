@@ -170,7 +170,7 @@ onMounted(load)
   <div class="d-grid gap-4">
     <div class="d-flex gap-2 align-items-center">
       <RouterLink :to="{ name: 'pharmacy' }" class="btn btn-soft btn-sm">بازگشت به دواخانه</RouterLink>
-      <RouterLink v-if="rx && auth.can('prescriptions.print')" :to="`/print/rx/${rx.id}`" target="_blank" class="btn btn-soft btn-sm">چاپ نسخه برای مریض</RouterLink>
+      <RouterLink v-if="rx && auth.can('prescriptions.print')" :to="{ path: `/print/rx/${rx.id}`, query: { layout: 'pharmacy-roll' } }" target="_blank" class="btn btn-soft btn-sm">چاپ نسخه برای مریض</RouterLink>
     </div>
     <div v-if="error" class="alert alert-danger mb-0" role="alert">{{ error }}</div>
     <div v-if="notice" class="alert alert-success mb-0" role="status">{{ notice }}</div>

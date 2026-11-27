@@ -44,7 +44,7 @@ public static class CommandPolicy
         "finance", "invoices", "cashier", "cash-sessions", "inventory", "pharmacy", "sales",
         "clinical", "diagnostics", "surgeries", "surgery-packages", "refractions", "prescriptions",
         "consultations", "pre-examinations", "triage", "follow-ups", "optical", "directory",
-        "services", "payments", "cash", "ledger", "expenses", "departments", "suppliers", "staff", "operations",
+        "services", "payments", "refunds", "cash", "ledger", "expenses", "departments", "suppliers", "staff", "operations",
         "diagnostic-tests", "diagnostic-orders", "optical-prescriptions", "visit-tokens", "chat",
     };
 
@@ -70,7 +70,7 @@ public static class CommandPolicy
         if (command.Method == "POST" && path is "/api/patients" or "/api/appointments" or "/api/admissions"
             or "/api/visits" or "/api/visit-tokens" or "/api/invoices" or "/api/payments"
             or "/api/inventory/purchases" or "/api/pharmacy/sales" or "/api/optical/orders"
-            or "/api/cash/sessions" or "/api/expenses" or "/api/diagnostic-orders" or "/api/surgeries"
+            or "/api/payments/settle" or "/api/refunds" or "/api/cash/sessions" or "/api/expenses" or "/api/diagnostic-orders" or "/api/surgeries"
             or "/api/chat/messages" or "/api/chat/public/messages")
             return true;
         if (command.Method == "DELETE" && Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(command.Query)
@@ -223,6 +223,7 @@ public static class CommandEndpoints
 /// The business transaction, local receipt and replication outbox commit together.</summary>
 public sealed class CommandExecutor(IServiceScopeFactory scopes, IHttpContextAccessor accessor)
 {
+    internal const string PendingChangesSql = "SELECT * FROM SyncChanges ORDER BY Id LIMIT 1 FOR UPDATE";
     private sealed class BodyDetection(bool hasBody) : IHttpRequestBodyDetectionFeature
     {
         public bool CanHaveBody => hasBody;
@@ -243,7 +244,9 @@ public sealed class CommandExecutor(IServiceScopeFactory scopes, IHttpContextAcc
             return new(stored.Id, stored.StatusCode, stored.ResponseBody, stored.ContentType);
         }
         var validatesCurrent = CommandPolicy.ValidatesCurrentState(command);
-        var pending = !validatesCurrent && (await db.SyncChanges.FromSqlRaw("SELECT * FROM SyncChanges FOR UPDATE").ToListAsync(ct)).Count != 0;
+        // Under SERIALIZABLE, the first-row/gap lock still protects the empty-queue decision.
+        // A nonempty queue already refuses the command; loading and locking its entire backlog adds no protection.
+        var pending = !validatesCurrent && (await db.SyncChanges.FromSqlRaw(PendingChangesSql).AsNoTracking().ToListAsync(ct)).Count != 0;
         var ack = await SyncWorker.GetStateAsync(db, "push.ackedSeq", ct);
         CommandResult Failure(int status, string code, string detail) => new(command.Id, status,
             JsonSerializer.Serialize(new { code, title = detail }), "application/problem+json");

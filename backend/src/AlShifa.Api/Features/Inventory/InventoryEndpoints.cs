@@ -2,6 +2,7 @@ using System.ComponentModel.DataAnnotations;
 using AlShifa.Api.Features.Auth;
 using AlShifa.Api.Features.Clinical;
 using AlShifa.Api.Features.Finance;
+using AlShifa.Api.Features.Reports;
 using AlShifa.Api.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 
@@ -561,11 +562,25 @@ public static class InventoryEndpoints
 
         var pharmacy = app.MapGroup("/api/pharmacy").WithTags("Pharmacy");
 
-        pharmacy.MapGet("/sales", async (AppDbContext db, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
+        pharmacy.MapGet("/sales", async (AppDbContext db, DateOnly? from, DateOnly? to, string? q, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
         {
             pageSize = Math.Clamp(pageSize, 1, 100);
             page = Math.Max(page, 1);
             var query = db.Sales.AsNoTracking().Where(s => s.Kind == SaleKind.Pharmacy);
+            if (from is not null || to is not null)
+            {
+                var (first, last) = ReportEndpoints.Range(from ?? to, to ?? from);
+                var (start, end) = ReportEndpoints.UtcRange(first, last);
+                query = query.Where(s => s.CreatedAt >= start && s.CreatedAt < end);
+            }
+            if (Text.Clean(q) is { } search)
+            {
+                var term = OldNumbers.Plain(PharmacySearch.Fold(search));
+                query = query.Where(s => s.SaleNumber.Contains(term) || s.Invoice!.InvoiceNumber.Contains(term)
+                    || (s.Patient != null && ((s.Patient.FirstName + " " + (s.Patient.LastName ?? "")).Contains(term)
+                        || (s.Patient.FatherName ?? "").Contains(term) || s.Patient.FileNumber.Contains(term) || (s.Patient.Phone ?? "").Contains(term)))
+                    || s.Items.Any(i => i.Product!.Name.Contains(term)));
+            }
             var total = await query.CountAsync(ct);
             var rows = await ProjectSales(query.OrderByDescending(s => s.Id).Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
             return Results.Ok(new PagedResult<SaleRow>(rows, total, page, pageSize));
@@ -606,20 +621,28 @@ public static class InventoryEndpoints
 
         var optical = app.MapGroup("/api/optical").WithTags("Optical");
 
-        optical.MapGet("/orders", async (AppDbContext db, OpticalOrderStatus? status, string? q, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
+        optical.MapGet("/orders", async (AppDbContext db, OpticalOrderStatus? status, string? q, DateOnly? from, DateOnly? to, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
         {
             pageSize = Math.Clamp(pageSize, 1, 100);
             page = Math.Max(page, 1);
             var query = db.OpticalOrders.AsNoTracking();
+            if (from is not null || to is not null)
+            {
+                var (first, last) = ReportEndpoints.Range(from ?? to, to ?? from);
+                var (start, end) = ReportEndpoints.UtcRange(first, last);
+                query = query.Where(o => o.CreatedAt >= start && o.CreatedAt < end);
+            }
             if (status is { } s)
             {
                 query = query.Where(o => o.Status == s);
             }
 
             // A customer back days later is found by name or phone across all orders, not only the page on screen.
-            if (Text.Clean(q) is { } term)
+            if (Text.Clean(q) is { } search)
             {
+                var term = OldNumbers.Plain(PharmacySearch.Fold(search));
                 query = query.Where(o => o.OrderNumber.Contains(term) || o.Sale!.Invoice!.InvoiceNumber.Contains(term)
+                    || (o.Description != null && o.Description.Contains(term))
                     || (o.CustomerName != null && o.CustomerName.Contains(term)) || (o.CustomerPhone != null && o.CustomerPhone.Contains(term))
                     || (o.Patient != null && (o.Patient.FirstName.Contains(term) || (o.Patient.LastName != null && o.Patient.LastName.Contains(term))
                         || (o.Patient.FirstName + " " + o.Patient.LastName).Contains(term) || o.Patient.FileNumber.Contains(term))));
@@ -642,11 +665,24 @@ public static class InventoryEndpoints
         }).RequirePermission("payments.create");
 
         // A separate report keeps complimentary delivered goods visible without mixing them into receivables or revenue reports.
-        optical.MapGet("/reports/complimentary", async (AppDbContext db, CancellationToken ct) =>
+        optical.MapGet("/reports/complimentary", async (AppDbContext db, DateOnly? from, DateOnly? to, string? q, CancellationToken ct) =>
         {
-            var rows = await ProjectOrders(db.OpticalOrders.AsNoTracking()
-                .Where(o => o.IsComplimentary && o.Status == OpticalOrderStatus.Delivered)
-                .OrderByDescending(o => o.Id)).ToListAsync(ct);
+            var query = db.OpticalOrders.AsNoTracking().Where(o => o.IsComplimentary && o.Status == OpticalOrderStatus.Delivered);
+            if (from is not null || to is not null)
+            {
+                var (first, last) = ReportEndpoints.Range(from ?? to, to ?? from);
+                var (start, end) = ReportEndpoints.UtcRange(first, last);
+                query = query.Where(o => o.DeliveredAt >= start && o.DeliveredAt < end);
+            }
+            if (Text.Clean(q) is { } search)
+            {
+                var term = OldNumbers.Plain(PharmacySearch.Fold(search));
+                query = query.Where(o => o.OrderNumber.Contains(term) || o.Sale!.Invoice!.InvoiceNumber.Contains(term)
+                    || (o.CustomerName != null && o.CustomerName.Contains(term)) || (o.CustomerPhone != null && o.CustomerPhone.Contains(term))
+                    || (o.Patient != null && ((o.Patient.FirstName + " " + (o.Patient.LastName ?? "")).Contains(term) || o.Patient.FileNumber.Contains(term)))
+                    || o.Sale!.Invoice!.Items.Any(i => !i.IsVoid && i.Description.Contains(term)));
+            }
+            var rows = await ProjectOrders(query.OrderByDescending(o => o.Id)).ToListAsync(ct);
             var invoiceIds = rows.Select(row => row.InvoiceId).ToArray();
             var items = await db.InvoiceItems.AsNoTracking()
                 .Where(item => invoiceIds.Contains(item.InvoiceId) && !item.IsVoid)
@@ -985,13 +1021,13 @@ public static class InventoryEndpoints
 
     private static IQueryable<SaleRow> ProjectSales(IQueryable<Sale> sales) => sales.Select(s => new SaleRow(
         s.Id, s.SaleNumber, s.Kind.ToString(), s.PatientId, s.Patient != null ? (s.Patient.FirstName + " " + (s.Patient.LastName ?? "")).Trim() : null, s.PrescriptionId,
-        s.InvoiceId, s.Invoice!.InvoiceNumber, s.Invoice.Total, s.Invoice.Status == InvoiceStatus.Void ? 0 : s.Invoice.Total - s.Invoice.Discount - s.Invoice.Paid, s.Invoice.Status.ToString(), s.IsReturned, s.CreatedAt, s.Version, s.DeliveredAt));
+        s.InvoiceId, s.Invoice!.InvoiceNumber, s.Invoice.Total, s.Invoice.Status == InvoiceStatus.Void ? 0 : s.Invoice.Total - s.Invoice.Discount - s.Invoice.Paid + s.Invoice.Refunded, s.Invoice.Status.ToString(), s.IsReturned, s.CreatedAt, s.Version, s.DeliveredAt));
 
     private sealed record OrderProjection(long Id, string OrderNumber, long? PatientId, string? PatientName, long? OpticalPrescriptionId, string? Description, OpticalOrderStatus Status, long InvoiceId, string InvoiceNumber, decimal Total, decimal Balance, DateTime? DeliveredAt, DateTime CreatedAt, int Version, bool IsComplimentary, string? ComplimentaryReason, string? ComplimentaryApprovedBy, string? CustomerPhone);
 
     private static IQueryable<OrderProjection> ProjectOrders(IQueryable<OpticalOrder> orders) => orders.Select(o => new OrderProjection(
         o.Id, o.OrderNumber, o.PatientId, o.Patient != null ? (o.Patient.FirstName + " " + (o.Patient.LastName ?? "")).Trim() : o.CustomerName, o.OpticalPrescriptionId, o.Description, o.Status,
-        o.Sale!.InvoiceId, o.Sale.Invoice!.InvoiceNumber, o.Sale.Invoice.Total, o.Sale.Invoice.Total - o.Sale.Invoice.Discount - o.Sale.Invoice.Paid, o.DeliveredAt, o.CreatedAt, o.Version,
+        o.Sale!.InvoiceId, o.Sale.Invoice!.InvoiceNumber, o.Sale.Invoice.Total, o.Sale.Invoice.Total - o.Sale.Invoice.Discount - o.Sale.Invoice.Paid + o.Sale.Invoice.Refunded, o.DeliveredAt, o.CreatedAt, o.Version,
         o.IsComplimentary, o.ComplimentaryReason, o.ComplimentaryApprovedBy, o.CustomerPhone));
 
     private static OpticalOrderRow ToRow(OrderProjection o) => new(

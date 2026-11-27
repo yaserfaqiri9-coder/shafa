@@ -65,6 +65,8 @@ const filled = (value: string | null | undefined): value is string => value != n
 const show = (value: string) => (/[A-Za-z]/.test(value) ? value : latinDigits(value))
 
 const isReceipt = computed(() => doc.value?.format === 'receipt')
+const isPharmacyRoll = computed(() => props.kind === 'rx' && route.query.layout === 'pharmacy-roll')
+const isRoll = computed(() => isReceipt.value || isPharmacyRoll.value)
 const layout = computed(() => (props.kind === 'rx' ? 'rx' : doc.value?.headers?.length && doc.value.rows?.length ? 'table' : 'card'))
 const hospitalName = computed(() => doc.value?.hospital.hospitalName?.trim() || 'شفاخانه تخصصی چشم الشفا')
 const dateText = computed(() => latinDigits(shamsiPaper(doc.value?.date)))
@@ -97,11 +99,12 @@ const medicines = computed(() =>
 const signer = computed(() => {
   const name = doc.value?.signer?.trim()
   if (!name) return null
+  if (isPharmacyRoll.value && name.toLowerCase() === 'admin') return null
   return /^(دکتر|داکتر|dr\.?)\s/i.test(name) ? name : `دکتر ${name}`
 })
 
 const paperOptions = computed(() =>
-  (isReceipt.value ? (['receipt-80', 'receipt-58'] as const) : (['a5', 'a4'] as const)).map((value) => ({ value, label: PAPER[value].label })),
+  (isRoll.value ? (['receipt-80', 'receipt-58'] as const) : (['a5', 'a4'] as const)).map((value) => ({ value, label: PAPER[value].label })),
 )
 const paperStyle = computed(() => ({ '--paper-w': `${PAPER[selectedPaper.value].width}mm` }))
 const logoSrc = '/print/alshefa-official-logo.png'
@@ -113,7 +116,7 @@ let observer: ResizeObserver | undefined
 /** Margins are part of the design, so the page itself has none; a roll is cut to the length of what it carries. */
 function updatePageSize() {
   if (!pageStyle || window.matchMedia('print').matches) return
-  if (!isReceipt.value) {
+  if (!isRoll.value) {
     pageStyle.textContent = `@page { size: ${selectedPaper.value === 'a4' ? 'A4' : 'A5'} portrait; margin: 0; }`
     return
   }
@@ -132,7 +135,7 @@ async function load() {
     const result = await api<PrintDocument>(`/print/${props.kind}/${props.id}`)
     if (current !== request) return
     doc.value = result
-    selectedPaper.value = result.format === 'receipt' ? savedRoll() : 'a5'
+    selectedPaper.value = result.format === 'receipt' || isPharmacyRoll.value ? savedRoll() : 'a5'
     await nextTick()
     observer?.disconnect()
     if (paper.value) observer?.observe(paper.value)
@@ -156,7 +159,7 @@ onMounted(() => {
   window.addEventListener('beforeprint', updatePageSize)
   void load()
 })
-watch(() => [props.kind, props.id], load)
+watch(() => [props.kind, props.id, route.query.layout], load)
 watch(selectedPaper, async (value) => {
   if (value.startsWith('receipt-')) {
     try { localStorage.setItem(ROLL_KEY, value) } catch { /* private window: the choice is only kept for this page */ }
@@ -191,14 +194,14 @@ async function openPrintDialog() {
         <button type="button" class="btn print-button" :disabled="!doc || loading" @click="openPrintDialog"><i class="ri-printer-line" aria-hidden="true"></i> چاپ</button>
         <button type="button" class="btn pdf-button" :disabled="!doc || loading" @click="openPrintDialog"><i class="ri-file-pdf-2-line" aria-hidden="true"></i> ذخیره به PDF</button>
       </div>
-      <p v-if="isReceipt" class="print-actions__hint">پرنتر رسید: در پنجره چاپ، «Margins» را روی «None» و «Scale» را روی «Default» یا 100 بگذارید. اندازه کاغذ پرنتر باید با رول انتخاب‌شده (80 یا 58 میلی‌متر) یکی باشد.</p>
+      <p v-if="isRoll" class="print-actions__hint">پرنتر رسید: در پنجره چاپ، «Margins» را روی «None» و «Scale» را روی «Default» یا 100 بگذارید. اندازه کاغذ پرنتر باید با رول انتخاب‌شده (80 یا 58 میلی‌متر) یکی باشد.</p>
       <p v-else class="print-actions__hint">برای PDF، در پنجره چاپ «Save as PDF» را انتخاب کنید. «Margins» را روی «None» و «Background graphics» را روشن بگذارید.</p>
     </section>
 
     <div v-if="loading" class="print-state" role="status"><span class="spinner-border spinner-border-sm" aria-hidden="true"></span><p>سند در حال آماده‌سازی است…</p></div>
     <div v-else-if="error" class="print-state" role="alert"><h2>سند باز نشد</h2><p>{{ error }}</p><button type="button" class="btn btn-outline-primary" @click="load">تلاش دوباره</button></div>
 
-    <article v-if="doc" ref="paper" class="pd" :class="[`pd--${selectedPaper}`, `pd--${layout}`, { 'pd--roll': isReceipt }]" :style="paperStyle">
+    <article v-if="doc" ref="paper" class="pd" :class="[`pd--${selectedPaper}`, `pd--${layout}`, { 'pd--roll': isRoll, 'pd--pharmacy-rx': isPharmacyRoll, 'pd--pharmacy-invoice': props.kind === 'sale' && doc.department === 'دواخانه' }]" :style="paperStyle">
       <header class="pd-head">
         <div class="pd-brand">
           <div class="pd-brand__fa">{{ hospitalName }}</div>
@@ -328,8 +331,7 @@ async function openPrintDialog() {
 }
 .pd--a5 { min-height: 210mm; }
 .pd--a4 { --u: calc(148mm / 348 * 1.15); min-height: 297mm; }
-/* Page invoices use readable document type, rather than enlarging a receipt's
-   typography until a short pharmacy bill spills onto a second sheet. */
+/* A5 invoices keep readable type; thermal rolls size themselves to their contents. */
 .pd--table.pd--a5 { --u: calc(100mm / 348); }
 .pd * { box-sizing: border-box; }
 .pd bdi { unicode-bidi: isolate; }
@@ -429,6 +431,23 @@ async function openPrintDialog() {
   padding: calc(var(--u) * 12) calc((var(--paper-w) - var(--print-w)) / 2) calc(var(--u) * 18);
   font-weight: 500;
 }
+.pd--pharmacy-invoice {
+  --ink: #000;
+  --text: #000;
+  --rule: #000;
+  --grid: #000;
+  font-weight: 700;
+  print-color-adjust: exact;
+  -webkit-print-color-adjust: exact;
+}
+.pd--pharmacy-invoice .pd-table { font-size: calc(var(--u) * 16); }
+.pd--pharmacy-invoice .pd-rows dt,
+.pd--pharmacy-invoice .pd-rows dd,
+.pd--pharmacy-invoice .pd-table tbody td,
+.pd--pharmacy-invoice .pd-foot dt,
+.pd--pharmacy-invoice .pd-foot dd { font-weight: 700; color: #000; }
+.pd--pharmacy-invoice .pd-table thead th,
+.pd--pharmacy-invoice .pd-band__label { font-weight: 800; color: #000; }
 /* 58 mm: a larger unit, or the type falls under what a thermal head prints legibly. */
 .pd--receipt-58 { --u: calc(var(--print-w) / 255); }
 .pd--roll .pd-box,.pd--roll .pd-band,.pd--roll .pd-band--table,.pd--roll .pd-table { width: 100%; margin-inline: 0; }
@@ -445,6 +464,20 @@ async function openPrintDialog() {
 .pd--roll .pd-rule--head { margin-top: calc(var(--u) * 12); }
 .pd--roll .pd-title { margin-top: calc(var(--u) * 8); font-size: calc(var(--u) * 22); }
 .pd--roll .pd-logo { filter: grayscale(1) contrast(1.6); }
+.pd--pharmacy-rx {
+  --ink: #000;
+  --text: #000;
+  --rule: #000;
+  font-weight: 600;
+  print-color-adjust: exact;
+  -webkit-print-color-adjust: exact;
+}
+.pd--pharmacy-rx .pd-box .pd-inline > *,
+.pd--pharmacy-rx .pd-medicines__name,
+.pd--pharmacy-rx .pd-signer__name { color: #000; font-weight: 700; }
+.pd--pharmacy-rx .pd-medicines,
+.pd--pharmacy-rx .pd-medicines__detail { color: #000; font-weight: 600; }
+.pd--pharmacy-rx .pd-medicines li { border-color: #000; }
 
 .pd-department { margin: calc(var(--u) * 8) 0 0; text-align: center; font-size: calc(var(--u) * 15); font-weight: 600; overflow-wrap: anywhere; }
 .pd-purposes { margin-top: calc(var(--u) * 14); padding-top: calc(var(--u) * 10); border-top: max(1px, var(--u)) solid var(--rule); font-size: calc(var(--u) * 15); }

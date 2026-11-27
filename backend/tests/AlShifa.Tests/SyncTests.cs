@@ -261,8 +261,78 @@ public sealed class FlakyHandler(FlakyNetwork network, HttpMessageHandler inner)
     }
 }
 
-public sealed class SyncTests(SyncFixture sync) : IClassFixture<SyncFixture>
+public sealed class SyncTests(SyncFixture sync, Xunit.Abstractions.ITestOutputHelper output) : IClassFixture<SyncFixture>
 {
+    [Fact]
+    public async Task Bounded_pending_check_keeps_the_empty_queue_locked_until_command_commit()
+    {
+        Assert.Equal("1", Environment.GetEnvironmentVariable("ALSHIFA_ISOLATED_QUEUE_TESTS"));
+        await sync.SyncAsync();
+        using var scope = sync.Local.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
+        Assert.Empty(await db.SyncChanges.FromSqlRaw(CommandExecutor.PendingChangesSql).AsNoTracking().ToListAsync());
+        await using var writer = new MySqlConnection(SyncFixture.LocalDb);
+        await writer.OpenAsync();
+        await using (var limit = new MySqlCommand("SET SESSION innodb_lock_wait_timeout=1", writer)) await limit.ExecuteNonQueryAsync();
+        await using var insert = new MySqlCommand("INSERT INTO SyncChanges(TableName,KeyJson,CreatedAt) VALUES('Patients','[-999999]',UTC_TIMESTAMP(6))", writer);
+        var blocked = await Assert.ThrowsAsync<MySqlException>(() => insert.ExecuteNonQueryAsync());
+        Assert.Equal(1205, blocked.Number);
+        await tx.RollbackAsync();
+        Assert.Equal(1, await insert.ExecuteNonQueryAsync());
+        // Remove only this synthetic sentinel; never reset a queue or its checkpoints.
+        Assert.Equal(1, await db.SyncChanges.Where(s => s.TableName == "Patients" && s.KeyJson == "[-999999]").ExecuteDeleteAsync());
+    }
+
+    [Fact]
+    public async Task Five_hundred_pending_rows_use_bounded_lookups_and_preserve_upserts_and_deletes()
+    {
+        Assert.Equal("1", Environment.GetEnvironmentVariable("ALSHIFA_ISOLATED_QUEUE_TESTS"));
+        await sync.SyncAsync();
+        using var scope = sync.Local.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var stamp = "perf-" + Guid.NewGuid().ToString("N")[..8];
+        var patients = Enumerable.Range(0, 500).Select(i => new Patient
+        {
+            FileNumber = stamp + i, FirstName = "Synthetic", LastName = stamp, Gender = Gender.Male,
+        }).ToArray();
+        db.Patients.AddRange(patients);
+        await db.SaveChangesAsync();
+
+        // General logging is enabled only on the runner's positively verified, dedicated instance.
+        // No extra application instrumentation or production logging is needed to count raw SQL.
+        var connectionString = new MySqlConnectionStringBuilder(Environment.GetEnvironmentVariable("ALSHIFA_TEST_ADMIN_DB")) { Database = "mysql" }.ConnectionString;
+        await using var admin = new MySqlConnection(connectionString);
+        await admin.OpenAsync();
+        async Task Execute(string text) { await using var command = new MySqlCommand(text, admin); await command.ExecuteNonQueryAsync(); }
+        await Execute("SET GLOBAL log_output='TABLE'");
+        await Execute("TRUNCATE TABLE mysql.general_log");
+        await Execute("SET GLOBAL general_log=ON");
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        try { await sync.SyncAsync(); }
+        finally { await Execute("SET GLOBAL general_log=OFF"); }
+        elapsed.Stop();
+        await using var count = new MySqlCommand("SELECT COUNT(*) FROM mysql.general_log WHERE command_type='Query' AND argument LIKE 'SELECT %FROM `Patients`%'", admin);
+        var totalLookups = Convert.ToInt32(await count.ExecuteScalarAsync());
+        count.CommandText += " AND argument NOT LIKE 'SELECT 1 FROM %'";
+        var lookups = Convert.ToInt32(await count.ExecuteScalarAsync());
+        output.WriteLine($"SYNC_PERFORMANCE rows=500 totalReaderQueries={totalLookups} localReaderQueries={lookups} elapsedMs={elapsed.ElapsedMilliseconds}");
+        await using (var mirror = sync.MirrorData()) Assert.Equal(500, await mirror.Patients.CountAsync(p => p.LastName == stamp));
+        Assert.Empty(await db.SyncChanges.AsNoTracking().ToListAsync());
+
+        foreach (var patient in patients.Take(250)) patient.FirstName = "Changed";
+        db.Patients.RemoveRange(patients.Skip(250));
+        await db.SaveChangesAsync();
+        await sync.SyncAsync();
+        await using (var mirror = sync.MirrorData())
+        {
+            Assert.Equal(250, await mirror.Patients.CountAsync(p => p.LastName == stamp));
+            Assert.Equal(250, await mirror.Patients.CountAsync(p => p.LastName == stamp && p.FirstName == "Changed"));
+        }
+        Assert.Empty(await db.SyncChanges.AsNoTracking().ToListAsync());
+        Assert.InRange(lookups, 1, 10);
+    }
+
     [Fact]
     public async Task Physical_cards_attendance_and_current_patient_survive_offline_and_lost_sync_reply()
     {

@@ -222,7 +222,10 @@ async function load() {
   try {
     const sameVisit = chart.value?.visit.id === Number(props.visitId)
     // The patient this doctor called is now with the doctor. The server ignores any other chart; nothing is announced.
-    if (!sameVisit && auth.can('consultation.edit')) await api(`/consultations/${props.visitId}/start`, { method: 'POST' }).catch(() => undefined)
+    if (!sameVisit && auth.can('consultation.edit')) {
+      // Record the open without making the chart wait for this separate state-change round trip.
+      void api(`/consultations/${props.visitId}/start`, { method: 'POST' }).catch(() => undefined)
+    }
     chart.value = await api<Chart>(`/consultations/${props.visitId}/chart`)
     // Reloading after an order or a prescription must never overwrite what the doctor is still typing.
     if (!sameVisit || !dirty.value) fillChart(chart.value)

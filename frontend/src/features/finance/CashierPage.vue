@@ -1,20 +1,32 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api, ApiError, errorMessage, newIdempotencyKey } from '@/api/http'
-import { fetchAll, usePagedList } from '@/api/paged'
+import { usePagedList } from '@/api/paged'
 import UiPager from '@/components/UiPager.vue'
 import { useLiveRefresh } from '@/api/realtime'
 import UiModal from '@/components/UiModal.vue'
 import UiListSkeleton from '@/components/UiListSkeleton.vue'
 import { useAuthStore } from '@/stores/auth'
 import UiRowMenu from '@/components/UiRowMenu.vue'
-import { formatDateTime } from '@/utils/date'
+import { formatDateTime, todayIso } from '@/utils/date'
+import ShamsiDateInput from '@/components/ShamsiDateInput.vue'
 import { money, quantity } from '@/utils/money'
 import { invoiceSubject, type InvoiceDetail, type InvoiceRow, type PaymentRow, type SessionRow } from './types'
 
 const auth = useAuthStore()
-const invoices = ref<InvoiceRow[]>([])
-const opticalOrders = ref<{ id: number; orderNumber: string; patientName: string | null; invoiceId: number; invoiceNumber: string; total: number; balance: number }[]>([])
+const tab = ref<'invoices' | 'receipts'>('invoices')
+const dayDetails = ref(false)
+const date = ref<string | null>(todayIso())
+const allOutstanding = ref(false)
+const historical = ref(false)
+const invoiceList = usePagedList<InvoiceRow>(() => `/invoices?unpaid=true&q=${encodeURIComponent(q.value)}${!allOutstanding.value ? `&from=${day.value}&to=${day.value}` : ''}`, 15)
+const invoices = invoiceList.rows
+const day = computed(() => date.value ?? todayIso())
+interface DaySummary { receipts: number; cashReceipts: number; otherReceipts: number; refunds: number; expenses: number; netReceived: number; sessions: SessionRow[]; unassignedCashOut: number }
+const summary = ref<DaySummary | null>(null)
+interface RefundRow { id: number; refundNumber: string; receiptNumber: string; amount: number; reason: string; createdAt: string; patientName: string | null }
+const refundList = usePagedList<RefundRow>(() => `/refunds?from=${day.value}&to=${day.value}&q=${encodeURIComponent(q.value)}`, 10)
+const historyList = usePagedList<{ id: number; invoiceNumber: string; patientName: string | null; balance: number; createdAt: string; description: string | null }>(() => `/cash/outstanding-at?date=${day.value}&q=${encodeURIComponent(q.value)}`, 15)
 const sessions = ref<SessionRow[]>([])
 const registers = ref<{ id: number; name: string }[]>([])
 const q = ref('')
@@ -24,38 +36,31 @@ const error = ref('')
 const loadError = ref('')
 
 const openSession = computed(() => sessions.value.find((s) => !s.closedAt) ?? null)
-const pendingTotal = computed(() => invoices.value.reduce((sum, i) => sum + i.balance, 0))
+const deskActions = computed(() => {
+  const items = [{ label: 'جزئیات روز', icon: 'ri-file-list-line', onSelect: () => { dayDetails.value = true } }]
+  if (openSession.value && auth.can('cash.edit')) items.push({ label: 'تحویل پول', icon: 'ri-bank-line', onSelect: () => {
+    Object.assign(transfer, { open: true, amount: 0, reason: '', error: '', version: openSession.value!.version, key: newIdempotencyKey() })
+  } })
+  if (auth.can('expenses.view') || auth.can('ledger.view')) items.push({ label: 'مصارف و حسابداری', icon: 'ri-book-line', onSelect: () => {
+    window.location.assign('/accounting?tab=expenses')
+  } })
+  return items
+})
 
-let controller: AbortController | null = null
+
 async function loadInvoices() {
-  controller?.abort()
-  controller = new AbortController()
-  const { signal } = controller
-  try {
-    const params = new URLSearchParams({ unpaid: 'true' })
-    if (q.value.trim()) params.set('q', q.value.trim())
-    // Every open invoice, not the first page: the count and the total above are built from this list.
-    invoices.value = await fetchAll<InvoiceRow>(`/invoices?${params}`, signal)
-    loadError.value = ''
-  } catch (cause) {
-    if (signal.aborted) return
-    loadError.value = errorMessage(cause)
-  }
-  loading.value = false
-}
-
-async function loadOpticalOrders() {
-  if (!auth.can('payments.create')) return
-  opticalOrders.value = await api<typeof opticalOrders.value>('/optical/orders/unpaid')
+  try { await invoiceList.load(); loadError.value = '' }
+  catch (cause) { loadError.value = errorMessage(cause) }
+  finally { loading.value = false }
 }
 
 async function loadSessions() {
   sessions.value = await api<SessionRow[]>('/cash/sessions?mine=true')
 }
 
-/** What this register has taken so far, newest first, so a lost receipt is printed again without leaving the desk. */
-const receiptList = usePagedList<PaymentRow>(() => `/payments?sessionId=${openSession.value?.id ?? 0}`, 10)
-const showReceipts = computed(() => !!openSession.value && auth.can('payments.view'))
+/** Receipts of the selected day remain available after the drawer closes. */
+const receiptList = usePagedList<PaymentRow>(() => `/payments?from=${day.value}&to=${day.value}&q=${encodeURIComponent(q.value)}`, 15)
+const showReceipts = computed(() => auth.can('payments.view'))
 
 async function loadReceipts() {
   if (showReceipts.value) await receiptList.load()
@@ -64,7 +69,7 @@ async function loadReceipts() {
 
 async function refresh() {
   try {
-    await Promise.all([loadInvoices(), loadOpticalOrders(), loadSessions()])
+    await Promise.all([loadInvoices(), loadSessions(), refundList.load(), historical.value ? historyList.load() : Promise.resolve(), api<DaySummary>(`/cash/day?date=${day.value}`).then((value) => { summary.value = value })])
     await loadReceipts()
   } catch (cause) {
     loadError.value = errorMessage(cause)
@@ -78,8 +83,7 @@ async function open() {
   error.value = ''
   try {
     await api('/cash/sessions', { method: 'POST', body: { registerId: opening.registerId, openingAmount: opening.amount } })
-    await loadSessions()
-    await loadReceipts()
+    await refresh()
   } catch (cause) {
     // A register has one open session at a time; the plain duplicate message would not say what to do.
     error.value = cause instanceof ApiError && cause.code === 'duplicate'
@@ -90,16 +94,19 @@ async function open() {
   }
 }
 
-const closing = reactive({ open: false, counted: 0, saving: false, error: '' })
+const closing = reactive({ open: false, target: null as SessionRow | null, counted: 0, note: '', saving: false, error: '' })
+const closingSession = computed(() => closing.target ?? openSession.value)
+function startClose(session: SessionRow) {
+  Object.assign(closing, { open: true, target: session, counted: session.currentExpected, note: '', error: '' })
+}
 
 async function close() {
   closing.saving = true
   closing.error = ''
   try {
-    await api(`/cash/sessions/${openSession.value!.id}/close`, { method: 'POST', body: { countedAmount: closing.counted, version: openSession.value!.version } })
+    await api(`/cash/sessions/${closingSession.value!.id}/close`, { method: 'POST', body: { countedAmount: closing.counted, note: closing.note, version: closingSession.value!.version } })
     closing.open = false
-    await loadSessions()
-    await loadReceipts()
+    await refresh()
   } catch (cause) {
     closing.error = errorMessage(cause)
   } finally {
@@ -144,7 +151,7 @@ async function submitPayment() {
     pay.error = errorMessage(cause)
     // A definite refusal may be retried with new values; an unknown outcome keeps the key so a retry cannot double-charge.
     if (cause instanceof ApiError && !cause.outcomeUnknown) pay.key = newIdempotencyKey()
-    if (cause instanceof ApiError && cause.code === 'invoice_changed') {
+    if (cause instanceof ApiError && (cause.code === 'invoice_changed' || cause.code === 'concurrency_conflict')) {
       pay.detail = await api<InvoiceDetail>(`/invoices/${pay.detail!.invoice.id}`)
       pay.amount = pay.detail.invoice.balance
       pay.discount = 0
@@ -170,8 +177,8 @@ async function submitVoid() {
   }
 }
 
-/** Unpaid and undiscounted: the patient left without paying, so the invoice is voided and leaves every receivable. */
-const canDrop = (row: InvoiceRow) => row.paid === 0 && row.discount === 0 && auth.can('invoices.cancel')
+/** No net receipt remains: cancellation reverses the charge and any discount together. */
+const canDrop = (row: InvoiceRow) => row.paid - row.refunded === 0 && auth.can('invoices.cancel')
 const dropReason = 'مریض پرداخت نکرد'
 function startDrop(row: InvoiceRow) {
   Object.assign(voiding, { row, reason: dropReason, error: '' })
@@ -180,22 +187,61 @@ function startDrop(row: InvoiceRow) {
 function cashierRowItems(row: InvoiceRow) {
   const items: { label: string; ariaLabel?: string; icon?: string; danger?: boolean; disabled?: boolean; onSelect: () => void }[] = []
   if (auth.can('invoices.print')) items.push({ label: 'فاکتور', icon: 'ri-printer-line', onSelect: () => { window.open(`/print/invoice/${row.id}`, '_blank', 'noopener') } })
-  if (canDrop(row) && auth.can('invoices.create')) {
+  if (canDrop(row) && row.correctable && auth.can('invoices.create')) {
     items.push({ label: 'اصلاح', icon: 'ri-edit-line', onSelect: () => { window.location.assign(`/cashier/invoice?correct=${encodeURIComponent(row.id)}`) } })
   }
   return items
 }
 
-/** Three lists at one desk: invoices to collect, optical orders waiting for money, and this register's receipts. */
-const tab = ref<'invoices' | 'optical' | 'receipts'>('invoices')
-
+const adjustment = reactive({ row: null as PaymentRow | null, cancel: false, amount: 0, reason: '', saving: false, error: '', key: '' })
+const transfer = reactive({ open: false, amount: 0, destination: 'Vault', reason: '', version: 0, saving: false, error: '', key: '' })
+async function saveTransfer() {
+  transfer.saving = true
+  transfer.error = ''
+  try {
+    await api(`/cash/sessions/${openSession.value!.id}/transfer`, { method: 'POST', idempotencyKey: transfer.key,
+      body: { amount: transfer.amount, destination: transfer.destination, reason: transfer.reason, version: transfer.version } })
+    transfer.open = false
+    await refresh()
+  } catch (cause) {
+    transfer.error = errorMessage(cause)
+    if (cause instanceof ApiError && !cause.outcomeUnknown) transfer.key = newIdempotencyKey()
+  } finally { transfer.saving = false }
+}
+function openAdjustment(row: PaymentRow, cancel: boolean) {
+  Object.assign(adjustment, { row, cancel, amount: row.amount, reason: '', saving: false, error: '', key: newIdempotencyKey() })
+}
+async function saveAdjustment() {
+  adjustment.saving = true
+  adjustment.error = ''
+  try {
+    await api(`/payments/${adjustment.row!.id}/${adjustment.cancel ? 'cancel' : 'correct'}`, {
+      method: 'POST', idempotencyKey: adjustment.key,
+      body: { amount: adjustment.amount, reason: adjustment.reason, version: adjustment.row!.version },
+    })
+    adjustment.row = null
+    await refresh()
+  } catch (cause) {
+    adjustment.error = errorMessage(cause)
+    if (cause instanceof ApiError && !cause.outcomeUnknown) adjustment.key = newIdempotencyKey()
+    if (cause instanceof ApiError && cause.status === 409 && !cause.outcomeUnknown) {
+      error.value = adjustment.error
+      adjustment.row = null
+      await refresh()
+    }
+  } finally { adjustment.saving = false }
+}
+watch([day, allOutstanding, historical], async () => {
+  invoiceList.page.value = 1; receiptList.page.value = 1; refundList.page.value = 1; historyList.page.value = 1
+  await refresh()
+})
 let debounce: ReturnType<typeof setTimeout> | undefined
 watch(q, () => {
   clearTimeout(debounce)
-  debounce = setTimeout(loadInvoices, 300)
+  debounce = setTimeout(() => { invoiceList.page.value = 1; receiptList.page.value = 1; refundList.page.value = 1; historyList.page.value = 1; refresh() }, 350)
 })
 
-useLiveRefresh(['InvoiceIssued', 'PaymentReceived'], refresh)
+useLiveRefresh(['InvoiceIssued', 'PaymentReceived', 'InventoryChanged', 'CashChanged', 'VisitStatusChanged'], refresh)
 onMounted(async () => {
   try {
     registers.value = await api<typeof registers.value>('/cash/registers')
@@ -221,24 +267,23 @@ onBeforeUnmount(() => clearTimeout(debounce))
       <!-- One row: the lists, the open register in brief, and the desk's buttons. -->
       <div class="cash-bar">
         <div class="xr-tabs dq-tabs cash-bar__tabs" role="tablist" aria-label="کارهای صندوق">
-          <button type="button" role="tab" class="xr-tab" :class="{ 'xr-tab--active': tab === 'invoices' }" :aria-selected="tab === 'invoices'" @click="tab = 'invoices'">
-            قابل دریافت <span v-if="invoices.length" class="xr-tab__count">{{ quantity(invoices.length) }}</span>
+          <button id="cash-invoices-tab" type="button" role="tab" class="xr-tab" :class="{ 'xr-tab--active': tab === 'invoices' }" :aria-selected="tab === 'invoices'" aria-controls="cash-invoices" @click="tab = 'invoices'">
+            فاکتورهای ارجاع‌شده <span v-if="invoiceList.total.value" class="xr-tab__count">{{ quantity(invoiceList.total.value) }}</span>
           </button>
-          <button v-if="opticalOrders.length" type="button" role="tab" class="xr-tab" :class="{ 'xr-tab--active': tab === 'optical' }" :aria-selected="tab === 'optical'" @click="tab = 'optical'">
-            سفارش‌های عینک <span class="xr-tab__count">{{ quantity(opticalOrders.length) }}</span>
+          <button v-if="showReceipts" id="cash-receipts-tab" type="button" role="tab" class="xr-tab" :class="{ 'xr-tab--active': tab === 'receipts' }" :aria-selected="tab === 'receipts'" aria-controls="cash-receipts" @click="tab = 'receipts'">
+            دریافت‌شده‌ها <span v-if="receiptList.total.value" class="xr-tab__count">{{ quantity(receiptList.total.value) }}</span>
           </button>
-          <button v-if="showReceipts" type="button" role="tab" class="xr-tab" :class="{ 'xr-tab--active': tab === 'receipts' }" :aria-selected="tab === 'receipts'" @click="tab = 'receipts'">دریافت‌های این صندوق</button>
         </div>
         <div v-if="openSession" class="cash-bar__session" :title="`${openSession.registerName} · باز از ${formatDateTime(openSession.openedAt)} · شروع ${money(openSession.openingAmount)}`">
           <span class="cash-bar__dot" aria-hidden="true"></span>
           <strong>{{ openSession.registerName }}</strong>
-          <span>نقد {{ money(openSession.cashCollected) }}</span>
-          <span class="dq__warn">مانده {{ money(pendingTotal) }}</span>
+          <span>موجودی {{ money(openSession.currentExpected) }}</span>
         </div>
         <span v-else-if="!auth.can('cash.create')" class="xr-badge xr-badge--orange">صندوق بسته است</span>
         <div class="cash-bar__actions">
           <RouterLink v-if="auth.can('invoices.create')" :to="{ name: 'invoice-new' }" class="btn btn-soft"><i class="ri-add-line" aria-hidden="true"></i> فاکتور مستقل</RouterLink>
-          <button v-if="openSession && auth.can('cash.edit')" type="button" class="btn btn-quiet" @click="closing.open = true; closing.counted = 0; closing.error = ''">بستن صندوق</button>
+          <button v-if="openSession && auth.can('cash.edit')" type="button" class="btn btn-quiet" @click="startClose(openSession)">بستن صندوق</button>
+          <UiRowMenu label="گزینه‌های صندوق" :items="deskActions" />
         </div>
       </div>
       <form v-if="!openSession && auth.can('cash.create')" class="dq-chosen cash-open" aria-label="صندوق" @submit.prevent="open">
@@ -252,14 +297,16 @@ onBeforeUnmount(() => clearTimeout(debounce))
         <button type="submit" class="btn btn-primary" :disabled="opening.saving">باز کردن صندوق</button>
       </form>
 
-      <template v-if="tab === 'invoices'">
-        <div class="dq-filters">
-          <label class="dq-search">
-            <i class="ri-search-line" aria-hidden="true"></i>
-            <input v-model="q" type="search" placeholder="جستجو: شماره فاکتور، پرونده یا نام" aria-label="جستجوی فاکتور" />
-            <button v-if="q" type="button" class="dq-search__clear" aria-label="پاک کردن جستجو" @click="q = ''"><i class="ri-close-line" aria-hidden="true"></i></button>
-          </label>
-        </div>
+      <div class="dq-filters cash-filters">
+        <label class="dq-search">
+          <i class="ri-search-line" aria-hidden="true"></i>
+          <input v-model="q" type="search" aria-label="جستجوی مالی" placeholder="جستجو: نام، پرونده، فاکتور یا رسید" />
+          <button v-if="q" type="button" class="dq-search__clear" aria-label="پاک کردن جستجو" @click="q = ''"><i class="ri-close-line" aria-hidden="true"></i></button>
+        </label>
+        <ShamsiDateInput v-model="date" label="تاریخ" required />
+        <label v-if="tab === 'invoices'" class="cash-filters__all"><input v-model="allOutstanding" type="checkbox" /> تمام روزها</label>
+      </div>
+      <section v-if="tab === 'invoices'" id="cash-invoices" role="tabpanel" aria-labelledby="cash-invoices-tab">
         <UiListSkeleton v-if="loading" />
         <div v-else-if="invoices.length === 0" class="xr-state">فاکتور قابل دریافتی نیست.</div>
         <div v-else class="xr-table-wrap">
@@ -272,13 +319,15 @@ onBeforeUnmount(() => clearTimeout(debounce))
                 <td class="text-nowrap">{{ formatDateTime(row.createdAt) }}</td>
                 <td>
                   <strong>{{ row.patientName ?? 'بدون مریض' }}</strong>
+                  <span class="cash-table__sub">فاکتور {{ row.invoiceNumber }}</span>
                   <span v-if="row.queueNumber" class="cash-table__sub">نوبت {{ quantity(row.queueNumber) }}</span>
                 </td>
                 <td>{{ row.section ?? '—' }}</td>
                 <td>{{ invoiceSubject(row) }}</td>
                 <td class="text-nowrap">
                   <span class="dq__money">{{ money(row.balance) }}</span>
-                  <span v-if="row.paid" class="cash-table__sub">پرداخت‌شده {{ money(row.paid) }}</span>
+                  <span v-if="row.paid - row.refunded > 0" class="cash-table__sub">پرداخت‌شده {{ money(row.paid - row.refunded) }}</span>
+                  <span v-if="row.paid - row.refunded > 0 && row.balance > 0" class="cash-table__sub">پرداخت ناقص</span>
                 </td>
                 <td>
                   <div class="dq__actions">
@@ -291,30 +340,13 @@ onBeforeUnmount(() => clearTimeout(debounce))
             </tbody>
           </table>
         </div>
-      </template>
+        <UiPager :page="invoiceList.page.value" :page-count="invoiceList.pageCount.value" @go="invoiceList.goTo($event).catch((cause) => (error = errorMessage(cause)))" />
+      </section>
 
-      <template v-else-if="tab === 'optical'">
-        <p class="form-hint mb-0">مریض رسید سفارش را به صندوق می‌آورد؛ با «وجه دریافت شد» همان فاکتور قفل‌شده پرداخت می‌شود.</p>
-        <ol class="dq" aria-label="سفارش‌های عینک در انتظار پرداخت">
-          <li v-for="order in opticalOrders" :key="order.id" class="dq__row">
-            <div class="dq__num"><strong class="ltr-num dq__code">{{ order.orderNumber }}</strong></div>
-            <div class="dq__who">
-              <div class="dq__name">{{ order.patientName ?? 'سفارش مستقل' }}</div>
-              <div class="dq__detail"><span>فاکتور <span class="ltr-num">{{ order.invoiceNumber }}</span></span><span>مجموع {{ money(order.total) }}</span></div>
-            </div>
-            <div class="dq__state dq__money">{{ money(order.balance) }}</div>
-            <div class="dq__actions">
-              <button type="button" class="btn btn-primary" :disabled="!openSession" @click="openPayment({ id: order.invoiceId, balance: order.balance })">وجه دریافت شد</button>
-              <RouterLink class="btn btn-soft" :to="{ name: 'print', params: { kind: 'optical-order', id: order.id } }">چاپ رسید</RouterLink>
-            </div>
-          </li>
-        </ol>
-      </template>
-
-      <template v-else>
-        <div v-if="receiptList.rows.value.length === 0" class="xr-state">هنوز در این صندوق دریافتی ثبت نشده است.</div>
+      <section v-if="tab === 'receipts' && showReceipts" id="cash-receipts" role="tabpanel" aria-labelledby="cash-receipts-tab">
+        <div v-if="receiptList.rows.value.length === 0" class="xr-state">در روز و جستجوی منتخب دریافتی ثبت نشده است.</div>
         <div v-else class="xr-table-wrap">
-          <table class="xr-table cash-table" aria-label="دریافت‌های این صندوق">
+          <table class="xr-table cash-table" aria-label="دریافت‌های روز منتخب">
             <thead>
               <tr><th>تاریخ</th><th>نام مریض</th><th>بخش</th><th>بابت</th><th>مبلغ</th><th><span class="visually-hidden">عملیات</span></th></tr>
             </thead>
@@ -330,19 +362,45 @@ onBeforeUnmount(() => clearTimeout(debounce))
                 <td class="text-nowrap">
                   <strong>{{ money(row.amount) }}</strong>
                   <span class="cash-table__sub">{{ row.method === 'Cash' ? 'نقد' : 'غیرنقدی' }}</span>
-                  <span v-if="row.refunded" class="cash-table__sub dq__warn">برگشت {{ money(row.refunded) }}</span>
+                  <span class="cash-table__sub">رسید {{ row.receiptNumber }} · فاکتور {{ row.invoiceNumber }}</span>
+                  <span v-if="row.refunded" class="cash-table__sub dq__warn" title="مجموع برگشت این رسید تا اکنون؛ برگشت روز منتخب در فهرست جدا آمده است">برگشت {{ money(row.refunded) }} · خالص {{ money(row.amount - row.refunded) }}</span>
+                  <span v-if="row.replacementPaymentId" class="cash-table__sub">اصلاح‌شده</span>
                 </td>
                 <td>
-                  <div class="dq__actions"><RouterLink v-if="auth.can('payments.print')" :to="`/print/receipt/${row.id}`" target="_blank" class="btn btn-soft">چاپ دوباره</RouterLink></div>
+                  <div class="dq__actions"><RouterLink v-if="auth.can('payments.print')" :to="`/print/receipt/${row.id}`" target="_blank" class="btn btn-soft">چاپ دوباره</RouterLink>
+                    <template v-if="auth.can('payments.refund') && !row.refunded"><button type="button" class="btn btn-soft" @click="openAdjustment(row, false)">اصلاح</button><button type="button" class="btn btn-soft-danger" @click="openAdjustment(row, true)">لغو دریافت</button></template>
+                  </div>
                 </td>
               </tr>
             </tbody>
           </table>
         </div>
         <UiPager :page="receiptList.page.value" :page-count="receiptList.pageCount.value" @go="receiptList.goTo($event).catch((cause) => (error = errorMessage(cause)))" />
-      </template>
+      </section>
     </section>
   </div>
+
+  <UiModal v-if="dayDetails" title="جزئیات روز" @close="dayDetails = false; historical = false">
+      <div v-if="summary" class="cash-day-summary" aria-label="خلاصه روز منتخب">
+        <span>دریافتی <strong>{{ money(summary.receipts) }}</strong></span>
+        <span>برگشت پول <strong>{{ money(summary.refunds) }}</strong></span>
+        <span>مصارف <strong>{{ money(summary.expenses) }}</strong></span>
+        <span>خالص روز <strong>{{ money(summary.netReceived) }}</strong></span>
+        <small v-if="summary.otherReceipts">غیرنقدی: {{ money(summary.otherReceipts) }}</small>
+      </div>
+      <p v-if="summary?.unassignedCashOut" class="alert alert-warning" role="status">گردش نقدی خارج از صندوق شخصی: {{ money(summary.unassignedCashOut) }}. این مبلغ در شمارش صندوق شما منظور نشده است.</p>
+      <details class="mt-3"><summary>برگشت‌های روز منتخب ({{ quantity(refundList.total.value) }})</summary>
+        <p class="form-hint">به تاریخ برگشت پول، حتی اگر رسید اصلی مربوط روز دیگری باشد.</p>
+        <div class="xr-table-wrap"><table class="xr-table"><thead><tr><th>مریض / رسید</th><th>مبلغ</th><th>دلیل</th><th>زمان</th></tr></thead><tbody><tr v-for="row in refundList.rows.value" :key="row.id"><td>{{ row.patientName }}<small class="cash-table__sub">{{ row.receiptNumber }}</small></td><td>{{ money(row.amount) }}</td><td>{{ row.reason }}</td><td>{{ formatDateTime(row.createdAt) }}</td></tr></tbody></table></div>
+        <UiPager :page="refundList.page.value" :page-count="refundList.pageCount.value" @go="refundList.goTo($event).catch((cause) => (error = errorMessage(cause)))" />
+      </details>
+      <details class="mt-3" @toggle="historical = ($event.target as HTMLDetailsElement).open"><summary>بدهی‌ها در پایان روز منتخب</summary>
+        <p class="form-hint">وضعیت تاریخی تا پایان همان روز به وقت کابل؛ پرداخت یا لغو روزهای بعد از این مانده کم نمی‌شود.</p>
+        <div class="xr-table-wrap"><table class="xr-table"><thead><tr><th>فاکتور</th><th>مریض</th><th>بابت</th><th>مانده آن روز</th></tr></thead><tbody><tr v-for="row in historyList.rows.value" :key="row.id"><td>{{ row.invoiceNumber }}</td><td>{{ row.patientName }}</td><td>{{ row.description }}</td><td>{{ money(row.balance) }}</td></tr></tbody></table></div>
+        <UiPager :page="historyList.page.value" :page-count="historyList.pageCount.value" @go="historyList.goTo($event).catch((cause) => (error = errorMessage(cause)))" />
+      </details>
+      <details v-if="summary?.sessions.length" class="mt-3"><summary>صندوق‌های روز منتخب</summary><div class="xr-table-wrap"><table class="xr-table"><thead><tr><th>صندوق / کارمند</th><th>بازشدن</th><th>بسته‌شدن</th><th>مورد انتظار</th><th>شمارش‌شده</th><th>کسری / اضافه</th><th>دلیل</th></tr></thead><tbody><tr v-for="session in summary.sessions" :key="session.id"><td>{{ session.registerName }} · {{ session.openedBy }}</td><td>{{ formatDateTime(session.openedAt) }}</td><td>{{ session.closedAt ? formatDateTime(session.closedAt) : 'باز' }}</td><td>{{ money(session.expectedAmount ?? session.currentExpected) }}</td><td>{{ session.countedAmount === null ? '—' : money(session.countedAmount) }}</td><td>{{ session.difference === null ? '—' : money(session.difference) }}</td><td>{{ session.closeNote ?? '—' }}<button v-if="!session.closedAt && auth.can('payments.refund')" type="button" class="btn btn-soft btn-sm" @click="dayDetails = false; startClose(session)">بررسی و بستن</button></td></tr></tbody></table></div></details>
+  </UiModal>
 
   <UiModal v-if="pay.detail" :title="`فاکتور ${pay.detail.invoice.invoiceNumber}`" @close="pay.detail = null">
     <ul class="list-unstyled small mb-3">
@@ -383,17 +441,41 @@ onBeforeUnmount(() => clearTimeout(debounce))
     </form>
   </UiModal>
 
-  <UiModal v-if="closing.open && openSession" title="بستن صندوق" @close="closing.open = false">
+  <UiModal v-if="closing.open && closingSession" title="بستن صندوق" @close="closing.open = false">
     <form @submit.prevent="close">
-      <p>دریافت نقدی این جلسه: {{ money(openSession.cashCollected) }}<br />مبلغ مورد انتظار: {{ money(openSession.openingAmount + openSession.cashCollected) }}</p>
-      <p class="small text-muted">این مبلغ فقط موجودی آغاز و دریافت نقدی این جلسه است. برگشت وجه و مصارف از آن کم نشده است.</p>
+      <p>{{ closingSession.registerName }} · {{ closingSession.openedBy }}<br />دریافت نقدی این جلسه: {{ money(closingSession.cashCollected) }}<br />مبلغ مورد انتظار: {{ money(closingSession.currentExpected) }}</p>
+      <p class="small text-muted">موجودی آغاز + دریافت نقدی − برگشت و مصارف مرتبط با همین صندوق. گردش خارج از این صندوق جدا گزارش می‌شود.</p>
       <label class="form-label" for="c-counted">مبلغ شمارش‌شده</label>
       <input id="c-counted" v-model.number="closing.counted" class="form-control mb-3" type="number" min="0" step="0.01" required />
+      <label class="form-label" for="c-note">توضیح کسری یا اضافه</label>
+      <input id="c-note" v-model="closing.note" class="form-control mb-3" maxlength="300" :required="closing.counted !== closingSession.currentExpected || closingSession.id !== openSession?.id" />
+      <p v-if="closing.counted !== closingSession.currentExpected">تفاوت: {{ money(closing.counted - closingSession.currentExpected) }}</p>
       <div v-if="closing.error" class="alert alert-danger" role="alert">{{ closing.error }}</div>
       <div class="xr-form-actions">
         <button type="submit" class="btn btn-primary" :disabled="closing.saving">بستن صندوق</button>
         <button type="button" class="btn btn-soft-danger" data-modal-cancel>انصراف</button>
       </div>
+    </form>
+  </UiModal>
+
+  <UiModal v-if="transfer.open && openSession" title="تحویل پول صندوق" @close="transfer.open = false">
+    <form @submit.prevent="saveTransfer">
+      <label class="form-label">مبلغ<input v-model.number="transfer.amount" type="number" class="form-control mb-3" min="0.01" step="0.01" :max="openSession.currentExpected" required /></label>
+      <label class="form-label">مقصد<select v-model="transfer.destination" class="form-select mb-3"><option value="Vault">گاوصندوق</option><option value="Bank">بانک</option></select></label>
+      <label class="form-label">شرح تحویل<input v-model="transfer.reason" class="form-control mb-3" minlength="3" maxlength="300" required /></label>
+      <div v-if="transfer.error" class="alert alert-danger" role="alert">{{ transfer.error }}</div>
+      <div class="xr-form-actions"><button type="submit" class="btn btn-primary" :disabled="transfer.saving">ثبت تحویل پول</button><button type="button" class="btn btn-soft" data-modal-cancel>انصراف</button></div>
+    </form>
+  </UiModal>
+
+  <UiModal v-if="adjustment.row" :title="adjustment.cancel ? 'لغو دریافت' : 'اصلاح دریافت'" @close="adjustment.row = null">
+    <form @submit.prevent="saveAdjustment">
+      <p>رسید {{ adjustment.row.receiptNumber }} · {{ adjustment.row.patientName }}</p>
+      <p class="form-hint">سابقه رسید حفظ می‌شود. اثر اصلاح در صندوق فعلی ثبت و مانده فاکتور هماهنگ می‌شود؛ لغو دریافت به معنی برگشت جنس نیست.</p>
+      <label v-if="!adjustment.cancel" class="form-label">مبلغ درست دریافتی<input v-model.number="adjustment.amount" class="form-control mb-3" type="number" min="0.01" step="0.01" required /></label>
+      <label class="form-label">دلیل<input v-model="adjustment.reason" class="form-control mb-3" minlength="3" maxlength="300" required /></label>
+      <div v-if="adjustment.error" class="alert alert-danger" role="alert">{{ adjustment.error }}</div>
+      <div class="xr-form-actions"><button type="submit" class="btn" :class="adjustment.cancel ? 'btn-danger' : 'btn-primary'" :disabled="adjustment.saving">{{ adjustment.cancel ? 'تأیید لغو دریافت' : 'ثبت اصلاح' }}</button><button type="button" class="btn btn-soft" data-modal-cancel>انصراف</button></div>
     </form>
   </UiModal>
 
@@ -413,6 +495,13 @@ onBeforeUnmount(() => clearTimeout(debounce))
 </template>
 
 <style scoped>
+.cash-filters { align-items: center; }
+.cash-filters :deep(.mb-3) { margin-bottom: 0 !important; }
+.cash-filters__all { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; margin: 0; }
+.cash-day-summary { display: flex; flex-wrap: wrap; gap: 12px 24px; padding: 16px 0; }
+.cash-day-summary span { display: grid; gap: 4px; }
+.cash-day-summary strong { font-size: 1.2rem; }
+
 .cash-open .form-select, .cash-open .form-control { width: auto; min-height: 38px; padding-block: 4px; }
 .cash-open__amount { display: inline-flex; align-items: center; gap: 8px; margin: 0; white-space: nowrap; }
 .cash-open__amount .form-control { max-width: 130px; }

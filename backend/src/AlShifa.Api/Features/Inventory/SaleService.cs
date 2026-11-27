@@ -29,7 +29,9 @@ public sealed class StockService(AppDbContext db, CurrentUser user, IConfigurati
 
         var since = DateTime.UtcNow - ReservationWindow;
         var rows = await db.Database.SqlQueryRaw<Held>(
-            "SELECT si.BatchId AS `Key`, si.Quantity AS `Quantity` FROM SaleItem si JOIN Sales s ON s.Id = si.SaleId " +
+            // Start from the locked batch's indexed items. Reordering this locking join to scan Sales first
+            // locks unrelated bills and can deadlock two deliveries that each own a different bill.
+            "SELECT si.BatchId AS `Key`, si.Quantity AS `Quantity` FROM SaleItem si FORCE INDEX (`IX_SaleItem_BatchId_SaleId_Quantity`) STRAIGHT_JOIN Sales s ON s.Id = si.SaleId " +
             $"WHERE si.BatchId IN ({string.Join(',', batchIds)}) AND si.SaleId <> {{0}} AND s.IsReturned = 0 AND s.DeliveredAt IS NULL AND s.CreatedAt >= {{1}} " +
             "FOR SHARE",
             exceptSaleId ?? -1, since).ToListAsync(ct);
@@ -56,7 +58,7 @@ public sealed class StockService(AppDbContext db, CurrentUser user, IConfigurati
     {
         var today = KabulClock.Today.ToDateTime(TimeOnly.MinValue);
         var batches = await db.StockBatches.FromSqlInterpolated($"""
-            SELECT * FROM StockBatches
+            SELECT * FROM StockBatches FORCE INDEX (`IX_StockBatches_ProductId_LocationId_ExpiryDate`)
             WHERE ProductId = {productId} AND LocationId = {locationId} AND Quantity > 0 AND (ExpiryDate IS NULL OR ExpiryDate >= {today})
             ORDER BY ExpiryDate IS NULL, ExpiryDate, Id
             FOR UPDATE
@@ -156,13 +158,15 @@ public sealed class SaleService(AppDbContext db, NumberService numbers, StockSer
             visitId = prescription.VisitId;
         }
 
+        // Traverse the same composite index as AllocateAsync. A primary-key pre-lock followed by a secondary-index lock
+        // after taking the invoice counter can deadlock two different products at their adjacent index ranges.
         // Every path that touches a bill locks in one order: prescription, batches, then bills. The batches are locked here, before this
         // bill's row exists; a delivery holding a batch would otherwise wait on this new bill while this bill waits on its batch.
         var productIds = lines.Select(l => l.ProductId).Distinct().OrderBy(id => id).ToList();
         if (productIds.Count > 0)
         {
             await db.StockBatches.FromSqlRaw(
-                $"SELECT * FROM StockBatches WHERE LocationId = {{0}} AND ProductId IN ({string.Join(',', productIds)}) ORDER BY Id FOR UPDATE", locationId).ToListAsync(ct);
+                $"SELECT * FROM StockBatches FORCE INDEX (`IX_StockBatches_ProductId_LocationId_ExpiryDate`) WHERE LocationId = {{0}} AND ProductId IN ({string.Join(',', productIds)}) ORDER BY Id FOR UPDATE", locationId).ToListAsync(ct);
         }
 
         // The invoice number is taken before the locking read of open bills. Two sales for two new prescriptions otherwise both hold
@@ -365,7 +369,7 @@ public sealed class SaleService(AppDbContext db, NumberService numbers, StockSer
     }
 
     /// <summary>Whole-sale return. The pharmacy return endpoint also refunds all money still held, in the same transaction.</summary>
-    public async Task ReturnAsync(long saleId, int version, string reason, CancellationToken ct, bool refundPaidPharmacy = false)
+    public async Task ReturnAsync(long saleId, int version, string reason, CancellationToken ct, bool refundPaidPharmacy = false, int? expectedInvoiceVersion = null)
     {
         // Use the delivery lock order so a concurrent delivery cannot move stock after it was returned.
         var head = await db.Sales.AsNoTracking().Where(s => s.Id == saleId).Select(s => new { s.PrescriptionId }).SingleOrDefaultAsync(ct) ?? throw AppException.NotFound();
@@ -387,7 +391,10 @@ public sealed class SaleService(AppDbContext db, NumberService numbers, StockSer
         }
 
         var invoice = await invoices.LockAsync(sale.InvoiceId, ct);
-        if (invoice.Paid > 0 && !refundPaidPharmacy)
+        if (expectedInvoiceVersion is { } seen && invoice.Version != seen) throw new DbUpdateConcurrencyException();
+        if (expectedInvoiceVersion is not null && invoice.Paid - invoice.Refunded > 0)
+            throw new AppException(409, "invoice_has_payments", "ابتدا دریافت این فاکتور را با صلاحیت برگشت وجه اصلاح یا لغو کنید.");
+        if (invoice.Paid - invoice.Refunded > 0 && !refundPaidPharmacy)
         {
             throw new AppException(StatusCodes.Status409Conflict, "sale_is_paid", "این فروش پرداخت شده است و از اینجا برگشت نمی‌شود. به حسابداری مراجعه کنید.");
         }
@@ -410,21 +417,15 @@ public sealed class SaleService(AppDbContext db, NumberService numbers, StockSer
                 invoice.Refunded += refund.Amount;
                 await db.SaveChangesAsync(ct);
                 ledger.Post("Refund", "Refund", refund.Id, reason,
-                    (Accounts.Refunds, refund.Amount, 0), (Accounts.Cash, 0, refund.Amount));
+                    (Accounts.Receivable, refund.Amount, 0), (payment.Method == PaymentMethod.Cash ? Accounts.Cash : Accounts.Bank, 0, refund.Amount));
+                if (payment.Method == PaymentMethod.Cash) await CashBook.RecordAsync(db, user.Id, "Refund", "Refund", refund.Id, -refund.Amount, ct);
                 audit.Add("RefundApproved", "Refund", refund.Id.ToString(), reason);
             }
-            // The charges are reversed below. Move both earlier and new refunds to receivables
-            // so the same return does not reduce revenue twice or leave a credit balance.
-            if (invoice.Refunded > 0)
-            {
-                ledger.Post("SaleReturnRefund", nameof(Sale), sale.Id, reason,
-                    (Accounts.Receivable, invoice.Refunded, 0), (Accounts.Refunds, 0, invoice.Refunded));
-            }
-            if (invoice.Discount > 0)
-            {
-                ledger.Post("SaleReturnDiscount", nameof(Sale), sale.Id, reason,
-                    (Accounts.Receivable, invoice.Discount, 0), (Accounts.Discounts, 0, invoice.Discount));
-            }
+        }
+        if (invoice.Discount > 0)
+        {
+            ledger.Post("SaleReturnDiscount", nameof(Sale), sale.Id, reason,
+                (Accounts.Receivable, invoice.Discount, 0), (Accounts.Discounts, 0, invoice.Discount));
         }
 
         // An undelivered bill moved no stock and dispensed nothing: cancelling it only frees its reservation.
@@ -467,7 +468,7 @@ public sealed class SaleService(AppDbContext db, NumberService numbers, StockSer
             }
         }
 
-        if (refundPaidPharmacy || (invoice.Discount == 0 && invoice.Paid == 0))
+        if (refundPaidPharmacy || invoice.Paid == invoice.Refunded)
         {
             invoice.Status = InvoiceStatus.Void;
         }
@@ -479,7 +480,7 @@ public sealed class SaleService(AppDbContext db, NumberService numbers, StockSer
 
         sale.IsReturned = true;
         audit.Add("SaleReturned", nameof(Sale), sale.Id.ToString(), reason);
-        outbox.Add("InventoryChanged", new { saleId = sale.Id }, Groups.Pharmacy, Groups.Optical, Groups.Inventory, Groups.Cashier);
+        outbox.Add("InventoryChanged", new { saleId = sale.Id }, Groups.Pharmacy, Groups.Optical, Groups.Inventory, Groups.Cashier, Groups.Finance);
         await db.SaveChangesAsync(ct);
     }
 

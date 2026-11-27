@@ -392,7 +392,9 @@ public sealed class HospitalReadinessTests(ApiFixture api) : PhysicalQueueTestSc
 
             async Task PayOpenAsync()
             {
-                var unpaid = await cashier.GetFromJsonAsync<PagedResult<InvoiceRow>>($"/api/invoices?unpaid=true&q={patient.FileNumber}", JsonOptions);
+                // A text search also matches other file numbers containing these digits.
+                // Parallel patients must settle only their own invoices.
+                var unpaid = await cashier.GetFromJsonAsync<PagedResult<InvoiceRow>>($"/api/invoices?unpaid=true&patientId={patient.Id}", JsonOptions);
                 foreach (var invoice in unpaid!.Items)
                 {
                     await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, invoice.Balance, PaymentMethod.Cash, null, invoice.Version))));
@@ -412,7 +414,7 @@ public sealed class HospitalReadinessTests(ApiFixture api) : PhysicalQueueTestSc
             await PayOpenAsync();
             await api.PayAndDeliverAsync(pharmacist, sale.Id);
 
-            var settled = await cashier.GetFromJsonAsync<PagedResult<InvoiceRow>>($"/api/invoices?unpaid=true&q={patient.FileNumber}", JsonOptions);
+            var settled = await cashier.GetFromJsonAsync<PagedResult<InvoiceRow>>($"/api/invoices?unpaid=true&patientId={patient.Id}", JsonOptions);
             Assert.Empty(settled!.Items);
             Assert.Equal(200, sale.Total);
             return (visit.Id, visit.QueueNumber!.Value);

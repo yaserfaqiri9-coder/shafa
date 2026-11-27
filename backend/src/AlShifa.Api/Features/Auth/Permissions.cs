@@ -96,8 +96,8 @@ public static class RolePermissions
         },
         [Roles.Accountant] = new()
         {
-            ["pharmacy"] = "V", ["optical"] = "V", ["inventory"] = "V", ["invoices"] = "VAO", ["payments"] = "VAR",
-            ["cash"] = "V", ["ledger"] = "VCAO", ["expenses"] = "VCEAX", ["reports"] = "VPOM", ["settings"] = "V",
+            ["pharmacy"] = "V", ["optical"] = "V", ["inventory"] = "V", ["invoices"] = "VCAXPO", ["payments"] = "VCAPR",
+            ["cash"] = "VCE", ["ledger"] = "VCAO", ["expenses"] = "VCEAX", ["reports"] = "VPOM", ["settings"] = "V",
             ["services"] = "E", ["audit"] = "V",
         },
         [Roles.Inventory] = new()

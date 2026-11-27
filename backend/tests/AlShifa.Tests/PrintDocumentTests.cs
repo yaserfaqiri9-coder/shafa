@@ -152,7 +152,7 @@ public sealed class PrintDocumentTests(ApiFixture api) : IAsyncLifetime
         var document = (await pharmacist.GetFromJsonAsync<PrintDocument>($"/api/print/sale/{saleId}", JsonOptions))!;
         Assert.Equal("فاکتور دواخانه", document.Title);
         Assert.Equal(invoiceNumber, document.Number);
-        Assert.Equal("a4", document.Format);
+        Assert.Equal("receipt", document.Format);
         Assert.Equal(["#", "نام دوا", "مقدار", "مبلغ"], document.Headers);
         Assert.Contains(document.Rows!, row => row[0] == "1" && row[1] == "Tobramycin eye drops" && row[2] == "2" && row[3]!.Contains("600"));
 

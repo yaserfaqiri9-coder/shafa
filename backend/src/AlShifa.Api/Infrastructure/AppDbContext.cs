@@ -68,6 +68,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
     public DbSet<Refund> Refunds => Set<Refund>();
     public DbSet<CashRegister> CashRegisters => Set<CashRegister>();
     public DbSet<CashSession> CashSessions => Set<CashSession>();
+    public DbSet<CashMovement> CashMovements => Set<CashMovement>();
     public DbSet<LedgerAccount> LedgerAccounts => Set<LedgerAccount>();
     public DbSet<LedgerTransaction> LedgerTransactions => Set<LedgerTransaction>();
     public DbSet<LedgerEntry> LedgerEntries => Set<LedgerEntry>();
@@ -253,7 +254,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
             e.ToTable(t =>
             {
                 t.HasCheckConstraint("CK_Invoice_Amounts", "`Total` >= 0 AND `Discount` >= 0 AND `Paid` >= 0 AND `Refunded` >= 0");
-                t.HasCheckConstraint("CK_Invoice_NotOverpaid", "`Paid` + `Discount` <= `Total`");
+                t.HasCheckConstraint("CK_Invoice_NotOverpaid", "`Refunded` <= `Paid` AND `Paid` - `Refunded` + `Discount` <= `Total`");
             });
         });
 
@@ -270,12 +271,19 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
 
         b.Entity<Payment>(e =>
         {
+            e.Property(x => x.Version).IsConcurrencyToken();
             e.HasIndex(x => x.ReceiptNumber).IsUnique();
             e.HasIndex(x => x.CreatedAt);
             e.ToTable(t => t.HasCheckConstraint("CK_Payment_Amounts", "`Amount` > 0 AND `Refunded` >= 0 AND `Refunded` <= `Amount`"));
         });
 
         b.Entity<Refund>().HasIndex(x => x.RefundNumber).IsUnique();
+        b.Entity<CashMovement>(e =>
+        {
+            e.HasIndex(x => new { x.Kind, x.SourceType, x.SourceId }).IsUnique();
+            e.HasIndex(x => x.CreatedAt);
+            e.HasOne(x => x.CashSession).WithMany().HasForeignKey(x => x.CashSessionId).OnDelete(DeleteBehavior.Restrict);
+        });
 
         b.Entity<CashSession>(e =>
         {
@@ -296,7 +304,9 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
         b.Entity<LedgerEntry>(e =>
         {
             e.HasOne(x => x.Account).WithMany().HasForeignKey(x => x.AccountCode);
-            e.HasIndex(x => x.AccountCode);
+            // Covers account totals without fetching every historical row; the leading account
+            // foreign key replaces the narrow AccountCode index. TransactionId keeps its own index.
+            e.HasIndex(x => new { x.AccountCode, x.TransactionId, x.Debit, x.Credit });
             e.ToTable(t => t.HasCheckConstraint("CK_Ledger_OneSided", "(`Debit` >= 0 AND `Credit` >= 0) AND (`Debit` = 0 OR `Credit` = 0)"));
         });
 
@@ -360,6 +370,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, SyncSwitch? sy
         });
 
         b.Entity<SaleItem>().Property(x => x.Quantity).HasPrecision(18, 3);
+        b.Entity<SaleItem>().HasIndex(x => new { x.BatchId, x.SaleId, x.Quantity });
 
         b.Entity<OpticalOrder>(e =>
         {

@@ -1091,6 +1091,50 @@ namespace AlShifa.Api.Infrastructure.Migrations
                     b.ToTable("SurgerySupplyPlans");
                 });
 
+            modelBuilder.Entity("AlShifa.Api.Features.Finance.CashMovement", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    b.Property<decimal>("Amount")
+                        .HasPrecision(18, 2)
+                        .HasColumnType("decimal(18,2)");
+
+                    b.Property<long?>("CashSessionId")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("datetime(6)");
+
+                    b.Property<long>("CreatedByUserId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("Kind")
+                        .IsRequired()
+                        .HasMaxLength(30)
+                        .HasColumnType("varchar(30)");
+
+                    b.Property<long>("SourceId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("SourceType")
+                        .IsRequired()
+                        .HasMaxLength(30)
+                        .HasColumnType("varchar(30)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CashSessionId");
+
+                    b.HasIndex("CreatedAt");
+
+                    b.HasIndex("Kind", "SourceType", "SourceId")
+                        .IsUnique();
+
+                    b.ToTable("CashMovements");
+                });
+
             modelBuilder.Entity("AlShifa.Api.Features.Finance.CashRegister", b =>
                 {
                     b.Property<int>("Id")
@@ -1115,6 +1159,10 @@ namespace AlShifa.Api.Infrastructure.Migrations
                     b.Property<long>("Id")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("bigint");
+
+                    b.Property<string>("CloseNote")
+                        .HasMaxLength(300)
+                        .HasColumnType("varchar(300)");
 
                     b.Property<DateTime?>("ClosedAt")
                         .HasColumnType("datetime(6)");
@@ -1290,7 +1338,7 @@ namespace AlShifa.Api.Infrastructure.Migrations
                         {
                             t.HasCheckConstraint("CK_Invoice_Amounts", "`Total` >= 0 AND `Discount` >= 0 AND `Paid` >= 0 AND `Refunded` >= 0");
 
-                            t.HasCheckConstraint("CK_Invoice_NotOverpaid", "`Paid` + `Discount` <= `Total`");
+                            t.HasCheckConstraint("CK_Invoice_NotOverpaid", "`Refunded` <= `Paid` AND `Paid` - `Refunded` + `Discount` <= `Total`");
                         });
                 });
 
@@ -1394,7 +1442,7 @@ namespace AlShifa.Api.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("AccountCode");
+                    b.HasIndex("AccountCode", "TransactionId", "Debit", "Credit");
 
                     b.HasIndex("TransactionId");
 
@@ -1485,6 +1533,13 @@ namespace AlShifa.Api.Infrastructure.Migrations
                     b.Property<decimal>("Refunded")
                         .HasPrecision(18, 2)
                         .HasColumnType("decimal(18,2)");
+
+                    b.Property<long?>("ReplacementPaymentId")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("Version")
+                        .IsConcurrencyToken()
+                        .HasColumnType("int");
 
                     b.HasKey("Id");
 
@@ -1923,6 +1978,8 @@ namespace AlShifa.Api.Infrastructure.Migrations
                         .HasColumnType("decimal(18,2)");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("BatchId", "SaleId", "Quantity");
 
                     b.HasIndex("ProductId");
 
@@ -3498,6 +3555,16 @@ namespace AlShifa.Api.Infrastructure.Migrations
                     b.Navigation("Product");
 
                     b.Navigation("SurgeryCase");
+                });
+
+            modelBuilder.Entity("AlShifa.Api.Features.Finance.CashMovement", b =>
+                {
+                    b.HasOne("AlShifa.Api.Features.Finance.CashSession", "CashSession")
+                        .WithMany()
+                        .HasForeignKey("CashSessionId")
+                        .OnDelete(DeleteBehavior.Restrict);
+
+                    b.Navigation("CashSession");
                 });
 
             modelBuilder.Entity("AlShifa.Api.Features.Finance.CashSession", b =>

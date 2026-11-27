@@ -72,8 +72,8 @@ export const menu: MenuSection[] = [
         label: 'مالی',
         icon: 'ri-wallet-3-fill',
         children: [
-          { label: 'صندوق', icon: 'ri-money-dollar-circle-fill', to: '/cashier', permission: 'payments.create' },
-          { label: 'حسابداری', icon: 'ri-book-2-fill', to: '/accounting', permission: 'invoices.view' },
+          { label: 'صندوق روزانه', icon: 'ri-money-dollar-circle-fill', to: '/cashier', permission: 'payments.create' },
+          { label: 'دفتر حساب و مصارف', icon: 'ri-book-2-fill', to: '/accounting', permission: 'invoices.view' },
         ],
       },
     ],

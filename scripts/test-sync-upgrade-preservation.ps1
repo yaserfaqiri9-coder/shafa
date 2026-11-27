@@ -29,10 +29,16 @@ function Set-AutoUpdateTasks {}
 function Stop-Service {$global:SyncTestRunning=$false}
 function Start-Service {$global:SyncTestRunning=$true}
 function Restart-Service {$global:SyncTestRunning=$true;$global:SyncTestRestarts++}
-function Restore-AlShifaDatabase {$global:SyncTestRollbacks++}
+function Restore-AlShifaDatabaseFromDump {$global:SyncTestRollbacks++}
 function Invoke-WebRequest {throw 'NETWORK MUST NEVER BE USED BY ESTABLISHED UPGRADE'}
 function Invoke-Native($Executable,[string[]]$Arguments){
  if($Arguments -contains 'SELECT @@port, @@datadir;'){return "33383`t$global:SyncTestRoot\data\"}
+ if((Split-Path $Executable -Leaf) -eq 'mysqldump.exe'){
+  $target=@($Arguments|Where-Object {$_ -like '--result-file=*'})
+  if($target.Count -ne 1){throw 'Synthetic dump target is required'}
+  [IO.File]::WriteAllText($target[0].Substring('--result-file='.Length),'-- Dump completed on synthetic fixture')
+  return
+ }
  if($Arguments -contains '--migrate'){if($global:SyncTestCase -eq 'failed-migration'){throw 'Synthetic migration failure'};return}
  if($Arguments -contains '-Maintenance'){
   $global:SyncTestHealth++
@@ -57,7 +63,7 @@ $file=Join-Path $Root 'synthetic-backup.gpg';[IO.File]::WriteAllText($file,'synt
 [IO.File]::WriteAllText((Join-Path $scripts 'db-integrity.ps1'),@'
 function Test-AlShifaDatabaseIntegrity { if($global:SyncTestCase -eq 'damaged-database'){@('synthetic: Assertion failure: fsp0fsp.cc:3694')}else{@()} }
 '@)
-[IO.File]::WriteAllText((Join-Path $scripts 'restore-test.ps1'),'param($Backup,$Root,$CandidateApp,$ExpectedSourceProof)')
+[IO.File]::WriteAllText((Join-Path $scripts 'restore-test.ps1'),"param(`$Backup,`$Root,`$CandidateApp,`$ExpectedSourceProof)`n'MIGRATION-SECONDS: 0'")
 [IO.File]::WriteAllText((Join-Path $scripts 'sync-bootstrap.ps1'),"throw 'ESTABLISHED SOURCE MUST NEVER ENTER ENROLLMENT'")
 
 $cases=@('installer-offline','auto-update-offline','damaged-database','failed-copy','failed-migration','failed-health','failed-resume-health','changed-key','changed-identity','missing-identity')

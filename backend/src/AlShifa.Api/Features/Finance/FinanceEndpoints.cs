@@ -45,26 +45,26 @@ public sealed record RefundRequest(long PaymentId, [Range(0.01, 100000000)] deci
 
 public sealed record OpenSessionRequest(int RegisterId, [Range(0, 100000000)] decimal OpeningAmount);
 
-public sealed record CloseSessionRequest([Range(0, 100000000)] decimal CountedAmount, int Version);
+public sealed record CloseSessionRequest([Range(0, 100000000)] decimal CountedAmount, int Version, [MaxLength(300)] string? Note = null);
 
 public sealed record CreateExpenseRequest([Required, MaxLength(100)] string Category, [MaxLength(300)] string? Description, [Range(0.01, 100000000)] decimal Amount, DateOnly ExpenseDate);
 
 /// <param name="Description">What the first line charges for, so the cashier sees what the patient is paying for.</param>
 /// <param name="ItemCount">The lines on the invoice, counting that first one.</param>
-public sealed record InvoiceRow(long Id, string InvoiceNumber, long? PatientId, string? PatientFileNumber, string? PatientName, long? VisitId, string Status, decimal Total, decimal Discount, decimal Paid, decimal Refunded, decimal Balance, DateTime CreatedAt, int Version, string? Description, int ItemCount, int? QueueNumber = null, string? Section = null);
+public sealed record InvoiceRow(long Id, string InvoiceNumber, long? PatientId, string? PatientFileNumber, string? PatientName, long? VisitId, string Status, decimal Total, decimal Discount, decimal Paid, decimal Refunded, decimal Balance, DateTime CreatedAt, int Version, string? Description, int ItemCount, int? QueueNumber = null, string? Section = null, bool Correctable = false);
 
 public sealed record InvoiceItemRow(long Id, string Description, decimal Quantity, decimal UnitPrice, decimal LineTotal, bool IsVoid, int? ServiceId = null);
 
 /// <param name="QueueNumber">The number a visit fee earned, for the cashier to give the patient. Null until the fee is settled, and on any other invoice.</param>
 public sealed record PaymentRow(long Id, string ReceiptNumber, long InvoiceId, string InvoiceNumber, decimal Amount, string Method, string? Reference, decimal Refunded, DateTime CreatedAt, string? ReceivedBy, int? QueueNumber, QueueShift? QueueShift, int? QueueRound,
-    string? PatientName = null, string? Description = null, int ItemCount = 0, string? Section = null);
+    string? PatientName = null, string? Description = null, int ItemCount = 0, string? Section = null, int Version = 0, long? ReplacementPaymentId = null, string Status = "Received");
 
 public sealed record DiscountHistoryRow(string? Details, string? ByUser, DateTime CreatedAt);
 
 /// <param name="Correctable">True for an invoice issued on its own. One raised by a sale, a request or a visit is corrected at its source.</param>
 public sealed record InvoiceDetail(InvoiceRow Invoice, IReadOnlyList<InvoiceItemRow> Items, IReadOnlyList<PaymentRow> Payments, IReadOnlyList<DiscountHistoryRow> Discounts, bool Correctable = false);
 
-public sealed record SessionRow(long Id, int RegisterId, string RegisterName, string? OpenedBy, decimal OpeningAmount, DateTime OpenedAt, DateTime? ClosedAt, decimal? ExpectedAmount, decimal? CountedAmount, decimal CashCollected, int Version);
+public sealed record SessionRow(long Id, int RegisterId, string RegisterName, string? OpenedBy, decimal OpeningAmount, DateTime OpenedAt, DateTime? ClosedAt, decimal? ExpectedAmount, decimal? CountedAmount, decimal CashCollected, int Version, decimal CashRefunded = 0, decimal CashExpenses = 0, decimal CurrentExpected = 0, decimal? Difference = null, string? CloseNote = null);
 
 public sealed record LedgerBalance(string Code, string Name, decimal Debit, decimal Credit);
 
@@ -80,6 +80,7 @@ public static class FinanceEndpoints
         MapCash(app);
         MapLedger(app);
         MapExpenses(app);
+        FinanceWorkspace.Map(app);
     }
 
     private static void MapServices(IEndpointRouteBuilder app)
@@ -191,12 +192,18 @@ public static class FinanceEndpoints
     {
         var group = app.MapGroup("/api/invoices").WithTags("Finance");
 
-        group.MapGet("/", async (AppDbContext db, string? q, bool? unpaid, long? patientId, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
+        group.MapGet("/", async (AppDbContext db, string? q, bool? unpaid, long? patientId, DateOnly? from, DateOnly? to, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
         {
             pageSize = Math.Clamp(pageSize, 1, 100);
             page = Math.Max(page, 1);
 
             var query = db.Invoices.AsNoTracking();
+            if (from is not null || to is not null)
+            {
+                var (first, last) = ReportEndpoints.Range(from ?? to, to ?? from);
+                var (start, end) = ReportEndpoints.UtcRange(first, last);
+                query = query.Where(i => i.CreatedAt >= start && i.CreatedAt < end);
+            }
             if (patientId is { } pid)
             {
                 // The patient file asks by id: a file-number prefix would also match longer file numbers of other patients.
@@ -206,13 +213,13 @@ public static class FinanceEndpoints
             if (unpaid == true)
             {
                 // A discount can cover a whole invoice with nothing paid, and nothing is left to collect on it.
-                query = query.Where(i => (i.Status == InvoiceStatus.Issued || i.Status == InvoiceStatus.PartiallyPaid) && i.Total - i.Discount - i.Paid > 0);
+                query = query.Where(i => (i.Status == InvoiceStatus.Issued || i.Status == InvoiceStatus.PartiallyPaid) && i.Total - i.Discount - i.Paid + i.Refunded > 0);
             }
 
             if (!string.IsNullOrWhiteSpace(q))
             {
                 q = OldNumbers.Plain(q);
-                query = query.Where(i => i.InvoiceNumber.StartsWith(q) || (i.Patient != null && (i.Patient.FileNumber.StartsWith(q) || i.Patient.FirstName.StartsWith(q))));
+                query = query.Where(i => i.InvoiceNumber.Contains(q) || (i.Patient != null && (i.Patient.FileNumber.StartsWith(q) || (i.Patient.FirstName + " " + (i.Patient.LastName ?? "")).Contains(q))));
             }
 
             var total = await query.CountAsync(ct);
@@ -220,7 +227,12 @@ public static class FinanceEndpoints
             var ordered = query.OrderByDescending(i => i.Id);
             var rows = await Project(ordered.Skip((page - 1) * pageSize).Take(pageSize)).ToListAsync(ct);
             var sections = await SectionsAsync(db, rows.Select(r => r.Id).ToList(), ct);
-            rows = rows.Select(r => r with { Section = sections.GetValueOrDefault(r.Id) }).ToList();
+            var ids = rows.Select(r => r.Id).ToList();
+            var standalone = await db.Invoices.Where(i => ids.Contains(i.Id)
+                && !db.InvoiceItems.Any(x => x.InvoiceId == i.Id && !x.IsVoid && (x.SourceType != null || x.ServiceId == null))
+                && !db.VisitTokens.Any(t => t.InvoiceId == i.Id) && !db.DiagnosticOrders.Any(o => o.InvoiceId == i.Id) && !db.Sales.Any(s => s.InvoiceId == i.Id))
+                .Select(i => i.Id).ToListAsync(ct);
+            rows = rows.Select(r => r with { Section = sections.GetValueOrDefault(r.Id), Correctable = standalone.Contains(r.Id) }).ToList();
             return Results.Ok(new PagedResult<InvoiceRow>(rows, total, page, pageSize));
         }).RequirePermission("invoices.view");
 
@@ -289,7 +301,7 @@ public static class FinanceEndpoints
                 throw new AppException(StatusCodes.Status409Conflict, "no_discount", "این فاکتور تخفیف فعالی ندارد.");
             }
 
-            if (invoice.Paid > 0)
+            if (invoice.Paid - invoice.Refunded > 0)
             {
                 throw new AppException(StatusCodes.Status409Conflict, "invoice_has_payments", "فاکتور دارای پرداخت است و تخفیف آن برگشت نمی‌شود.");
             }
@@ -346,16 +358,51 @@ public static class FinanceEndpoints
             return Results.NoContent();
         }).RequirePermission("invoices.approve");
 
-        group.MapPost("/{id:long}/void", async (long id, VoidRequest request, AppDbContext db, InvoiceService invoices, LedgerService ledger, AuditService audit, CancellationToken ct) =>
+        group.MapPost("/{id:long}/void", async (long id, VoidRequest request, AppDbContext db, InvoiceService invoices, VisitFeeService fees, SaleService sales, LedgerService ledger, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>
         {
             await using var tx = await db.BeginWorkflowTransactionAsync(ct);
+            var sale = await db.Sales.AsNoTracking().Where(s => s.InvoiceId == id).Select(s => new { s.Id, s.Version, s.Kind }).SingleOrDefaultAsync(ct);
+            if (sale is not null)
+            {
+                await sales.ReturnAsync(sale.Id, sale.Version, request.Reason.Trim(), ct, refundPaidPharmacy: sale.Kind == SaleKind.Pharmacy, expectedInvoiceVersion: request.Version);
+                var optical = await db.OpticalOrders.SingleOrDefaultAsync(o => o.SaleId == sale.Id, ct);
+                if (optical is not null) optical.Status = OpticalOrderStatus.Cancelled;
+                outbox.Add("InvoiceIssued", new { invoiceId = id }, Groups.Cashier, Groups.Finance, Groups.Pharmacy, Groups.Optical);
+                await db.SaveChangesAsync(ct);
+                await tx.CommitAsync(ct);
+                return Results.NoContent();
+            }
+            var fee = await fees.LockFeeOfInvoiceAsync(id, ct);
             var invoice = await invoices.LockAsync(id, ct);
             if (invoice.Version != request.Version)
             {
                 throw new DbUpdateConcurrencyException();
             }
 
+            if (fee?.Visit is { } visit)
+            {
+                if (visit.Status is not (VisitStatus.AwaitingPayment or VisitStatus.Registered or VisitStatus.Waiting)
+                    || await db.PreExaminations.AnyAsync(e => e.VisitId == visit.Id, ct))
+                    throw new AppException(409, "clinical_work_started", "کار طبی شروع شده است؛ لغو مراجعه باید از بخش مربوط با بررسی مسئول انجام شود.");
+                await DiagnosticGate.CloseOpenPrepaidAsync(db, invoices, audit, visit.Id, ct);
+                db.VisitStatusHistory.Add(new VisitStatusHistory { VisitId = visit.Id, FromStatus = visit.Status, ToStatus = VisitStatus.Cancelled, ChangedByUserId = user.Id });
+                visit.Status = VisitStatus.Cancelled;
+                audit.Add("VisitStatusChanged", "Visit", visit.Id.ToString(), request.Reason.Trim());
+                outbox.Add("VisitStatusChanged", new { visitId = visit.Id }, VisitService.EventGroups);
+            }
+            var orders = await db.DiagnosticOrders.Where(o => o.InvoiceId == id).ToListAsync(ct);
+            foreach (var order in orders)
+            {
+                if (order.Status != DiagnosticStatus.Requested) throw new AppException(409, "clinical_work_started", "این خدمت شروع شده است؛ از بخش مربوط لغو کنید.");
+                order.Status = DiagnosticStatus.Cancelled;
+                audit.Add("DiagnosticCancelled", "DiagnosticOrder", order.Id.ToString(), request.Reason.Trim());
+            }
+            if (await db.InvoiceItems.AnyAsync(i => i.InvoiceId == id && i.SourceType == nameof(SurgeryCase), ct))
+                throw new AppException(409, "source_cancellation_required", "فاکتور عملیات را از پرونده عملیات لغو کنید تا وضعیت طبی و مواد مصرفی حفظ شود.");
             await VoidAsync(invoice, request.Reason, db, ledger, audit, ct);
+            foreach (var order in orders.Where(o => o.ReturnToDoctor && o.VisitId != null))
+                await DiagnosticGate.ReturnToDoctorAsync(db, order.VisitId!.Value, user, outbox, ct);
+            outbox.Add("InvoiceIssued", new { invoiceId = id }, Groups.Cashier, Groups.Finance, Groups.Reception, Groups.Lab, Groups.Triage);
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
             return Results.NoContent();
@@ -391,7 +438,7 @@ public static class FinanceEndpoints
     /// <summary>Call with the invoice locked, inside a transaction.</summary>
     private static async Task VoidAsync(Invoice invoice, string reason, AppDbContext db, LedgerService ledger, AuditService audit, CancellationToken ct)
     {
-        if (invoice.Paid > 0)
+        if (invoice.Paid - invoice.Refunded > 0)
         {
             throw new AppException(StatusCodes.Status409Conflict, "invoice_has_payments", "فاکتور دارای پرداخت است و باطل نمی‌شود. برگشت وجه ثبت کنید.");
         }
@@ -403,18 +450,20 @@ public static class FinanceEndpoints
 
         if (invoice.Discount > 0)
         {
-            throw new AppException(StatusCodes.Status409Conflict, "invoice_has_discount", "فاکتور دارای تخفیف است و باطل نمی‌شود.");
+            ledger.Post("DiscountVoided", "Invoice", invoice.Id, reason,
+                (Accounts.Receivable, invoice.Discount, 0), (Accounts.Discounts, 0, invoice.Discount));
+            invoice.Discount = 0;
         }
 
         var items = await db.InvoiceItems.Where(i => i.InvoiceId == invoice.Id && !i.IsVoid).ToListAsync(ct);
         foreach (var item in items)
         {
             item.IsVoid = true;
-            await ledger.ReverseAsync("Charge", "InvoiceItem", item.Id, ct);
+            if (item.LineTotal != 0) await ledger.ReverseAsync("Charge", "InvoiceItem", item.Id, ct);
         }
 
         invoice.Status = InvoiceStatus.Void;
-        invoice.Total = 0;
+        if (invoice.Paid == 0) invoice.Total = 0;
         audit.Add("InvoiceVoided", "Invoice", invoice.Id.ToString(), reason);
     }
 
@@ -472,12 +521,17 @@ public static class FinanceEndpoints
     {
         var group = app.MapGroup("/api/payments").WithTags("Finance");
 
-        group.MapGet("/", async (AppDbContext db, long? sessionId, DateOnly? from, DateOnly? to, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
+        group.MapGet("/", async (AppDbContext db, long? sessionId, DateOnly? from, DateOnly? to, string? q, int page = 1, int pageSize = 50, CancellationToken ct = default) =>
         {
             pageSize = Math.Clamp(pageSize, 1, 100);
             page = Math.Max(page, 1);
 
             var query = db.Payments.AsNoTracking();
+            if (!string.IsNullOrWhiteSpace(q))
+            {
+                q = OldNumbers.Plain(q.Trim());
+                query = query.Where(p => p.ReceiptNumber.Contains(q) || p.Invoice!.InvoiceNumber.Contains(q) || (p.Invoice.Patient != null && (p.Invoice.Patient.FirstName.Contains(q) || (p.Invoice.Patient.LastName ?? "").Contains(q) || p.Invoice.Patient.FileNumber.Contains(q))));
+            }
             if (sessionId is { } s)
             {
                 query = query.Where(p => p.CashSessionId == s);
@@ -541,7 +595,7 @@ public static class FinanceEndpoints
                 return (StatusCodes.Status201Created, await QueryPayments(db, db.Payments.Where(p => p.Id == payment.Id)).SingleAsync(ct));
             }, ct)).RequirePermission("payments.create");
 
-        app.MapPost("/api/refunds", async (RefundRequest request, AppDbContext db, Idempotency idempotency, InvoiceService invoices, VisitFeeService visitFees, NumberService numbers, LedgerService ledger, CurrentUser user, AuditService audit, CancellationToken ct) =>
+        app.MapPost("/api/refunds", async (RefundRequest request, AppDbContext db, Idempotency idempotency, InvoiceService invoices, VisitFeeService visitFees, NumberService numbers, LedgerService ledger, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>
             await idempotency.RunAsync(request, async () =>
             {
                 Money.EnsureCents(request.Amount);
@@ -572,8 +626,11 @@ public static class FinanceEndpoints
                 await db.SaveChangesAsync(ct);
 
                 ledger.Post("Refund", "Refund", refund.Id, refund.Reason,
-                    (Accounts.Refunds, refund.Amount, 0),
-                    (Accounts.Cash, 0, refund.Amount));
+                    (Accounts.Receivable, refund.Amount, 0),
+                    (payment.Method == PaymentMethod.Cash ? Accounts.Cash : Accounts.Bank, 0, refund.Amount));
+                if (payment.Method == PaymentMethod.Cash) await CashBook.RecordAsync(db, user.Id, "Refund", "Refund", refund.Id, -refund.Amount, ct);
+                InvoiceService.UpdateStatus(invoice);
+                outbox.Add("PaymentReceived", new { invoiceId = invoice.Id }, Groups.Cashier, Groups.Finance, Groups.Reception, Groups.Pharmacy, Groups.Optical, Groups.Lab);
                 audit.Add("RefundApproved", "Refund", refund.Id.ToString(), refund.Reason);
                 await db.SaveChangesAsync(ct);
                 await visitFees.WithdrawIfFullyRefundedAsync(fee, invoice, ct);
@@ -603,8 +660,11 @@ public static class FinanceEndpoints
             return Results.Ok(await QuerySessions(db, query.OrderByDescending(s => s.Id).Take(50)).ToListAsync(ct));
         }).RequirePermission("cash.view");
 
-        group.MapPost("/sessions", async (OpenSessionRequest request, AppDbContext db, CurrentUser user, AuditService audit, CancellationToken ct) =>
+        group.MapPost("/sessions", async (OpenSessionRequest request, AppDbContext db, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>
         {
+            await using var tx = await db.BeginWorkflowTransactionAsync(ct);
+            var ownerId = user.Id;
+            await db.Users.FromSqlInterpolated($"SELECT * FROM AspNetUsers WHERE Id={ownerId} FOR UPDATE").AsNoTracking().ToListAsync(ct);
             Money.EnsureCents(request.OpeningAmount);
             if (!await db.CashRegisters.AnyAsync(r => r.Id == request.RegisterId && r.IsActive, ct))
             {
@@ -619,12 +679,14 @@ public static class FinanceEndpoints
 
             var session = new CashSession { RegisterId = request.RegisterId, OpenedByUserId = userId, OpeningAmount = request.OpeningAmount };
             db.CashSessions.Add(session);
+            outbox.Add("CashChanged", new { sessionId = 0 }, Groups.Cashier, Groups.Finance);
             audit.Add("CashSessionOpened", "CashSession", null, request.OpeningAmount.ToString("F2"));
             await db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
             return Results.Created($"/api/cash/sessions/{session.Id}", new { session.Id });
         }).RequirePermission("cash.create");
 
-        group.MapPost("/sessions/{id:long}/close", async (long id, CloseSessionRequest request, AppDbContext db, CurrentUser user, AuditService audit, CancellationToken ct) =>
+        group.MapPost("/sessions/{id:long}/close", async (long id, CloseSessionRequest request, AppDbContext db, CurrentUser user, AuditService audit, HttpContext http, Outbox outbox, CancellationToken ct) =>
         {
             Money.EnsureCents(request.CountedAmount);
             await using var tx = await db.BeginWorkflowTransactionAsync(ct);
@@ -635,16 +697,22 @@ public static class FinanceEndpoints
                 throw new AppException(StatusCodes.Status409Conflict, "session_closed", "این صندوق قبلاً بسته شده است.");
             }
 
-            if (session.OpenedByUserId != user.Id)
+            if (session.OpenedByUserId != user.Id && !http.User.HasClaim(RolePermissions.ClaimType, "payments.refund"))
             {
                 throw new AppException(StatusCodes.Status403Forbidden, "not_session_owner", "فقط بازکننده صندوق می‌تواند آن را ببندد.");
             }
 
             var collected = await db.Payments.Where(p => p.CashSessionId == id && p.Method == PaymentMethod.Cash).SumAsync(p => (decimal?)p.Amount, ct) ?? 0;
-            session.ExpectedAmount = session.OpeningAmount + collected;
+            var movement = await db.CashMovements.Where(m => m.CashSessionId == id).SumAsync(m => (decimal?)m.Amount, ct) ?? 0;
+            session.ExpectedAmount = session.OpeningAmount + collected + movement;
+            var note = Text.Clean(request.Note);
+            if ((request.CountedAmount != session.ExpectedAmount || session.OpenedByUserId != user.Id) && string.IsNullOrWhiteSpace(note))
+                throw new AppException(400, "difference_reason_required", "برای کسری یا اضافه صندوق دلیل بنویسید.");
+            session.CloseNote = note;
             session.CountedAmount = request.CountedAmount;
             session.ClosedAt = DateTime.UtcNow;
             session.ClosedByUserId = user.Id;
+            outbox.Add("CashChanged", new { sessionId = id }, Groups.Cashier, Groups.Finance, Groups.Management);
             audit.Add("CashSessionClosed", "CashSession", id.ToString(), $"expected {session.ExpectedAmount:F2} counted {request.CountedAmount:F2}");
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
@@ -676,14 +744,15 @@ public static class FinanceEndpoints
 
         var receivableEntries = db.LedgerEntries.Where(e => e.AccountCode == Accounts.Receivable);
         var ledgerReceivable = (await receivableEntries.SumAsync(e => (decimal?)e.Debit, ct) ?? 0) - (await receivableEntries.SumAsync(e => (decimal?)e.Credit, ct) ?? 0);
-        var invoiceReceivable = await db.Invoices.Where(i => i.Status != InvoiceStatus.Void).SumAsync(i => (decimal?)(i.Total - i.Discount - i.Paid), ct) ?? 0;
+        var invoiceReceivable = await db.Invoices.Where(i => i.Status != InvoiceStatus.Void).SumAsync(i => (decimal?)(i.Total - i.Discount - i.Paid + i.Refunded), ct) ?? 0;
 
         var cashEntries = db.LedgerEntries.Where(e => e.AccountCode == Accounts.Cash);
         var ledgerCash = (await cashEntries.SumAsync(e => (decimal?)e.Debit, ct) ?? 0) - (await cashEntries.SumAsync(e => (decimal?)e.Credit, ct) ?? 0);
-        var payments = await db.Payments.SumAsync(p => (decimal?)p.Amount, ct) ?? 0;
-        var refunds = await db.Refunds.SumAsync(r => (decimal?)r.Amount, ct) ?? 0;
+        var payments = await db.Payments.Where(p => p.Method == PaymentMethod.Cash).SumAsync(p => (decimal?)p.Amount, ct) ?? 0;
+        var refunds = await db.Refunds.Where(r => r.Payment!.Method == PaymentMethod.Cash).SumAsync(r => (decimal?)r.Amount, ct) ?? 0;
         var expenses = await db.Expenses.Where(e => e.Status == ExpenseStatus.Recorded).SumAsync(e => (decimal?)e.Amount, ct) ?? 0;
-        var derivedCash = payments - refunds - expenses;
+        var transfers = await db.CashMovements.Where(m => m.Kind == "TransferOut").SumAsync(m => (decimal?)m.Amount, ct) ?? 0;
+        var derivedCash = payments - refunds - expenses + transfers;
 
         return new ReconciliationResult(
             debit == credit && ledgerReceivable == invoiceReceivable && ledgerCash == derivedCash,
@@ -712,30 +781,30 @@ public static class FinanceEndpoints
             return Results.Ok(new { items = rows, total, page, pageSize });
         }).RequirePermission("expenses.view");
 
-        group.MapPost("/", async (CreateExpenseRequest request, AppDbContext db, Idempotency idempotency, NumberService numbers, LedgerService ledger, CurrentUser user, AuditService audit, CancellationToken ct) =>
+        group.MapPost("/", async (CreateExpenseRequest request, AppDbContext db, Idempotency idempotency, NumberService numbers, LedgerService ledger, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct) =>
             await idempotency.RunAsync(request, async () =>
             {
-                var expense = await RecordExpenseAsync(request.Category, request.Description, request.Amount, request.ExpenseDate, db, numbers, ledger, user, audit, ct);
+                var expense = await RecordExpenseAsync(request.Category, request.Description, request.Amount, request.ExpenseDate, db, numbers, ledger, user, audit, outbox, ct);
                 return (StatusCodes.Status201Created, new { expense.Id, expense.ExpenseNumber });
             }, ct)).RequirePermission("expenses.create");
 
-        group.MapPost("/{id:long}/cancel", async (long id, VoidRequest request, AppDbContext db, LedgerService ledger, AuditService audit, CancellationToken ct) =>
+        group.MapPost("/{id:long}/cancel", async (long id, VoidRequest request, AppDbContext db, LedgerService ledger, AuditService audit, CurrentUser user, Outbox outbox, CancellationToken ct) =>
         {
             await using var tx = await db.BeginWorkflowTransactionAsync(ct);
-            await CancelExpenseAsync(id, request.Version, request.Reason, db, ledger, audit, ct);
+            await CancelExpenseAsync(id, request.Version, request.Reason, db, ledger, audit, user, outbox, ct);
             await tx.CommitAsync(ct);
             return Results.NoContent();
         }).RequirePermission("expenses.cancel");
 
         // Cancels the mistaken expense and records the right one together, so the cash figures never show one without the other.
-        group.MapPost("/{id:long}/correct", async (long id, CorrectExpenseRequest request, AppDbContext db, NumberService numbers, LedgerService ledger, CurrentUser user, AuditService audit, HttpContext http, CancellationToken ct) =>
+        group.MapPost("/{id:long}/correct", async (long id, CorrectExpenseRequest request, AppDbContext db, NumberService numbers, LedgerService ledger, CurrentUser user, AuditService audit, HttpContext http, Outbox outbox, CancellationToken ct) =>
         {
             Permission.Require(http, "expenses.create");
             await using var tx = await db.BeginWorkflowTransactionAsync(ct);
-            await CancelExpenseAsync(id, request.Version, request.Reason.Trim(), db, ledger, audit, ct);
+            await CancelExpenseAsync(id, request.Version, request.Reason.Trim(), db, ledger, audit, user, outbox, ct);
             if (await db.Expenses.AnyAsync(e => e.Id == id && e.StaffId != null, ct))
                 throw new AppException(409, "staff_expense", "پرداخت کارمند را لغو کنید و پرداخت درست را از پروفایل او ثبت کنید.");
-            var replacement = await RecordExpenseAsync(request.Category, request.Description, request.Amount, request.ExpenseDate, db, numbers, ledger, user, audit, ct);
+            var replacement = await RecordExpenseAsync(request.Category, request.Description, request.Amount, request.ExpenseDate, db, numbers, ledger, user, audit, outbox, ct);
             audit.Add("ExpenseCorrected", "Expense", id.ToString(), $"{replacement.ExpenseNumber}: {request.Reason.Trim()}");
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
@@ -743,7 +812,7 @@ public static class FinanceEndpoints
         }).RequirePermission("expenses.cancel");
     }
 
-    private static async Task<Expense> RecordExpenseAsync(string category, string? description, decimal amount, DateOnly date, AppDbContext db, NumberService numbers, LedgerService ledger, CurrentUser user, AuditService audit, CancellationToken ct)
+    private static async Task<Expense> RecordExpenseAsync(string category, string? description, decimal amount, DateOnly date, AppDbContext db, NumberService numbers, LedgerService ledger, CurrentUser user, AuditService audit, Outbox outbox, CancellationToken ct)
     {
         Money.EnsureCents(amount);
         var expense = new Expense
@@ -761,12 +830,14 @@ public static class FinanceEndpoints
         ledger.Post("Expense", "Expense", expense.Id, expense.Category,
             (Accounts.Expenses, expense.Amount, 0),
             (Accounts.Cash, 0, expense.Amount));
+        await CashBook.RecordAsync(db, user.Id, "Expense", "Expense", expense.Id, -expense.Amount, ct);
+        outbox.Add("CashChanged", new { expenseId = expense.Id }, Groups.Cashier, Groups.Finance);
         audit.Add("ExpenseRecorded", "Expense", expense.Id.ToString());
         await db.SaveChangesAsync(ct);
         return expense;
     }
 
-    private static async Task CancelExpenseAsync(long id, int version, string reason, AppDbContext db, LedgerService ledger, AuditService audit, CancellationToken ct)
+    private static async Task CancelExpenseAsync(long id, int version, string reason, AppDbContext db, LedgerService ledger, AuditService audit, CurrentUser user, Outbox outbox, CancellationToken ct)
     {
         var expense = await db.Expenses.SingleOrDefaultAsync(e => e.Id == id, ct) ?? throw AppException.NotFound();
         db.Entry(expense).Property(e => e.Version).OriginalValue = version;
@@ -777,6 +848,8 @@ public static class FinanceEndpoints
 
         expense.Status = ExpenseStatus.Cancelled;
         await ledger.ReverseAsync("Expense", "Expense", id, ct);
+        await CashBook.RecordAsync(db, user.Id, "ExpenseReversal", "Expense", expense.Id, expense.Amount, ct);
+        outbox.Add("CashChanged", new { expenseId = id }, Groups.Cashier, Groups.Finance);
         audit.Add("ExpenseCancelled", "Expense", id.ToString(), reason);
         await db.SaveChangesAsync(ct);
     }
@@ -821,11 +894,11 @@ public static class FinanceEndpoints
     private static IQueryable<InvoiceRow> Project(IQueryable<Invoice> invoices) => invoices.Select(i => new InvoiceRow(
         i.Id, i.InvoiceNumber, i.PatientId, i.Patient != null ? i.Patient.FileNumber : null,
         i.Patient != null ? (i.Patient.FirstName + " " + (i.Patient.LastName ?? "")).Trim() : null,
-        i.VisitId, i.Status.ToString(), i.Total, i.Discount, i.Paid, i.Refunded, i.Status == InvoiceStatus.Void ? 0 : i.Total - i.Discount - i.Paid, i.CreatedAt, i.Version,
+        i.VisitId, i.Status.ToString(), i.Total, i.Discount, i.Paid, i.Refunded, i.Status == InvoiceStatus.Void ? 0 : i.Total - i.Discount - i.Paid + i.Refunded, i.CreatedAt, i.Version,
         i.Items.Where(x => !x.IsVoid).OrderBy(x => x.Id).Select(x => x.Description).FirstOrDefault(),
         i.Items.Count(x => !x.IsVoid), i.Visit != null ? i.Visit.QueueNumber : null));
 
-    private static IQueryable<PaymentRow> QueryPayments(AppDbContext db, IQueryable<Payment> payments) =>
+    internal static IQueryable<PaymentRow> QueryPayments(AppDbContext db, IQueryable<Payment> payments) =>
         from p in payments
         join u in db.Users on p.ReceivedByUserId equals u.Id
         select new PaymentRow(p.Id, p.ReceiptNumber, p.InvoiceId, p.Invoice!.InvoiceNumber, p.Amount, p.Method.ToString(), p.Reference, p.Refunded, p.CreatedAt, u.FullName,
@@ -834,7 +907,7 @@ public static class FinanceEndpoints
             db.VisitTokens.Where(t => t.InvoiceId == p.InvoiceId).Select(t => (int?)t.QueueRound).FirstOrDefault(),
             p.Invoice.Patient != null ? (p.Invoice.Patient.FirstName + " " + (p.Invoice.Patient.LastName ?? "")).Trim() : null,
             p.Invoice.Items.OrderBy(x => x.Id).Select(x => x.Description).FirstOrDefault(),
-            p.Invoice.Items.Count());
+            p.Invoice.Items.Count(), null, p.Version, p.ReplacementPaymentId, p.Refunded >= p.Amount ? "Refunded" : p.Refunded > 0 ? "PartiallyRefunded" : "Received");
 
     internal static IQueryable<SessionRow> QuerySessions(AppDbContext db, IQueryable<CashSession> sessions) =>
         from s in sessions
@@ -842,7 +915,11 @@ public static class FinanceEndpoints
         select new SessionRow(
             s.Id, s.RegisterId, s.Register!.Name, u.FullName, s.OpeningAmount, s.OpenedAt, s.ClosedAt, s.ExpectedAmount, s.CountedAmount,
             db.Payments.Where(p => p.CashSessionId == s.Id && p.Method == PaymentMethod.Cash).Sum(p => (decimal?)p.Amount) ?? 0,
-            s.Version);
+            s.Version,
+            -(db.CashMovements.Where(m => m.CashSessionId == s.Id && m.Kind == "Refund").Sum(m => (decimal?)m.Amount) ?? 0),
+            -(db.CashMovements.Where(m => m.CashSessionId == s.Id && (m.Kind == "Expense" || m.Kind == "ExpenseReversal")).Sum(m => (decimal?)m.Amount) ?? 0),
+            s.OpeningAmount + (db.Payments.Where(p => p.CashSessionId == s.Id && p.Method == PaymentMethod.Cash).Sum(p => (decimal?)p.Amount) ?? 0) + (db.CashMovements.Where(m => m.CashSessionId == s.Id).Sum(m => (decimal?)m.Amount) ?? 0),
+            s.ClosedAt == null ? null : s.CountedAmount - s.ExpectedAmount, s.CloseNote);
 }
 
 public sealed record SetPriceRequest([Range(0, 100000000)] decimal Price);

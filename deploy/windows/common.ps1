@@ -308,7 +308,7 @@ function Add-BackupRequestTrigger([string]$TaskName = 'AlShifa Backup') {
     Set-ScheduledTask -TaskName $TaskName -Trigger (@($task.Triggers) + $trigger) | Out-Null
 }
 
-# Downloads hourly; the separate install task runs only on a version-specific approval event.
+# Checks every minute and at startup; installation needs version-specific approval.
 # The API receives no privilege to execute a program, change tasks or modify the publisher trust anchor.
 function Set-AutoUpdateTasks([string]$Root) {
     foreach ($name in 'AlShifa Update Check', 'AlShifa Update Install') {
@@ -320,8 +320,8 @@ function Set-AutoUpdateTasks([string]$Root) {
     Protect-Path $requests @('NT SERVICE\AlShifaApi=M')
     $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $Root 'scripts\auto-update.ps1')`" -Root `"$Root`""
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
-    $hourly = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Hours 1)
-    Register-ScheduledTask -TaskName 'AlShifa Update Check' -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments) -Trigger $hourly -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+    $checks = @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)))
+    Register-ScheduledTask -TaskName 'AlShifa Update Check' -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments) -Trigger $checks -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
     $event = New-CimInstance -CimClass (Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler) -ClientOnly
     $event.Enabled = $true
     $event.Subscription = '<QueryList><Query Id="0" Path="Application"><Select Path="Application">*[System[Provider[@Name=''AlShifa.Api''] and EventID=4101]]</Select></Query></QueryList>'

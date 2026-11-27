@@ -20,6 +20,31 @@ namespace AlShifa.Tests;
 public sealed class ConcurrencyTests(ApiFixture api) : PhysicalQueueTestScope(api)
 {
     [Fact]
+    public async Task Concurrent_receipt_corrections_create_one_replacement_and_one_refund()
+    {
+        var invoice = await NewInvoiceAsync(500);
+        var cashier = await CashierWithOpenSessionAsync();
+        var payment = await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, 500, PaymentMethod.Cash, null))));
+        var accountant = await UserAsync(Roles.Accountant);
+        int registerId;
+        using (var scope = api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var register = new CashRegister { Name = Name("correction-drawer") };
+            db.CashRegisters.Add(register); await db.SaveChangesAsync(); registerId = register.Id;
+        }
+        Assert.Equal(HttpStatusCode.Created, (await accountant.PostAsJsonAsync("/api/cash/sessions", new OpenSessionRequest(registerId, 0))).StatusCode);
+        var responses = await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => accountant.SendAsync(Post($"/api/payments/{payment.Id}/correct", new CorrectPaymentRequest(400, "Synthetic concurrent correction", payment.Version)))));
+        Assert.Single(responses, r => r.StatusCode == HttpStatusCode.Created);
+        Assert.Equal(3, responses.Count(r => r.StatusCode == HttpStatusCode.Conflict));
+        var detail = (await accountant.GetFromJsonAsync<InvoiceDetail>($"/api/invoices/{invoice.Id}", JsonOptions))!;
+        Assert.Equal(2, detail.Payments.Count);
+        Assert.Equal(500, detail.Payments.Single(p => p.Id == payment.Id).Refunded);
+        Assert.Equal(100, detail.Invoice.Balance);
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
     public async Task Concurrent_salary_payments_cannot_pay_the_same_earned_balance_twice()
     {
         var admin = await UserAsync(Roles.SuperAdmin);
@@ -342,7 +367,7 @@ public sealed class ConcurrencyTests(ApiFixture api) : PhysicalQueueTestScope(ap
             var session = Assert.Single(sessions!);
 
             var pays = invoices.Select(i => cashier.SendAsync(Post("/api/payments", new PaymentRequest(i.Id, 100, PaymentMethod.Cash, null)))).ToList();
-            var close = cashier.PostAsJsonAsync($"/api/cash/sessions/{session.Id}/close", new CloseSessionRequest(0, session.Version));
+            var close = cashier.PostAsJsonAsync($"/api/cash/sessions/{session.Id}/close", new CloseSessionRequest(0, session.Version, "Synthetic closing discrepancy"));
             await Task.WhenAll(pays.Append(close));
             Assert.Equal(HttpStatusCode.OK, close.Result.StatusCode);
 
@@ -384,7 +409,7 @@ public sealed class ConcurrencyTests(ApiFixture api) : PhysicalQueueTestScope(ap
     /// When the accountant decides, this test changes along with the rule.
     /// </summary>
     [Fact]
-    public async Task Current_rule_expected_cash_ignores_refunds_expenses_and_other_methods_while_the_ledger_counts_them_all()
+    public async Task Drawer_excludes_unallocated_treasury_and_noncash_while_cash_ledger_reconciles()
     {
         var accountant = await UserAsync(Roles.Accountant);
         var cashier = await UserAsync(Roles.Cashier);
@@ -417,7 +442,7 @@ public sealed class ConcurrencyTests(ApiFixture api) : PhysicalQueueTestScope(ap
         Assert.Equal(HttpStatusCode.Created, (await accountant.SendAsync(Post("/api/expenses", new CreateExpenseRequest("قرطاسیه", null, 50, DateOnly.FromDateTime(DateTime.UtcNow))))).StatusCode);
 
         var session = (await cashier.GetFromJsonAsync<List<SessionRow>>("/api/cash/sessions?mine=true", JsonOptions))!.Single();
-        var closed = await cashier.PostAsJsonAsync($"/api/cash/sessions/{session.Id}/close", new CloseSessionRequest(1350, session.Version));
+        var closed = await cashier.PostAsJsonAsync($"/api/cash/sessions/{session.Id}/close", new CloseSessionRequest(1500, session.Version));
         Assert.Equal(HttpStatusCode.OK, closed.StatusCode);
         var result = JsonSerializer.Deserialize<SessionRow>(await closed.Content.ReadAsStringAsync(), JsonOptions)!;
 
@@ -426,10 +451,10 @@ public sealed class ConcurrencyTests(ApiFixture api) : PhysicalQueueTestScope(ap
         Assert.Equal(1500, result.ExpectedAmount);
 
         // Ledger cash account: 500 + 200 - 100 - 50. The opening float is not in the ledger at all.
-        Assert.Equal(550, await LedgerCashAsync() - ledgerBefore);
+        Assert.Equal(350, await LedgerCashAsync() - ledgerBefore);
 
         // A drawer that really paid out the refund and the expense holds 1350, and shows as 150 short. No ledger entry records that difference.
-        Assert.Equal(1350, result.CountedAmount);
+        Assert.Equal(1500, result.CountedAmount);
         await AssertLedgerReconciles();
     }
 

@@ -9,6 +9,7 @@ import { prefetchForRoles } from '@/router/pages'
 import { useAuthStore } from '@/stores/auth'
 import { formatDateTime } from '@/utils/date'
 import OnlineCommandsPanel from '@/features/settings/OnlineCommandsPanel.vue'
+import SoftwareUpdateAlert from '@/features/settings/SoftwareUpdateAlert.vue'
 import AppFooter from './AppFooter.vue'
 import AppHeader from './AppHeader.vue'
 import AppSidebar from './AppSidebar.vue'
@@ -128,6 +129,7 @@ onBeforeUnmount(() => {
     />
     <div class="layout__main" :inert="mobileMenu && sidebarOpen" :class="{ 'layout__main--menu-open': mobileMenu && sidebarOpen }">
       <AppHeader @toggle-sidebar="sidebarOpen = !sidebarOpen" />
+      <SoftwareUpdateAlert v-if="!onlineCopy && auth.can('settings.view')" />
       <details class="system-dock" :class="{ 'system-dock--attention': systemNeedsAttention }" @keydown.esc="closeSystemDock">
         <summary aria-label="وضعیت سیستم و درخواست‌های آنلاین">
           <i class="ri-information-line" aria-hidden="true"></i><span>وضعیت سیستم</span>

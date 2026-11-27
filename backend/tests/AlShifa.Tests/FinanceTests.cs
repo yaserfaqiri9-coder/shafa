@@ -18,6 +18,171 @@ namespace AlShifa.Tests;
 [Collection("api")]
 public sealed class FinanceTests(ApiFixture api) : PhysicalQueueTestScope(api)
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Cashier_cancels_discounted_unpaid_pharmacy_bill_and_releases_stock_but_cannot_refund_paid_bill(bool paid)
+    {
+        var product = await NewProductAsync(100);
+        await StockAsync(product, 5);
+        var pharmacy = await UserAsync(Roles.Pharmacist);
+        var sale = await Created<SaleRow>(await pharmacy.SendAsync(Post("/api/pharmacy/sales", new CreateSaleRequest(null, null, [new SaleLineInput(product, 2)]))));
+        var accountant = await UserAsync(Roles.Accountant);
+        var invoice = (await accountant.GetFromJsonAsync<InvoiceDetail>($"/api/invoices/{sale.InvoiceId}", JsonOptions))!.Invoice;
+        Assert.Equal(HttpStatusCode.NoContent, (await accountant.PostAsJsonAsync($"/api/invoices/{invoice.Id}/discount", new DiscountRequest(20, "Synthetic discount", invoice.Version))).StatusCode);
+        var cashier = await CashierWithOpenSessionAsync();
+        if (paid) await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, 20, PaymentMethod.Cash, null))));
+        invoice = (await accountant.GetFromJsonAsync<InvoiceDetail>($"/api/invoices/{invoice.Id}", JsonOptions))!.Invoice;
+        var result = await cashier.PostAsJsonAsync($"/api/invoices/{invoice.Id}/void", new VoidRequest("Synthetic source cancellation", invoice.Version));
+        Assert.Equal(paid ? HttpStatusCode.Conflict : HttpStatusCode.NoContent, result.StatusCode);
+        var returned = await api.InDbAsync(db => db.Sales.Where(s => s.Id == sale.Id).Select(s => s.IsReturned).SingleAsync());
+        Assert.Equal(!paid, returned);
+        if (!paid) await Created<SaleRow>(await pharmacy.SendAsync(Post("/api/pharmacy/sales", new CreateSaleRequest(null, null, [new SaleLineInput(product, 5)]))));
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
+    public async Task Unpaid_discounted_invoice_can_be_cancelled_atomically_without_leaving_receivable_or_discount()
+    {
+        var patient = await NewPatientAsync();
+        var invoice = await NewInvoiceAsync(patient.Id, await NewServiceAsync(100));
+        var accountant = await UserAsync(Roles.Accountant);
+        Assert.Equal(HttpStatusCode.NoContent, (await accountant.PostAsJsonAsync($"/api/invoices/{invoice.Id}/discount", new DiscountRequest(20, "Synthetic discount", invoice.Version))).StatusCode);
+        var current = (await accountant.GetFromJsonAsync<InvoiceDetail>($"/api/invoices/{invoice.Id}", JsonOptions))!.Invoice;
+        Assert.Equal(HttpStatusCode.NoContent, (await accountant.PostAsJsonAsync($"/api/invoices/{invoice.Id}/void", new VoidRequest("Synthetic cancellation", current.Version))).StatusCode);
+        current = (await accountant.GetFromJsonAsync<InvoiceDetail>($"/api/invoices/{invoice.Id}", JsonOptions))!.Invoice;
+        Assert.Equal(("Void", 0m), (current.Status, current.Balance));
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
+    public void Finance_commands_and_cash_movements_keep_the_existing_sync_contract()
+    {
+        Assert.True(AlShifa.Api.Features.Sync.CommandPolicy.Allowed("POST", "/api/refunds"));
+        Assert.True(AlShifa.Api.Features.Sync.CommandPolicy.ValidatesCurrentState(new() { Method = "POST", Path = "/api/payments/settle", Body = "{}" }));
+        Assert.True(AlShifa.Api.Features.Sync.CommandPolicy.ValidatesCurrentState(new() { Method = "POST", Path = "/api/payments/1/correct", Body = "{\"version\":0}" }));
+        Assert.True(AlShifa.Api.Features.Sync.SyncSchema.IsSynced("CashMovements"));
+    }
+
+    [Fact]
+    public async Task Outstanding_at_day_end_reconstructs_the_balance_before_a_later_payment()
+    {
+        var patient = await NewPatientAsync();
+        var invoice = await NewInvoiceAsync(patient.Id, await NewServiceAsync(600));
+        var cashier = await CashierWithOpenSessionAsync();
+        await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, 600, PaymentMethod.Cash, null))));
+        var historical = KabulClock.Today.AddDays(-2);
+        var start = historical.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        await api.InDbAsync(async db =>
+        {
+            (await db.Invoices.SingleAsync(i => i.Id == invoice.Id)).CreatedAt = start.AddHours(8);
+            var itemIds = await db.InvoiceItems.Where(i => i.InvoiceId == invoice.Id).Select(i => i.Id).ToListAsync();
+            foreach (var entry in await db.LedgerTransactions.Where(t => t.SourceType == "InvoiceItem" && itemIds.Contains(t.SourceId)).ToListAsync()) entry.CreatedAt = start.AddHours(8);
+            await db.SaveChangesAsync(); return 0;
+        });
+        var response = await cashier.GetAsync($"/api/cash/outstanding-at?date={historical:yyyy-MM-dd}&q={invoice.InvoiceNumber}");
+        Assert.True(response.IsSuccessStatusCode, await response.Content.ReadAsStringAsync());
+        var result = (await response.Content.ReadFromJsonAsync<JsonElement>());
+        var row = result.GetProperty("items").EnumerateArray().Single(r => r.GetProperty("id").GetInt64() == invoice.Id);
+        Assert.Equal(600, row.GetProperty("balance").GetDecimal());
+    }
+
+    [Fact]
+    public async Task Cash_transfer_is_not_expense_and_retries_do_not_transfer_twice()
+    {
+        var accountant = await UserAsync(Roles.Accountant);
+        await OpenFreshSessionAsync(accountant);
+        var patient = await NewPatientAsync();
+        var invoice = await NewInvoiceAsync(patient.Id, await NewServiceAsync(500));
+        await Created<PaymentRow>(await accountant.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, 500, PaymentMethod.Cash, null))));
+        var session = Assert.Single((await accountant.GetFromJsonAsync<List<SessionRow>>("/api/cash/sessions?mine=true", JsonOptions))!);
+        var key = Guid.NewGuid().ToString("N");
+        var transfer = new CashTransferRequest(300, "Vault", "Synthetic cash handover", session.Version);
+        var first = await Created<JsonElement>(await accountant.SendAsync(Post($"/api/cash/sessions/{session.Id}/transfer", transfer, key)));
+        var retry = await Created<JsonElement>(await accountant.SendAsync(Post($"/api/cash/sessions/{session.Id}/transfer", transfer, key)));
+        Assert.Equal(first.GetProperty("id").GetInt64(), retry.GetProperty("id").GetInt64());
+        session = Assert.Single((await accountant.GetFromJsonAsync<List<SessionRow>>("/api/cash/sessions?mine=true", JsonOptions))!);
+        Assert.Equal(200, session.CurrentExpected);
+        var over = await accountant.SendAsync(Post($"/api/cash/sessions/{session.Id}/transfer", new CashTransferRequest(201, "Bank", "Synthetic over-transfer", session.Version)));
+        Assert.Equal(HttpStatusCode.Conflict, over.StatusCode);
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
+    public async Task Accountant_corrects_a_closed_drawer_receipt_in_today_drawer_once_and_can_collect_reopened_balance()
+    {
+        var patient = await NewPatientAsync();
+        var invoice = await NewInvoiceAsync(patient.Id, await NewServiceAsync(1000));
+        var cashier = await CashierWithOpenSessionAsync();
+        var payment = await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, 1000, PaymentMethod.Cash, null))));
+        var first = Assert.Single((await cashier.GetFromJsonAsync<List<SessionRow>>("/api/cash/sessions?mine=true", JsonOptions))!);
+        Assert.Equal(HttpStatusCode.OK, (await cashier.PostAsJsonAsync($"/api/cash/sessions/{first.Id}/close", new CloseSessionRequest(1000, first.Version))).StatusCode);
+        var accountant = await UserAsync(Roles.Accountant);
+        await OpenFreshSessionAsync(accountant);
+        var key = Guid.NewGuid().ToString("N");
+        var correction = new CorrectPaymentRequest(700, "Synthetic receipt correction", payment.Version);
+        var replacement = await Created<PaymentRow>(await accountant.SendAsync(Post($"/api/payments/{payment.Id}/correct", correction, key)));
+        var retried = await Created<PaymentRow>(await accountant.SendAsync(Post($"/api/payments/{payment.Id}/correct", correction, key)));
+        Assert.Equal(replacement.Id, retried.Id);
+        var detail = (await accountant.GetFromJsonAsync<InvoiceDetail>($"/api/invoices/{invoice.Id}", JsonOptions))!;
+        Assert.Equal(300, detail.Invoice.Balance);
+        var original = detail.Payments.Single(p => p.Id == payment.Id);
+        Assert.Equal((1000m, 1000m, (long?)replacement.Id), (original.Amount, original.Refunded, original.ReplacementPaymentId));
+        var closed = Assert.Single((await cashier.GetFromJsonAsync<List<SessionRow>>("/api/cash/sessions?mine=true", JsonOptions))!);
+        Assert.Equal((1000m, 1000m), (closed.ExpectedAmount, closed.CountedAmount));
+        var current = Assert.Single((await accountant.GetFromJsonAsync<List<SessionRow>>("/api/cash/sessions?mine=true", JsonOptions))!);
+        Assert.Equal(-300, current.CurrentExpected);
+        await Created<PaymentRow>(await accountant.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, 300, PaymentMethod.Cash, null))));
+        var paid = (await accountant.GetFromJsonAsync<InvoiceDetail>($"/api/invoices/{invoice.Id}", JsonOptions))!.Invoice;
+        Assert.Equal((0m, "Paid"), (paid.Balance, paid.Status));
+        var refused = await accountant.SendAsync(Post($"/api/payments/{payment.Id}/cancel", new CancelPaymentRequest("Synthetic stale correction", payment.Version)));
+        Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
+    public async Task Drawer_expected_cash_counts_its_refunds_expenses_and_expense_cancellation_requires_difference_reason()
+    {
+        var accountant = await UserAsync(Roles.Accountant);
+        await OpenFreshSessionAsync(accountant);
+        var patient = await NewPatientAsync();
+        var invoice = await NewInvoiceAsync(patient.Id, await NewServiceAsync(500));
+        var payment = await Created<PaymentRow>(await accountant.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, 500, PaymentMethod.Cash, null))));
+        await Created<JsonElement>(await accountant.SendAsync(Post("/api/refunds", new RefundRequest(payment.Id, 100, "Synthetic partial refund"))));
+        var expense = await Created<JsonElement>(await accountant.SendAsync(Post("/api/expenses", new CreateExpenseRequest("Synthetic", null, 50, KabulClock.Today))));
+        var session = Assert.Single((await accountant.GetFromJsonAsync<List<SessionRow>>("/api/cash/sessions?mine=true", JsonOptions))!);
+        Assert.Equal((350m, 100m, 50m), (session.CurrentExpected, session.CashRefunded, session.CashExpenses));
+        var refusal = await accountant.PostAsJsonAsync($"/api/cash/sessions/{session.Id}/close", new CloseSessionRequest(340, session.Version));
+        Assert.Equal(HttpStatusCode.BadRequest, refusal.StatusCode);
+        var expenseId = expense.GetProperty("id").GetInt64();
+        var version = await api.InDbAsync(db => db.Expenses.Where(e => e.Id == expenseId).Select(e => e.Version).SingleAsync());
+        Assert.Equal(HttpStatusCode.NoContent, (await accountant.PostAsJsonAsync($"/api/expenses/{expenseId}/cancel", new VoidRequest("Synthetic cancellation", version))).StatusCode);
+        session = Assert.Single((await accountant.GetFromJsonAsync<List<SessionRow>>("/api/cash/sessions?mine=true", JsonOptions))!);
+        Assert.Equal(400, session.CurrentExpected);
+        Assert.Equal(HttpStatusCode.OK, (await accountant.PostAsJsonAsync($"/api/cash/sessions/{session.Id}/close", new CloseSessionRequest(400, session.Version))).StatusCode);
+        await AssertLedgerReconciles();
+    }
+
+    [Fact]
+    public async Task Receipt_search_and_refund_day_include_an_old_receipt_refunded_today()
+    {
+        var patient = await NewPatientAsync();
+        var invoice = await NewInvoiceAsync(patient.Id, await NewServiceAsync(100));
+        var cashier = await CashierWithOpenSessionAsync();
+        var payment = await Created<PaymentRow>(await cashier.SendAsync(Post("/api/payments", new PaymentRequest(invoice.Id, 100, PaymentMethod.Cash, null))));
+        await api.InDbAsync(async db => { var p = await db.Payments.SingleAsync(p => p.Id == payment.Id); p.CreatedAt = DateTime.UtcNow.AddDays(-2); await db.SaveChangesAsync(); return 0; });
+        var accountant = await UserAsync(Roles.Accountant);
+        await Created<JsonElement>(await accountant.SendAsync(Post("/api/refunds", new RefundRequest(payment.Id, 20, "Synthetic old receipt refund"))));
+        var receipts = (await accountant.GetFromJsonAsync<PagedResult<PaymentRow>>($"/api/payments?q={payment.ReceiptNumber}", JsonOptions))!;
+        Assert.Contains(receipts.Items, p => p.Id == payment.Id);
+        var today = KabulClock.Today.ToString("yyyy-MM-dd");
+        var refunds = (await accountant.GetFromJsonAsync<JsonElement>($"/api/refunds?from={today}&to={today}&q={payment.ReceiptNumber}"));
+        Assert.Equal(1, refunds.GetProperty("total").GetInt32());
+        Assert.Equal(20, refunds.GetProperty("items")[0].GetProperty("amount").GetDecimal());
+        Assert.Equal(HttpStatusCode.OK, (await accountant.GetAsync($"/api/cash/day?date={today}")).StatusCode);
+        await AssertLedgerReconciles();
+    }
+
     [Fact]
     public void Shamsi_payroll_prorates_start_end_and_rate_changes_without_charging_an_unfinished_month()
     {
@@ -713,6 +878,89 @@ public sealed class FinanceTests(ApiFixture api) : PhysicalQueueTestScope(api)
         await AssertLedgerReconciles();
     }
 
+    [Theory]
+    [InlineData(SaleKind.Pharmacy)]
+    [InlineData(SaleKind.Optical)]
+    public async Task Department_sales_history_filters_Kabul_days_before_pagination_and_searches_older_records(SaleKind kind)
+    {
+        var patient = await NewPatientAsync();
+        var user = await UserAsync(kind == SaleKind.Pharmacy ? Roles.Pharmacist : Roles.Optical);
+        var productId = 0;
+        if (kind == SaleKind.Pharmacy) { productId = await NewProductAsync(); await StockAsync(productId, 5); }
+        var ids = new List<long>();
+        var numbers = new List<string>();
+        for (var index = 0; index < 4; index++)
+        {
+            if (kind == SaleKind.Pharmacy)
+            {
+                var sale = await Created<SaleRow>(await user.SendAsync(Post("/api/pharmacy/sales", new CreateSaleRequest(patient.Id, null, [new SaleLineInput(productId, 1)]))));
+                ids.Add(sale.Id); numbers.Add(sale.SaleNumber);
+            }
+            else
+            {
+                var order = await Created<OpticalOrderRow>(await user.SendAsync(Post("/api/optical/orders", new CreateOpticalOrderRequest(patient.Id, null, "Historical synthetic order", [], [new CustomLineInput("Synthetic lens", 100, true)]))));
+                ids.Add(order.Id); numbers.Add(order.OrderNumber);
+            }
+        }
+        // Kabul midnight is 19:30 UTC on the previous calendar day; the upper bound is exclusive.
+        var start = new DateTime(2024, 3, 19, 19, 30, 0, DateTimeKind.Utc);
+        var end = start.AddDays(1);
+        var times = new[] { start.AddMilliseconds(-1), start, end.AddMilliseconds(-1), end };
+        await api.InDbAsync(async db =>
+        {
+            for (var index = 0; index < ids.Count; index++)
+            {
+                var id = ids[index]; var time = times[index];
+                if (kind == SaleKind.Pharmacy) await db.Sales.Where(s => s.Id == id).ExecuteUpdateAsync(s => s.SetProperty(x => x.CreatedAt, time));
+                else await db.OpticalOrders.Where(o => o.Id == id).ExecuteUpdateAsync(s => s.SetProperty(x => x.CreatedAt, time));
+            }
+            return 0;
+        });
+        var path = kind == SaleKind.Pharmacy ? "/api/pharmacy/sales" : "/api/optical/orders";
+        var q = Uri.EscapeDataString(patient.FileNumber);
+        using var first = JsonDocument.Parse(await user.GetStringAsync($"{path}?from=2024-03-20&to=2024-03-20&q={q}&pageSize=1"));
+        Assert.Equal(2, first.RootElement.GetProperty("total").GetInt32());
+        Assert.Equal(ids[2], first.RootElement.GetProperty("items")[0].GetProperty("id").GetInt64());
+        using var second = JsonDocument.Parse(await user.GetStringAsync($"{path}?from=2024-03-20&to=2024-03-20&q={q}&page=2&pageSize=1"));
+        Assert.Equal(ids[1], second.RootElement.GetProperty("items")[0].GetProperty("id").GetInt64());
+        // One-sided dates mean that one day, while no dates keep the entire history available.
+        using var all = JsonDocument.Parse(await user.GetStringAsync($"{path}?q={Uri.EscapeDataString(patient.FirstName)}"));
+        Assert.Equal(4, all.RootElement.GetProperty("total").GetInt32());
+        var persian = string.Concat(numbers[0].Select(c => char.IsAsciiDigit(c) ? (char)('۰' + c - '0') : c));
+        using var old = JsonDocument.Parse(await user.GetStringAsync($"{path}?to=2024-03-19&q={Uri.EscapeDataString(persian)}"));
+        Assert.Contains(old.RootElement.GetProperty("items").EnumerateArray(), item => item.GetProperty("id").GetInt64() == ids[0]);
+        if (kind == SaleKind.Pharmacy)
+        {
+            var productName = await api.InDbAsync(db => db.Products.Where(p => p.Id == productId).Select(p => p.Name).SingleAsync());
+            using var byProduct = JsonDocument.Parse(await user.GetStringAsync($"{path}?from=2024-03-20&q={Uri.EscapeDataString(productName)}"));
+            Assert.Equal(2, byProduct.RootElement.GetProperty("total").GetInt32());
+        }
+        var other = await UserAsync(kind == SaleKind.Pharmacy ? Roles.Optical : Roles.Pharmacist);
+        Assert.Equal(HttpStatusCode.Forbidden, (await other.GetAsync($"{path}?from=2024-03-20&to=2024-03-20")).StatusCode);
+    }
+
+    [Fact]
+    public async Task Complimentary_history_filters_by_delivery_day_and_searches_order_and_items()
+    {
+        var optical = await UserAsync(Roles.Optical);
+        var name = Name("history");
+        var order = await Created<OpticalOrderRow>(await optical.SendAsync(Post("/api/optical/orders", new CreateOpticalOrderRequest(null, null, null, [],
+            [new CustomLineInput(name, 0, true)], true, "Synthetic approval", "Synthetic approver", CustomerName: name))));
+        await api.InDbAsync(async db =>
+        {
+            await db.OpticalOrders.Where(o => o.Id == order.Id).ExecuteUpdateAsync(s => s
+                .SetProperty(o => o.Status, OpticalOrderStatus.Delivered)
+                .SetProperty(o => o.CreatedAt, new DateTime(2024, 3, 17, 8, 0, 0, DateTimeKind.Utc))
+                .SetProperty(o => o.DeliveredAt, new DateTime(2024, 3, 19, 19, 30, 0, DateTimeKind.Utc)));
+            return 0;
+        });
+        var path = $"/api/optical/reports/complimentary?q={Uri.EscapeDataString(name)}";
+        var report = await optical.GetFromJsonAsync<List<ComplimentaryOpticalReportRow>>(path + "&from=2024-03-20&to=2024-03-20", JsonOptions);
+        Assert.Equal(order.Id, Assert.Single(report!).Id);
+        Assert.Contains(name, report![0].Items);
+        Assert.Empty((await optical.GetFromJsonAsync<List<ComplimentaryOpticalReportRow>>(path + "&from=2024-03-19&to=2024-03-19", JsonOptions))!);
+    }
+
     [Fact]
     public async Task Walk_in_optical_order_keeps_the_customer_name_and_is_found_by_name_or_phone()
     {
@@ -815,7 +1063,7 @@ public sealed class FinanceTests(ApiFixture api) : PhysicalQueueTestScope(api)
         var session = Assert.Single(sessions!);
         Assert.Equal(400, session.CashCollected);
 
-        var closed = await cashier.PostAsJsonAsync($"/api/cash/sessions/{session.Id}/close", new CloseSessionRequest(390, session.Version));
+        var closed = await cashier.PostAsJsonAsync($"/api/cash/sessions/{session.Id}/close", new CloseSessionRequest(390, session.Version, "Synthetic closing discrepancy"));
         var after = (await closed.Content.ReadFromJsonAsync<SessionRow>(JsonOptions))!;
         Assert.Equal(400, after.ExpectedAmount);
         Assert.Equal(390, after.CountedAmount);
